@@ -1,0 +1,132 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            cross_gcc: gcc-aarch64-linux-gnu
+            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux ARM64 cross-linker
+        if: matrix.cross_gcc != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.cross_gcc }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.linker_env }}" ]; then
+            export ${{ matrix.linker_env }}
+          fi
+          cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package release archive (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            TAG="${{ github.event.inputs.tag }}"
+          fi
+          ARCHIVE="maga-${TAG}-${{ matrix.target }}.tar.gz"
+          cp "target/${{ matrix.target }}/release/maga" .
+          tar -czf "${ARCHIVE}" maga README.md LICENSE
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+
+      - name: Package release archive (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $Tag = if ($env:GITHUB_EVENT_NAME -eq "workflow_dispatch") { "${{ github.event.inputs.tag }}" } else { $env:GITHUB_REF_NAME }
+          $Archive = "maga-$Tag-${{ matrix.target }}.zip"
+          Copy-Item "target/${{ matrix.target }}/release/maga.exe" -Destination "."
+          Compress-Archive -Path "maga.exe", "README.md", "LICENSE" -DestinationPath $Archive
+          $Hash = (Get-FileHash -Algorithm SHA256 $Archive).Hash.ToLower()
+          "$Hash  $Archive" | Out-File -Encoding ascii "$Archive.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            maga-*.tar.gz
+            maga-*.zip
+            maga-*.sha256
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate combined SHA256SUMS
+        run: |
+          cd dist
+          cat *.sha256 > SHA256SUMS
+          rm -f *.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/maga-*.tar.gz
+            dist/maga-*.zip
+            dist/SHA256SUMS

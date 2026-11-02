@@ -1,0 +1,14 @@
+/target
+.mcp.json
+.env
+.env.*
+.agents
+.agent
+.claude
+.dsh
+.opencode
+.pi
+.grok
+.github/prompts
+.github/skills
+openspec/

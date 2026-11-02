@@ -106,29 +106,29 @@ Switch between the **MCP Servers (`1`)** and **Plugins (`2`)** workspace section
 
 **Option 1 — Prebuilt Release Binary (Linux, macOS, Windows)**
 
-Download the archive for your platform (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, or `x86_64-pc-windows-msvc`) from [**GitHub Releases**](https://github.com/notakrista/maga/releases), or install via [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall):
+Download the archive for your platform (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, or `x86_64-pc-windows-msvc`) from [**GitHub Releases**](https://github.com/akrista/maga/releases), or install via [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall):
 
 ```bash
 # Quick one-liner for Linux / macOS (adjust TARGET for your OS/arch)
 TARGET="x86_64-unknown-linux-gnu"
-curl -fsSL "https://github.com/notakrista/maga/releases/latest/download/maga-v0.1.0-${TARGET}.tar.gz" \
+curl -fsSL "https://github.com/akrista/maga/releases/latest/download/maga-v0.1.0-${TARGET}.tar.gz" \
   | tar -xz -C ~/.local/bin maga
 
 # Or install prebuilt binary via cargo-binstall
-cargo binstall --git https://github.com/notakrista/maga maga
+cargo binstall --git https://github.com/akrista/maga maga
 ```
 
 **Option 2 — Install from GitHub via Cargo (Rust 1.85+)**
 
 ```bash
-cargo install --git https://github.com/notakrista/maga
+cargo install --git https://github.com/akrista/maga
 maga
 ```
 
 **Option 3 — Build from a Local Clone**
 
 ```bash
-git clone https://github.com/notakrista/maga.git
+git clone https://github.com/akrista/maga.git
 cd maga
 cargo install --path .
 maga

@@ -218,6 +218,67 @@ pub fn extract_manifest_description(dir: &Path) -> Option<String> {
     None
 }
 
+/// Extracts an optional non-empty `"name"` field from `plugin.json` or `.claude-plugin/plugin.json`.
+pub fn extract_manifest_name(dir: &Path) -> Option<String> {
+    if !dir.is_dir() {
+        return None;
+    }
+    for candidate in [
+        dir.join("plugin.json"),
+        dir.join(".claude-plugin").join("plugin.json"),
+    ] {
+        if candidate.is_file()
+            && let Ok(text) = fs::read_to_string(&candidate)
+            && let Ok(val) = serde_json::from_str::<JsonValue>(&text)
+            && let Some(name) = val.get("name").and_then(JsonValue::as_str)
+        {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Best-effort Grok registry fallback for a human-readable name when the install dir lacks a manifest `name`.
+fn extract_grok_registry_display_name(installed_dir: &Path, id: &str) -> Option<String> {
+    let registry_path = installed_dir.join("registry.json");
+    if !registry_path.is_file() {
+        return None;
+    }
+    let text = fs::read_to_string(&registry_path).ok()?;
+    let val: JsonValue = serde_json::from_str(&text).ok()?;
+    let entry = val.get("repos")?.as_object()?.get(id)?;
+
+    if let Some(name) = entry
+        .get("marketplace")
+        .and_then(|m| m.get("source_display_name"))
+        .and_then(JsonValue::as_str)
+    {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    if let Some(plugins) = entry.get("plugins").and_then(JsonValue::as_object)
+        && plugins.len() == 1
+    {
+        return plugins.keys().next().map(|k| k.clone());
+    }
+
+    None
+}
+
+fn plugin_path_basename(id: &str) -> String {
+    id.rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(id)
+        .to_string()
+}
+
 /// Scans an installed plugin directory to collect bundled skill, hook, and MCP server names and counts.
 pub fn inspect_bundled_contents(dir: &Path) -> BundledCounts {
     if !dir.is_dir() {
@@ -675,7 +736,7 @@ pub fn discover_agy_plugins(paths: &StoragePaths, config: &MagaConfig) -> Vec<Ha
     for id in all_ids {
         let dir_path = plugins_dir.join(&id);
         let install_path = dir_path.is_dir().then_some(dir_path.clone());
-        let mut display_name = id.clone();
+        let display_name = extract_manifest_name(&dir_path).unwrap_or_else(|| id.clone());
         let mut default_enabled = true;
         let mut version = None;
         let mut source = Some("local".to_string());
@@ -685,11 +746,6 @@ pub fn discover_agy_plugins(paths: &StoragePaths, config: &MagaConfig) -> Vec<Ha
             && let Ok(text) = fs::read_to_string(&manifest_path)
             && let Ok(manifest) = serde_json::from_str::<JsonValue>(&text)
         {
-            if let Some(n) = manifest.get("name").and_then(JsonValue::as_str)
-                && !n.trim().is_empty()
-            {
-                display_name = n.to_string();
-            }
             if manifest.get("disabled").and_then(JsonValue::as_bool) == Some(true) {
                 default_enabled = false;
             }
@@ -1100,12 +1156,11 @@ pub fn discover_grok_plugins(paths: &StoragePaths, config: &MagaConfig) -> Vec<H
             .as_deref()
             .map(inspect_bundled_contents)
             .unwrap_or_default();
-        let display_name = id
-            .rsplit('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&id)
-            .to_string();
+        let display_name = install_path
+            .as_deref()
+            .and_then(extract_manifest_name)
+            .or_else(|| extract_grok_registry_display_name(&installed_dir, &id))
+            .unwrap_or_else(|| plugin_path_basename(&id));
         let enabled = !disabled_set.contains(&id);
 
         out.push(HarnessPlugin {
@@ -1846,5 +1901,128 @@ paths = ["xai-helper"]
             );
         }
         assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn extract_manifest_name_reads_plugin_json_name() {
+        let dir = tempdir().expect("create tempdir");
+        let plugin_dir = dir.path().join("skills-343a64e7");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{"name": "ponytail", "description": "Lazy senior dev mode"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            extract_manifest_name(&plugin_dir).as_deref(),
+            Some("ponytail")
+        );
+        assert_eq!(
+            extract_manifest_description(&plugin_dir).as_deref(),
+            Some("Lazy senior dev mode")
+        );
+        assert_eq!(extract_manifest_name(dir.path()), None);
+    }
+
+    #[test]
+    fn discovers_grok_display_name_from_opaque_install_dir_manifest() {
+        let dir = tempdir().expect("create tempdir");
+        let paths = StoragePaths::in_dir(dir.path());
+        let config = MagaConfig::default();
+        let mut ledger = PluginsLedger::default();
+
+        let opaque_id = "skills-343a64e7";
+        let grok_plugin_dir = paths
+            .effective_grok_installed_plugins_dir(&config)
+            .join(opaque_id);
+        fs::create_dir_all(&grok_plugin_dir).unwrap();
+        fs::write(
+            grok_plugin_dir.join("plugin.json"),
+            r#"{"name": "ponytail", "description": "Lazy senior dev mode"}"#,
+        )
+        .unwrap();
+        fs::write(
+            &paths.grok_toml,
+            r#"
+[models]
+default = "grok-4.5"
+
+[plugins]
+disabled = []
+"#,
+        )
+        .unwrap();
+
+        let all = discover_all_harness_plugins(&paths, &config, &mut ledger);
+        let grok_list = &all[&HarnessKind::Grok];
+        assert_eq!(grok_list.len(), 1);
+        let plugin = &grok_list[0];
+        assert_eq!(plugin.id, opaque_id);
+        assert_eq!(plugin.display_name, "ponytail");
+        assert_eq!(
+            plugin.description.as_deref(),
+            Some("Lazy senior dev mode")
+        );
+        assert!(plugin.enabled);
+
+        // Toggle still keys on the opaque install id.
+        let mut plugin = plugin.clone();
+        toggle_harness_plugin(&paths, &config, &mut ledger, &mut plugin).unwrap();
+        assert!(!plugin.enabled);
+        let grok_raw: TomlTable =
+            toml::from_str(&fs::read_to_string(&paths.grok_toml).unwrap()).unwrap();
+        let disabled_arr = grok_raw["plugins"]["disabled"].as_array().unwrap();
+        assert!(disabled_arr.contains(&TomlValue::String(opaque_id.to_string())));
+        assert_eq!(grok_raw["models"]["default"].as_str(), Some("grok-4.5"));
+    }
+
+    #[test]
+    fn discovers_grok_display_name_from_registry_when_manifest_name_missing() {
+        let dir = tempdir().expect("create tempdir");
+        let paths = StoragePaths::in_dir(dir.path());
+        let config = MagaConfig::default();
+        let mut ledger = PluginsLedger::default();
+
+        let opaque_id = "skills-abcdef12";
+        let installed_dir = paths.effective_grok_installed_plugins_dir(&config);
+        let grok_plugin_dir = installed_dir.join(opaque_id);
+        fs::create_dir_all(&grok_plugin_dir).unwrap();
+        // Manifest present but without a usable name field.
+        fs::write(
+            grok_plugin_dir.join("plugin.json"),
+            r#"{"description": "Fallback via registry"}"#,
+        )
+        .unwrap();
+        fs::write(
+            installed_dir.join("registry.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "repos": {
+                    opaque_id: {
+                        "marketplace": {
+                            "source_display_name": "registry-named-plugin"
+                        },
+                        "plugins": {
+                            "should-not-win": {}
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(&paths.grok_toml, "[plugins]\ndisabled = []\n").unwrap();
+
+        let all = discover_all_harness_plugins(&paths, &config, &mut ledger);
+        let plugin = all[&HarnessKind::Grok]
+            .iter()
+            .find(|p| p.id == opaque_id)
+            .expect("opaque grok plugin");
+        assert_eq!(plugin.display_name, "registry-named-plugin");
+        assert_eq!(
+            plugin.description.as_deref(),
+            Some("Fallback via registry")
+        );
     }
 }

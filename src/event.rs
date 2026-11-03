@@ -13,11 +13,15 @@ use std::time::{Duration, Instant};
 use tempfile::Builder;
 
 /// Runs the main interactive event loop, including `$EDITOR` suspension, periodic auto-refresh, and terminal restoration.
-pub fn run_event_loop<B: Backend + Write>(
+pub fn run_event_loop<B>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     theme: &Theme,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    B: Backend + Write,
+    io::Error: From<B::Error>,
+{
     let mut last_refresh = Instant::now();
     let mut last_anim = Instant::now();
     let mut last_frame = Instant::now();
@@ -94,10 +98,14 @@ pub fn compute_poll_timeout(app: &App, mono: bool) -> Duration {
 
 /// Suspends raw mode and the alternate screen, launches `$VISUAL` / `$EDITOR` (fallback `vi`),
 /// reads the resulting TOML snippet, and restores the TUI cleanly.
-fn launch_external_editor<B: Backend + Write>(
+fn launch_external_editor<B>(
     terminal: &mut Terminal<B>,
     req: &EditorRequest,
-) -> io::Result<String> {
+) -> io::Result<String>
+where
+    B: Backend + Write,
+    io::Error: From<B::Error>,
+{
     if let Some(ref target_path) = req.direct_file_path {
         if let Some(parent) = target_path.parent() {
             let _ = fs::create_dir_all(parent);

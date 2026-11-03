@@ -1960,10 +1960,7 @@ disabled = []
         let plugin = &grok_list[0];
         assert_eq!(plugin.id, opaque_id);
         assert_eq!(plugin.display_name, "ponytail");
-        assert_eq!(
-            plugin.description.as_deref(),
-            Some("Lazy senior dev mode")
-        );
+        assert_eq!(plugin.description.as_deref(), Some("Lazy senior dev mode"));
         assert!(plugin.enabled);
 
         // Toggle still keys on the opaque install id.
@@ -2020,9 +2017,6 @@ disabled = []
             .find(|p| p.id == opaque_id)
             .expect("opaque grok plugin");
         assert_eq!(plugin.display_name, "registry-named-plugin");
-        assert_eq!(
-            plugin.description.as_deref(),
-            Some("Fallback via registry")
-        );
+        assert_eq!(plugin.description.as_deref(), Some("Fallback via registry"));
     }
 }

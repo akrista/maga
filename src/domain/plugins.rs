@@ -265,7 +265,7 @@ fn extract_grok_registry_display_name(installed_dir: &Path, id: &str) -> Option<
     if let Some(plugins) = entry.get("plugins").and_then(JsonValue::as_object)
         && plugins.len() == 1
     {
-        return plugins.keys().next().map(|k| k.clone());
+        return plugins.keys().next().cloned();
     }
 
     None

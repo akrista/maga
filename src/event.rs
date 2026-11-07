@@ -47,7 +47,8 @@ where
         terminal.draw(|f| ui::draw(f, app, theme))?;
 
         if let Some(req) = app.pending_editor.take() {
-            let edited = launch_external_editor(terminal, &req)?;
+            let edited =
+                launch_external_editor(terminal, &req, app.loaded.config.configured_editor())?;
             app.apply_editor_result(req, &edited);
             last_refresh = Instant::now();
             last_frame = Instant::now();
@@ -92,13 +93,18 @@ pub fn compute_poll_timeout(app: &App, mono: bool) -> Duration {
     }
 }
 
-/// Suspends raw mode and the alternate screen, launches `$VISUAL` / `$EDITOR` (fallback `vi`),
-/// reads the resulting TOML snippet, and restores the TUI cleanly.
-fn launch_external_editor<B>(terminal: &mut Terminal<B>, req: &EditorRequest) -> io::Result<String>
+/// Suspends raw mode and the alternate screen, launches the configured editor / `$VISUAL` / `$EDITOR`
+/// (with platform-aware fallback), reads the resulting TOML snippet, and restores the TUI cleanly.
+fn launch_external_editor<B>(
+    terminal: &mut Terminal<B>,
+    req: &EditorRequest,
+    configured_editor: Option<&str>,
+) -> io::Result<String>
 where
     B: Backend + Write,
     io::Error: From<B::Error>,
 {
+    let editor = resolve_editor_command(configured_editor);
     if let Some(ref target_path) = req.direct_file_path {
         if let Some(parent) = target_path.parent() {
             let _ = fs::create_dir_all(parent);
@@ -108,8 +114,7 @@ where
         crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
         terminal.show_cursor()?;
 
-        let editor = resolve_editor_command();
-        let status_res = Command::new(&editor).arg(target_path).status();
+        let status_res = run_editor_process(&editor, target_path);
 
         crossterm::execute!(terminal.backend_mut(), EnterAlternateScreen)?;
         enable_raw_mode()?;
@@ -134,8 +139,7 @@ where
     crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    let editor = resolve_editor_command();
-    let status_res = Command::new(&editor).arg(&tmp_path).status();
+    let status_res = run_editor_process(&editor, &tmp_path);
 
     // Always restore TUI terminal state before checking editor status
     crossterm::execute!(terminal.backend_mut(), EnterAlternateScreen)?;
@@ -152,16 +156,118 @@ where
     }
 }
 
-pub fn resolve_editor_command() -> String {
-    std::env::var("VISUAL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            std::env::var("EDITOR")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-        })
-        .unwrap_or_else(|| "vi".to_string())
+fn run_editor_process(
+    editor_cmd: &str,
+    target_path: &std::path::Path,
+) -> io::Result<std::process::ExitStatus> {
+    let (program, args) =
+        split_editor_command(editor_cmd).unwrap_or_else(|| (editor_cmd.to_string(), Vec::new()));
+    let res = Command::new(&program).args(&args).arg(target_path).status();
+
+    #[cfg(windows)]
+    if let Err(ref e) = res
+        && e.kind() == io::ErrorKind::NotFound
+    {
+        return Command::new("cmd")
+            .arg("/C")
+            .arg(&program)
+            .args(&args)
+            .arg(target_path)
+            .status();
+    }
+
+    res
+}
+
+/// Splits an editor command string into `(executable, extra_args)`, respecting single and double quotes.
+pub fn split_editor_command(raw: &str) -> Option<(String, Vec<String>)> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quote: Option<char> = None;
+
+    for ch in raw.chars() {
+        match in_quote {
+            Some(q) if ch == q => {
+                in_quote = None;
+            }
+            Some(_) => {
+                current.push(ch);
+            }
+            None if ch == '"' || ch == '\'' => {
+                in_quote = Some(ch);
+            }
+            None if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            None => {
+                current.push(ch);
+            }
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    let mut iter = tokens.into_iter();
+    let program = iter.next()?;
+    let args: Vec<String> = iter.collect();
+    Some((program, args))
+}
+
+pub fn resolve_editor_command(configured_editor: Option<&str>) -> String {
+    let visual = std::env::var("VISUAL").ok();
+    let editor = std::env::var("EDITOR").ok();
+    let path_var = std::env::var_os("PATH");
+    resolve_editor_command_with(
+        configured_editor,
+        visual.as_deref(),
+        editor.as_deref(),
+        cfg!(windows),
+        path_var.as_deref(),
+    )
+}
+
+pub fn resolve_editor_command_with(
+    configured_editor: Option<&str>,
+    visual: Option<&str>,
+    editor: Option<&str>,
+    is_windows: bool,
+    path_var: Option<&std::ffi::OsStr>,
+) -> String {
+    for candidate in [configured_editor, visual, editor].into_iter().flatten() {
+        let trimmed = candidate.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    if is_windows {
+        find_windows_editor_in_path(path_var).unwrap_or_else(|| "notepad.exe".to_string())
+    } else {
+        "vi".to_string()
+    }
+}
+
+fn find_windows_editor_in_path(path_var: Option<&std::ffi::OsStr>) -> Option<String> {
+    let path_var = path_var?;
+    let dirs: Vec<std::path::PathBuf> = std::env::split_paths(path_var).collect();
+    for candidate in ["nvim", "vim", "nano", "edit"] {
+        for dir in &dirs {
+            for ext in ["exe", "cmd", "bat", ""] {
+                let file_name = if ext.is_empty() {
+                    candidate.to_string()
+                } else {
+                    format!("{candidate}.{ext}")
+                };
+                if dir.join(file_name).is_file() {
+                    return Some(candidate.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -241,5 +347,67 @@ url = "https://mcp.example.com/mcp"
         // Disabling animations switches to 50ms poll timeout
         app.loaded.config.ui.animations = false;
         assert_eq!(compute_poll_timeout(&app, false), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn resolves_editor_precedence_and_windows_fallbacks_and_splits_args() {
+        // 1. config.toml editor overrides VISUAL and EDITOR
+        assert_eq!(
+            resolve_editor_command_with(Some("nvim"), Some("code --wait"), Some("vim"), true, None),
+            "nvim"
+        );
+
+        // 2. VISUAL overrides EDITOR when config.toml editor is unset
+        assert_eq!(
+            resolve_editor_command_with(None, Some("hx"), Some("vim"), false, None),
+            "hx"
+        );
+
+        // 3. EDITOR used when config.toml and VISUAL are empty/unset
+        assert_eq!(
+            resolve_editor_command_with(Some("  "), Some(""), Some("nano"), false, None),
+            "nano"
+        );
+
+        // 4. Unix fallback is "vi"
+        assert_eq!(
+            resolve_editor_command_with(None, None, None, false, None),
+            "vi"
+        );
+
+        // 5. Windows fallback probes PATH in order (nvim -> vim -> nano -> edit) before notepad.exe
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            resolve_editor_command_with(None, None, None, true, Some(dir.path().as_os_str())),
+            "notepad.exe"
+        );
+
+        fs::write(dir.path().join("vim.exe"), b"").unwrap();
+        assert_eq!(
+            resolve_editor_command_with(None, None, None, true, Some(dir.path().as_os_str())),
+            "vim"
+        );
+
+        fs::write(dir.path().join("nvim.cmd"), b"").unwrap();
+        assert_eq!(
+            resolve_editor_command_with(None, None, None, true, Some(dir.path().as_os_str())),
+            "nvim"
+        );
+
+        // 6. Argument splitting handles flags and quoted executable paths
+        assert_eq!(
+            split_editor_command("code --wait --new-window"),
+            Some((
+                "code".to_string(),
+                vec!["--wait".to_string(), "--new-window".to_string()]
+            ))
+        );
+        assert_eq!(
+            split_editor_command("\"C:\\Program Files\\Microsoft VS Code\\Code.exe\" --wait"),
+            Some((
+                "C:\\Program Files\\Microsoft VS Code\\Code.exe".to_string(),
+                vec!["--wait".to_string()]
+            ))
+        );
     }
 }

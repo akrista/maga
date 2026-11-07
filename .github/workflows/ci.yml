@@ -11,8 +11,12 @@ env:
 
 jobs:
   check:
-    name: Format, Clippy & Test
-    runs-on: ubuntu-latest
+    name: Format, Clippy & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

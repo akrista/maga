@@ -221,26 +221,74 @@ pub fn probe_stdio_server(
         return Err("Stdio server has no command configured".to_string());
     }
 
-    let mut command = Command::new(cmd_str);
-    command
-        .args(&cfg.args)
-        .envs(&cfg.env)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("Failed to spawn '{cmd_str}': {e}"))?;
+    let mut child =
+        spawn_stdio_child(cmd_str, cfg).map_err(|e| format!("Failed to spawn '{cmd_str}': {e}"))?;
 
     let deadline = Instant::now() + timeout;
     let res = run_stdio_handshake(&mut child, deadline);
 
-    // Always terminate and reap the child process so no orphans remain
-    let _ = child.kill();
-    let _ = child.wait();
+    // Always terminate and reap the child process tree so no orphans remain
+    kill_and_reap_child(&mut child);
 
     res
+}
+
+fn spawn_stdio_child(cmd_str: &str, cfg: &McpServerConfig) -> std::io::Result<Child> {
+    #[cfg(windows)]
+    {
+        let lower = cmd_str.to_ascii_lowercase();
+        if lower.ends_with(".cmd") || lower.ends_with(".bat") {
+            return Command::new("cmd")
+                .arg("/C")
+                .arg(cmd_str)
+                .args(&cfg.args)
+                .envs(&cfg.env)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
+        }
+    }
+
+    let direct = Command::new(cmd_str)
+        .args(&cfg.args)
+        .envs(&cfg.env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+
+    #[cfg(windows)]
+    if let Err(ref e) = direct
+        && e.kind() == std::io::ErrorKind::NotFound
+    {
+        return Command::new("cmd")
+            .arg("/C")
+            .arg(cmd_str)
+            .args(&cfg.args)
+            .envs(&cfg.env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+    }
+
+    direct
+}
+
+fn kill_and_reap_child(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        let pid = child.id().to_string();
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn run_stdio_handshake(child: &mut Child, deadline: Instant) -> Result<ProbeOutcome, String> {
@@ -511,7 +559,29 @@ data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"resolve-l
 
     #[test]
     fn probes_stdio_server_with_banner_and_extracts_tools() {
-        let script = r#"
+        #[cfg(windows)]
+        let (_dir, cfg) = {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cmd_path = dir.path().join("mock-mcp.cmd");
+            let script = "@echo off\r\n\
+echo Starting custom MCP server banner...\r\n\
+set /p line1=\r\n\
+echo {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"serverInfo\":{\"name\":\"mock-stdio\",\"version\":\"0.4.2\"}}}\r\n\
+set /p line2=\r\n\
+echo {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"read_file\",\"description\":\"Reads a file from disk\"},{\"name\":\"list_dir\"}]}}\r\n\
+ping -n 30 127.0.0.1 >nul\r\n";
+            std::fs::write(&cmd_path, script).expect("write mock-mcp.cmd");
+            // Pass path without .cmd extension to also verify Windows command shim resolution via `cmd /C`
+            let shim_no_ext = dir.path().join("mock-mcp");
+            (
+                dir,
+                McpServerConfig::new_stdio(shim_no_ext.to_string_lossy().to_string(), vec![]),
+            )
+        };
+
+        #[cfg(not(windows))]
+        let cfg = {
+            let script = r#"
 echo "Starting custom MCP server banner..."
 read line1
 echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"mock-stdio","version":"0.4.2"}}}'
@@ -520,7 +590,9 @@ read line3
 echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"read_file","description":"Reads a file from disk"},{"name":"list_dir"}]}}'
 sleep 30
 "#;
-        let cfg = McpServerConfig::new_stdio("sh", vec!["-c".to_string(), script.to_string()]);
+            McpServerConfig::new_stdio("sh", vec!["-c".to_string(), script.to_string()])
+        };
+
         let state = probe_server(&cfg, Duration::from_secs(3));
         match state {
             ServerProbeState::Online(outcome) => {
@@ -540,6 +612,15 @@ sleep 30
 
     #[test]
     fn stdio_probe_handles_process_error_and_timeout_cleanly() {
+        #[cfg(windows)]
+        let fail_cfg = McpServerConfig::new_stdio(
+            "cmd",
+            vec![
+                "/C".to_string(),
+                "echo missing API_KEY 1>&2 & exit /b 1".to_string(),
+            ],
+        );
+        #[cfg(not(windows))]
         let fail_cfg = McpServerConfig::new_stdio(
             "sh",
             vec![
@@ -547,6 +628,7 @@ sleep 30
                 "echo 'missing API_KEY' >&2; exit 1".to_string(),
             ],
         );
+
         match probe_server(&fail_cfg, Duration::from_secs(2)) {
             ServerProbeState::Failed { error, .. } => {
                 assert!(
@@ -557,8 +639,15 @@ sleep 30
             other => panic!("Expected Failed, got {other:?}"),
         }
 
+        #[cfg(windows)]
+        let hang_cfg = McpServerConfig::new_stdio(
+            "cmd",
+            vec!["/C".to_string(), "ping -n 15 127.0.0.1 >nul".to_string()],
+        );
+        #[cfg(not(windows))]
         let hang_cfg =
             McpServerConfig::new_stdio("sh", vec!["-c".to_string(), "sleep 10".to_string()]);
+
         let start = Instant::now();
         match probe_server(&hang_cfg, Duration::from_millis(200)) {
             ServerProbeState::Failed { error, .. } => {

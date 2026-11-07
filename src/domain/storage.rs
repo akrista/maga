@@ -221,7 +221,9 @@ impl StoragePaths {
 }
 
 pub fn expand_tilde(path_str: &str) -> PathBuf {
-    if let Some(rest) = path_str.strip_prefix("~/")
+    if let Some(rest) = path_str
+        .strip_prefix("~/")
+        .or_else(|| path_str.strip_prefix("~\\"))
         && let Some(home) = dirs::home_dir()
     {
         return home.join(rest);
@@ -749,22 +751,22 @@ url = "https://mcp.context7.com/mcp"
             r#"
 [tools.antigravity]
 enabled = true
-config_path = "{}"
+config_path = '{}'
 
 [tools.claude]
 enabled = false
 
 [tools.copilot]
 enabled = true
-config_path = "{}"
+config_path = '{}'
 
 [tools.grok]
 enabled = true
-config_path = "{}"
+config_path = '{}'
 
 [tools.opencode]
 enabled = true
-config_path = "{}"
+config_path = '{}'
 "#,
             custom_agy.display(),
             custom_copilot.display(),
@@ -900,6 +902,19 @@ url = "https://mcp.docs.astro.build/mcp"
         assert_eq!(
             reloaded.mcp.mcps["sqlite-mcp"].description.as_deref(),
             Some("Local SQLite database MCP")
+        );
+    }
+
+    #[test]
+    fn expands_tilde_with_forward_and_backslash_prefixes() {
+        let home = dirs::home_dir().expect("home dir");
+        assert_eq!(
+            expand_tilde("~/.gemini/config/mcp_config.json"),
+            home.join(".gemini/config/mcp_config.json")
+        );
+        assert_eq!(
+            expand_tilde(r"~\.gemini\config\mcp_config.json"),
+            home.join(r".gemini\config\mcp_config.json")
         );
     }
 }

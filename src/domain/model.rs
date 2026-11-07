@@ -453,6 +453,8 @@ pub struct UiConfig {
     pub hide_ui: bool,
     #[serde(default = "default_enabled")]
     pub animations: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor: Option<String>,
 }
 
 impl Default for UiConfig {
@@ -464,6 +466,7 @@ impl Default for UiConfig {
             hero_mascot: true,
             hide_ui: false,
             animations: true,
+            editor: None,
         }
     }
 }
@@ -564,6 +567,22 @@ impl MagaConfig {
             }
         }
         true
+    }
+
+    /// Returns the configured external editor from top-level `editor` or `[ui].editor` if non-empty.
+    pub fn configured_editor(&self) -> Option<&str> {
+        self.settings
+            .get("editor")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.ui
+                    .editor
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            })
     }
 
     /// Extracts and removes a legacy `[mcps]` table from `config.toml`, validating all entries.
@@ -997,5 +1016,18 @@ url = "https://mcp.docs.astro.build/mcp"
         let parsed_snippet =
             SingleServerSnippet::from_editor_toml(&editor_toml).expect("parse editor toml");
         assert_eq!(parsed_snippet, snippet);
+    }
+
+    #[test]
+    fn reads_configured_editor_from_top_level_or_ui_table() {
+        let empty = MagaConfig::default();
+        assert_eq!(empty.configured_editor(), None);
+
+        let top_level = MagaConfig::from_toml_str("editor = \"nvim\"\n").expect("top-level editor");
+        assert_eq!(top_level.configured_editor(), Some("nvim"));
+
+        let ui_level =
+            MagaConfig::from_toml_str("[ui]\neditor = \"code --wait\"\n").expect("ui editor");
+        assert_eq!(ui_level.configured_editor(), Some("code --wait"));
     }
 }

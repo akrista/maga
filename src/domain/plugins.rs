@@ -272,9 +272,8 @@ fn extract_grok_registry_display_name(installed_dir: &Path, id: &str) -> Option<
 }
 
 fn plugin_path_basename(id: &str) -> String {
-    id.rsplit('/')
-        .next()
-        .filter(|s| !s.is_empty())
+    id.rsplit(['/', '\\'])
+        .find(|s| !s.is_empty())
         .unwrap_or(id)
         .to_string()
 }
@@ -2018,5 +2017,10 @@ disabled = []
             .expect("opaque grok plugin");
         assert_eq!(plugin.display_name, "registry-named-plugin");
         assert_eq!(plugin.description.as_deref(), Some("Fallback via registry"));
+        assert_eq!(
+            plugin_path_basename(r"C:\Users\dev\.grok\plugins\my-plugin"),
+            "my-plugin"
+        );
+        assert_eq!(plugin_path_basename("user/noisy-plugin"), "noisy-plugin");
     }
 }

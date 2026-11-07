@@ -50,7 +50,7 @@ impl AgyDocument {
         self.raw_root
             .get("mcpServers")
             .and_then(Value::as_object)
-            .is_some_and(|m| m.keys().any(|k| k.chars().any(char::is_whitespace)))
+            .is_some_and(|m| m.keys().any(|k| normalize_mcp_server_name(k) != *k))
     }
 
     pub fn to_json_string(
@@ -132,7 +132,6 @@ fn serialize_agy_server(server: &McpServerConfig) -> Value {
     let mut obj = Map::new();
     match server.transport {
         Transport::Stdio => {
-            obj.insert("type".to_string(), json!("stdio"));
             if let Some(cmd) = &server.command {
                 obj.insert("command".to_string(), json!(cmd));
             }
@@ -144,7 +143,6 @@ fn serialize_agy_server(server: &McpServerConfig) -> Value {
             }
         }
         Transport::Http => {
-            obj.insert("type".to_string(), json!("http"));
             if let Some(url) = &server.url {
                 obj.insert("url".to_string(), json!(url));
             }
@@ -226,6 +224,7 @@ mod tests {
         assert!(!reparsed.has_raw_spaced_keys());
         assert_eq!(doc.servers, reparsed.servers);
         assert!(!out_json.contains("serverUrl"));
+        assert!(!out_json.contains("\"type\""));
         assert!(!out_json.contains("Astro Docs"));
         assert!(out_json.contains("Astro-Docs"));
     }

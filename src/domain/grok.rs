@@ -50,7 +50,7 @@ impl GrokDocument {
         self.raw_root
             .get("mcp_servers")
             .and_then(Value::as_table)
-            .is_some_and(|m| m.keys().any(|k| k.chars().any(char::is_whitespace)))
+            .is_some_and(|m| m.keys().any(|k| normalize_mcp_server_name(k) != *k))
     }
 
     pub fn to_toml_string(

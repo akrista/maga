@@ -51,7 +51,7 @@ impl CopilotDocument {
         self.raw_root
             .get("mcpServers")
             .and_then(Value::as_object)
-            .is_some_and(|m| m.keys().any(|k| k.chars().any(char::is_whitespace)))
+            .is_some_and(|m| m.keys().any(|k| normalize_mcp_server_name(k) != *k))
     }
 
     pub fn to_json_string(

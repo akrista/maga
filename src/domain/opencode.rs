@@ -73,7 +73,7 @@ impl OpenCodeDocument {
             };
             return source_map
                 .keys()
-                .any(|k| k.chars().any(char::is_whitespace));
+                .any(|k| normalize_mcp_server_name(k) != *k);
         }
         false
     }

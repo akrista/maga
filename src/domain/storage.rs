@@ -301,7 +301,9 @@ impl LoadedConfigs {
                 .map_err(|e| format!("Failed to read {}: {e}", paths.mcp_toml.display()))?;
             if let Ok(raw_tbl) = toml::from_str::<toml::Table>(&content)
                 && let Some(mcps_tbl) = raw_tbl.get("mcps").and_then(|v| v.as_table())
-                && mcps_tbl.keys().any(|k| k.chars().any(char::is_whitespace))
+                && mcps_tbl
+                    .keys()
+                    .any(|k| crate::domain::model::normalize_mcp_server_name(k) != *k)
             {
                 mcp_had_spaced_keys = true;
             }

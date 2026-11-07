@@ -66,14 +66,14 @@ impl ClaudeDocument {
             .raw_root
             .get("mcpServers")
             .and_then(Value::as_object)
-            .is_some_and(|m| m.keys().any(|k| k.chars().any(char::is_whitespace)));
+            .is_some_and(|m| m.keys().any(|k| normalize_mcp_server_name(k) != *k));
         let array_has_spaced = |obj: &Map<String, Value>| {
             for key in ["disabledMcpServers", "enabledMcpServers"] {
                 if let Some(Value::Array(arr)) = obj.get(key)
                     && arr
                         .iter()
                         .filter_map(Value::as_str)
-                        .any(|s| !s.starts_with("plugin:") && s.chars().any(char::is_whitespace))
+                        .any(|s| !s.starts_with("plugin:") && normalize_mcp_server_name(s) != s)
                 {
                     return true;
                 }
@@ -138,7 +138,7 @@ fn sync_mcp_toggle_arrays(
     raw_mcp_names: &BTreeSet<String>,
 ) {
     let is_removed_or_spaced_entry = |entry: &str| {
-        if entry.chars().any(char::is_whitespace) {
+        if normalize_mcp_server_name(entry) != entry {
             return true;
         }
         let norm = normalize_mcp_server_name(entry);

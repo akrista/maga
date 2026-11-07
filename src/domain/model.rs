@@ -602,19 +602,32 @@ impl MagaConfig {
     }
 }
 
-/// Normalizes an MCP server identifier by trimming outer whitespace and collapsing internal
-/// whitespace sequences into a single hyphen (`'-'`).
+/// Normalizes an MCP server identifier by trimming and collapsing any sequences of characters
+/// outside `[a-zA-Z0-9_-]` (such as spaces or periods) into a single hyphen (`'-'`).
 pub fn normalize_mcp_server_name(raw: &str) -> String {
-    raw.split_whitespace().collect::<Vec<_>>().join("-")
+    raw.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
-/// Validates that an MCP server identifier is non-empty and contains no whitespace characters.
+/// Validates that an MCP server identifier is non-empty and contains only ASCII alphanumeric
+/// characters, hyphens (`'-'`), or underscores (`'_'`).
 pub fn validate_mcp_server_name(name: &str) -> Result<(), String> {
     if name.trim().is_empty() {
         return Err("MCP server name cannot be empty.".to_string());
     }
     if name.chars().any(char::is_whitespace) {
         return Err("MCP server name cannot contain spaces or whitespace.".to_string());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(
+            "MCP server name can only contain letters, digits, hyphens ('-'), and underscores ('_')."
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -627,14 +640,14 @@ pub struct McpRegistry {
 }
 
 impl McpRegistry {
-    /// Normalizes any whitespace-containing server keys in `self.mcps` in-place and returns `true`
-    /// if any key was modified. If both a spaced key and its normalized equivalent exist in the same
+    /// Normalizes any invalid-character server keys in `self.mcps` in-place and returns `true`
+    /// if any key was modified. If both an unnormalized key and its normalized equivalent exist in the same
     /// map, the already-normalized key takes precedence.
     pub fn normalize_names(&mut self) -> bool {
         let had_spaced = self
             .mcps
             .keys()
-            .any(|k| k.trim().is_empty() || k.chars().any(char::is_whitespace));
+            .any(|k| k.trim().is_empty() || normalize_mcp_server_name(k) != *k);
         if !had_spaced {
             return false;
         }
@@ -926,12 +939,21 @@ config_path = "~/.grok/custom.toml"
             normalize_mcp_server_name("  my   custom\tmcp  "),
             "my-custom-mcp"
         );
+        assert_eq!(
+            normalize_mcp_server_name("Home-AppTBTBConnect2.0"),
+            "Home-AppTBTBConnect2-0"
+        );
+        assert_eq!(
+            normalize_mcp_server_name("Home-AppTBTBConnect2.0_Customer"),
+            "Home-AppTBTBConnect2-0_Customer"
+        );
         assert!(validate_mcp_server_name("astro-docs").is_ok());
         assert!(validate_mcp_server_name("Astro-Docs_v2").is_ok());
         assert!(validate_mcp_server_name("").is_err());
         assert!(validate_mcp_server_name("   ").is_err());
         assert!(validate_mcp_server_name("Astro Docs").is_err());
         assert!(validate_mcp_server_name("astro\tdocs").is_err());
+        assert!(validate_mcp_server_name("Home-AppTBTBConnect2.0").is_err());
 
         // SingleServerSnippet rejects spaced names from $EDITOR
         let bad_editor = r#"
@@ -943,16 +965,23 @@ url = "https://mcp.docs.astro.build/mcp"
         let err = SingleServerSnippet::from_editor_toml(bad_editor).unwrap_err();
         assert!(err.contains("cannot contain spaces"));
 
-        // McpRegistry::from_toml_str auto-normalizes spaced table keys on load
+        // McpRegistry::from_toml_str auto-normalizes spaced and dotted table keys on load
         let raw_registry = r#"
 [mcps."Astro Docs"]
 enabled = true
 transport = "http"
 url = "https://mcp.docs.astro.build/mcp"
+
+[mcps."Home-AppTBTBConnect2.0"]
+enabled = true
+transport = "http"
+url = "https://mcp.example.com/mcp"
 "#;
         let reg = McpRegistry::from_toml_str(raw_registry).expect("auto-normalize mcp.toml keys");
         assert!(reg.mcps.contains_key("Astro-Docs"));
         assert!(!reg.mcps.contains_key("Astro Docs"));
+        assert!(reg.mcps.contains_key("Home-AppTBTBConnect2-0"));
+        assert!(!reg.mcps.contains_key("Home-AppTBTBConnect2.0"));
 
         // Direct McpRegistry::validate rejects unnormalized spaced keys in memory
         let mut unnormalized = McpRegistry::default();

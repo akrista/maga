@@ -35,8 +35,8 @@ pub struct StoragePaths {
 
 impl StoragePaths {
     pub fn resolve_default() -> Result<Self, String> {
-        let home =
-            dirs::home_dir().ok_or_else(|| "Could not determine $HOME directory.".to_string())?;
+        let home = std::env::home_dir()
+            .ok_or_else(|| "Could not determine $HOME directory.".to_string())?;
         let config_root = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".config"));
@@ -224,7 +224,7 @@ pub fn expand_tilde(path_str: &str) -> PathBuf {
     if let Some(rest) = path_str
         .strip_prefix("~/")
         .or_else(|| path_str.strip_prefix("~\\"))
-        && let Some(home) = dirs::home_dir()
+        && let Some(home) = std::env::home_dir()
     {
         return home.join(rest);
     }
@@ -909,7 +909,7 @@ url = "https://mcp.docs.astro.build/mcp"
 
     #[test]
     fn expands_tilde_with_forward_and_backslash_prefixes() {
-        let home = dirs::home_dir().expect("home dir");
+        let home = std::env::home_dir().expect("home dir");
         assert_eq!(
             expand_tilde("~/.gemini/config/mcp_config.json"),
             home.join(".gemini/config/mcp_config.json")

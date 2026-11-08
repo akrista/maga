@@ -422,11 +422,11 @@ pub fn probe_http_server(cfg: &McpServerConfig, timeout: Duration) -> Result<Pro
         return Err("HTTP server has no URL configured".to_string());
     }
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(timeout)
-        .timeout_read(timeout)
-        .timeout_write(timeout)
-        .build();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .http_status_as_error(false)
+        .build()
+        .into();
 
     // 1. Send `initialize` (id = 1)
     let (init_body, session_id) = send_http_jsonrpc(
@@ -478,38 +478,43 @@ fn send_http_jsonrpc(
 ) -> Result<(String, Option<String>), String> {
     let mut req = agent
         .post(url)
-        .set("Content-Type", "application/json")
-        .set("Accept", "application/json, text/event-stream");
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream");
 
     for (k, v) in headers {
-        req = req.set(k, v);
+        req = req.header(k.as_str(), v.as_str());
     }
     if let Some(sid) = session_id {
-        req = req.set("Mcp-Session-Id", sid);
+        req = req.header("Mcp-Session-Id", sid);
     }
 
-    match req.send_json(payload.clone()) {
-        Ok(resp) => {
+    match req.send_json(payload) {
+        Ok(mut resp) => {
+            let code = resp.status().as_u16();
             let sid = resp
-                .header("Mcp-Session-Id")
-                .or_else(|| resp.header("mcp-session-id"))
+                .headers()
+                .get("Mcp-Session-Id")
+                .or_else(|| resp.headers().get("mcp-session-id"))
+                .and_then(|v| v.to_str().ok())
                 .map(ToString::to_string);
-            let body = resp
-                .into_string()
-                .map_err(|e| format!("Failed reading HTTP response body: {e}"))?;
-            Ok((body, sid))
-        }
-        Err(ureq::Error::Status(code, resp)) => {
-            let body = resp.into_string().unwrap_or_default();
-            let detail = body.lines().next().unwrap_or("").trim();
-            if detail.is_empty() {
-                Err(format!("HTTP {code}"))
+            if code >= 400 {
+                let body = resp.body_mut().read_to_string().unwrap_or_default();
+                let detail = body.lines().next().unwrap_or("").trim();
+                if detail.is_empty() {
+                    Err(format!("HTTP {code}"))
+                } else {
+                    let snippet: String = detail.chars().take(100).collect();
+                    Err(format!("HTTP {code}: {snippet}"))
+                }
             } else {
-                let snippet: String = detail.chars().take(100).collect();
-                Err(format!("HTTP {code}: {snippet}"))
+                let body = resp
+                    .body_mut()
+                    .read_to_string()
+                    .map_err(|e| format!("Failed reading HTTP response body: {e}"))?;
+                Ok((body, sid))
             }
         }
-        Err(ureq::Error::Transport(t)) => Err(format!("HTTP transport error: {t}")),
+        Err(e) => Err(format!("HTTP transport error: {e}")),
     }
 }
 

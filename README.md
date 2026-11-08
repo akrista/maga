@@ -118,7 +118,7 @@ curl -fsSL "https://github.com/akrista/maga/releases/latest/download/maga-v0.1.0
 cargo binstall --git https://github.com/akrista/maga maga
 ```
 
-**Option 2 — Install from GitHub via Cargo (Rust 1.85+)**
+**Option 2 — Install from GitHub via Cargo (Rust 1.88+)**
 
 ```bash
 cargo install --git https://github.com/akrista/maga

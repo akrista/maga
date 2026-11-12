@@ -81,7 +81,8 @@ pub fn map_workspace_key(key: KeyEvent) -> Option<Action> {
         }
         (KeyModifiers::NONE, KeyCode::Char('1')) => Some(Action::SelectMcpsSection),
         (KeyModifiers::NONE, KeyCode::Char('2')) => Some(Action::SelectPluginsSection),
-        (KeyModifiers::NONE, KeyCode::Char('/')) => Some(Action::StartFilter),
+        (KeyModifiers::NONE, KeyCode::Char('/'))
+        | (KeyModifiers::SHIFT, KeyCode::Char('/')) => Some(Action::StartFilter),
         (KeyModifiers::NONE, KeyCode::Char('a')) => Some(Action::AddForm),
         (KeyModifiers::NONE, KeyCode::Char('e')) => Some(Action::EditForm),
         (KeyModifiers::SHIFT, KeyCode::Char('E')) | (KeyModifiers::NONE, KeyCode::Char('E')) => {
@@ -106,7 +107,8 @@ pub fn map_workspace_key(key: KeyEvent) -> Option<Action> {
             Some(Action::ProbeAll)
         }
         (KeyModifiers::NONE, KeyCode::Char('t')) => Some(Action::ToggleDetailsFocus),
-        (KeyModifiers::NONE, KeyCode::Char('?')) => Some(Action::ToggleHelp),
+        (KeyModifiers::NONE, KeyCode::Char('?'))
+        | (KeyModifiers::SHIFT, KeyCode::Char('?')) => Some(Action::ToggleHelp),
         (KeyModifiers::NONE, KeyCode::Esc) => Some(Action::CancelModal),
         _ => None,
     }
@@ -115,6 +117,31 @@ pub fn map_workspace_key(key: KeyEvent) -> Option<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maps_symbol_shortcuts_with_optional_shift_only() {
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+            assert_eq!(
+                map_workspace_key(KeyEvent::new(KeyCode::Char('/'), modifiers)),
+                Some(Action::StartFilter)
+            );
+            assert_eq!(
+                map_workspace_key(KeyEvent::new(KeyCode::Char('?'), modifiers)),
+                Some(Action::ToggleHelp)
+            );
+        }
+
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            assert_eq!(
+                map_workspace_key(KeyEvent::new(KeyCode::Char('/'), modifiers)),
+                None
+            );
+            assert_eq!(
+                map_workspace_key(KeyEvent::new(KeyCode::Char('?'), modifiers)),
+                None
+            );
+        }
+    }
 
     #[test]
     fn maps_extended_navigation_keys() {

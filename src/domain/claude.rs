@@ -1,4 +1,6 @@
-use crate::domain::model::{McpServerConfig, Transport, normalize_mcp_server_name};
+use crate::domain::model::{
+    McpServerConfig, ProjectPolicy, Transport, normalize_mcp_server_name,
+};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -95,6 +97,82 @@ impl ClaudeDocument {
         false
     }
 
+    pub fn project_paths(&self) -> Vec<String> {
+        self.raw_root
+            .get("projects")
+            .and_then(Value::as_object)
+            .map(|p| p.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn project_server_state(&self, project_path: &str, server_name: &str) -> Option<bool> {
+        let projects = self.raw_root.get("projects")?.as_object()?;
+        let proj = projects.get(project_path)?.as_object()?;
+        let norm = normalize_mcp_server_name(server_name);
+        if let Some(Value::Array(disabled)) = proj.get("disabledMcpServers") {
+            if disabled
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|s| s == server_name || s == norm)
+            {
+                return Some(false);
+            }
+        }
+        if let Some(Value::Array(enabled)) = proj.get("enabledMcpServers") {
+            if enabled
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|s| s == server_name || s == norm)
+            {
+                return Some(true);
+            }
+        }
+        None
+    }
+
+    pub fn toggle_project_server(&mut self, project_path: &str, server_name: &str) {
+        let current = self.project_server_state(project_path, server_name);
+        let Some(Value::Object(projects)) = self.raw_root.get_mut("projects") else {
+            return;
+        };
+        let Some(Value::Object(proj)) = projects.get_mut(project_path) else {
+            return;
+        };
+        for key in ["disabledMcpServers", "enabledMcpServers"] {
+            if let Some(Value::Array(arr)) = proj.get_mut(key) {
+                let norm = normalize_mcp_server_name(server_name);
+                arr.retain(|v| {
+                    if let Some(s) = v.as_str() {
+                        s != server_name && s != norm
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
+        match current {
+            None => {
+                let entry = proj
+                    .entry("enabledMcpServers".to_string())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let Value::Array(arr) = entry {
+                    arr.push(json!(server_name));
+                }
+            }
+            Some(true) => {
+                let entry = proj
+                    .entry("disabledMcpServers".to_string())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let Value::Array(arr) = entry {
+                    arr.push(json!(server_name));
+                }
+            }
+            Some(false) => {
+                // Inherit from global
+            }
+        }
+    }
+
     pub fn to_json_string(
         &self,
         canonical: &BTreeMap<String, McpServerConfig>,
@@ -116,12 +194,12 @@ impl ClaudeDocument {
         }
         root.insert("mcpServers".to_string(), Value::Object(mcp_servers));
 
-        sync_mcp_toggle_arrays(&mut root, canonical, &self.servers, &raw_mcp_names);
+        sync_mcp_toggle_arrays(&mut root, canonical, &self.servers, &raw_mcp_names, false);
 
         if let Some(Value::Object(projects)) = root.get_mut("projects") {
             for env_val in projects.values_mut() {
                 if let Value::Object(env_obj) = env_val {
-                    sync_mcp_toggle_arrays(env_obj, canonical, &self.servers, &raw_mcp_names);
+                    sync_mcp_toggle_arrays(env_obj, canonical, &self.servers, &raw_mcp_names, true);
                 }
             }
         }
@@ -136,6 +214,7 @@ fn sync_mcp_toggle_arrays(
     canonical: &BTreeMap<String, McpServerConfig>,
     previous_servers: &BTreeMap<String, McpServerConfig>,
     raw_mcp_names: &BTreeSet<String>,
+    is_project: bool,
 ) {
     let is_removed_or_spaced_entry = |entry: &str| {
         if normalize_mcp_server_name(entry) != entry {
@@ -164,13 +243,30 @@ fn sync_mcp_toggle_arrays(
     let mut new_disabled: Vec<String> = existing_disabled
         .into_iter()
         .filter(|entry| {
-            entry.starts_with("plugin:")
-                || (!is_removed_or_spaced_entry(entry)
-                    && canonical.get(entry).is_none_or(|cfg| !cfg.enabled))
+            if entry.starts_with("plugin:") {
+                return true;
+            }
+            if is_removed_or_spaced_entry(entry) {
+                return false;
+            }
+            if is_project {
+                if let Some(cfg) = canonical.get(entry) {
+                    if cfg.project_policy == ProjectPolicy::Preserve {
+                        return true;
+                    }
+                    return !cfg.enabled;
+                }
+                true
+            } else {
+                canonical.get(entry).is_none_or(|cfg| !cfg.enabled)
+            }
         })
         .collect();
 
     for (name, server) in canonical {
+        if is_project && server.project_policy == ProjectPolicy::Preserve {
+            continue;
+        }
         if !server.enabled && !new_disabled.contains(name) {
             new_disabled.push(name.clone());
         }
@@ -193,13 +289,30 @@ fn sync_mcp_toggle_arrays(
     let mut new_enabled: Vec<String> = existing_enabled
         .into_iter()
         .filter(|entry| {
-            entry.starts_with("plugin:")
-                || (!is_removed_or_spaced_entry(entry)
-                    && canonical.get(entry).is_none_or(|cfg| cfg.enabled))
+            if entry.starts_with("plugin:") {
+                return true;
+            }
+            if is_removed_or_spaced_entry(entry) {
+                return false;
+            }
+            if is_project {
+                if let Some(cfg) = canonical.get(entry) {
+                    if cfg.project_policy == ProjectPolicy::Preserve {
+                        return true;
+                    }
+                    return cfg.enabled;
+                }
+                true
+            } else {
+                canonical.get(entry).is_none_or(|cfg| cfg.enabled)
+            }
         })
         .collect();
 
     for (name, server) in canonical {
+        if is_project && server.project_policy == ProjectPolicy::Preserve {
+            continue;
+        }
         if server.enabled && !new_enabled.contains(name) {
             new_enabled.push(name.clone());
         }
@@ -254,7 +367,7 @@ fn parse_claude_server(obj: &Map<String, Value>) -> Option<McpServerConfig> {
     let env = extract_string_map(obj.get("env"));
     let headers = extract_string_map(obj.get("headers"));
 
-    Some(McpServerConfig {
+    let mut server = McpServerConfig {
         enabled,
         description: None,
         transport,
@@ -263,7 +376,11 @@ fn parse_claude_server(obj: &Map<String, Value>) -> Option<McpServerConfig> {
         env,
         url,
         headers,
-    })
+        harnesses: BTreeMap::new(),
+        project_policy: crate::domain::model::ProjectPolicy::Mirror,
+    };
+    server.unwrap_windows_shim();
+    Some(server)
 }
 
 fn serialize_claude_server(server: &McpServerConfig) -> Value {
@@ -460,5 +577,55 @@ mod tests {
         let b_enabled = proj_b["enabledMcpServers"].as_array().unwrap();
         assert_eq!(b_disabled, &vec![json!("context7")]);
         assert_eq!(b_enabled, &vec![json!("Astro-Docs")]);
+    }
+
+    #[test]
+    fn preserves_project_toggles_when_project_policy_is_preserve() {
+        let fixture = r#"{
+          "disabledMcpServers": [],
+          "enabledMcpServers": ["context7", "ssh-mcp"],
+          "mcpServers": {
+            "context7": { "type": "http", "url": "https://mcp.context7.com/mcp" },
+            "ssh-mcp": { "type": "stdio", "command": "ssh-mcp" },
+            "obsolete-mcp": { "type": "stdio", "command": "obsolete" }
+          },
+          "projects": {
+            "/home/dev/work-repo": {
+              "disabledMcpServers": ["context7"],
+              "enabledMcpServers": ["ssh-mcp", "obsolete-mcp"]
+            }
+          }
+        }"#;
+
+        let mut doc = ClaudeDocument::parse_json_str(fixture).expect("parse claude json");
+        // context7 is globally enabled, but has project_policy = Preserve
+        doc.servers.get_mut("context7").unwrap().enabled = true;
+        doc.servers.get_mut("context7").unwrap().project_policy = ProjectPolicy::Preserve;
+
+        // ssh-mcp is globally disabled, but has project_policy = Mirror
+        doc.servers.get_mut("ssh-mcp").unwrap().enabled = false;
+        doc.servers.get_mut("ssh-mcp").unwrap().project_policy = ProjectPolicy::Mirror;
+
+        // delete obsolete-mcp
+        doc.servers.remove("obsolete-mcp");
+
+        let out = doc.to_json_string(&doc.servers).expect("serialize claude json");
+        let raw: Map<String, Value> = serde_json::from_str(&out).expect("parse raw json");
+
+        let work_proj = raw["projects"]["/home/dev/work-repo"].as_object().unwrap();
+        let disabled = work_proj["disabledMcpServers"].as_array().unwrap();
+        let enabled = work_proj["enabledMcpServers"].as_array().unwrap();
+
+        // context7 was disabled in this project and had Preserve policy -> remains disabled here!
+        assert!(disabled.contains(&json!("context7")));
+        assert!(!enabled.contains(&json!("context7")));
+
+        // ssh-mcp had Mirror policy and is globally false -> mirrored to disabled
+        assert!(disabled.contains(&json!("ssh-mcp")));
+        assert!(!enabled.contains(&json!("ssh-mcp")));
+
+        // obsolete-mcp was deleted -> purged from both arrays
+        assert!(!disabled.contains(&json!("obsolete-mcp")));
+        assert!(!enabled.contains(&json!("obsolete-mcp")));
     }
 }

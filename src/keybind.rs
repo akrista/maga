@@ -16,6 +16,9 @@ pub enum Action {
     ToggleWorkspaceSection,
     SelectMcpsSection,
     SelectPluginsSection,
+    SelectGuidelinesSection,
+    SelectRefsSection,
+    UpdateSelectedRef,
     StartFilter,
     AddForm,
     EditForm,
@@ -23,6 +26,8 @@ pub enum Action {
     DeleteSelected,
     OpenConflicts,
     OpenOptions,
+    OpenProfiles,
+    OpenMatrix,
     ToggleHeroMascot,
     ToggleHideUi,
     RefreshFromDisk,
@@ -81,8 +86,12 @@ pub fn map_workspace_key(key: KeyEvent) -> Option<Action> {
         }
         (KeyModifiers::NONE, KeyCode::Char('1')) => Some(Action::SelectMcpsSection),
         (KeyModifiers::NONE, KeyCode::Char('2')) => Some(Action::SelectPluginsSection),
-        (KeyModifiers::NONE, KeyCode::Char('/'))
-        | (KeyModifiers::SHIFT, KeyCode::Char('/')) => Some(Action::StartFilter),
+        (KeyModifiers::NONE, KeyCode::Char('3')) => Some(Action::SelectGuidelinesSection),
+        (KeyModifiers::NONE, KeyCode::Char('4')) => Some(Action::SelectRefsSection),
+        (KeyModifiers::NONE, KeyCode::Char('u')) => Some(Action::UpdateSelectedRef),
+        (KeyModifiers::NONE, KeyCode::Char('/')) | (KeyModifiers::SHIFT, KeyCode::Char('/')) => {
+            Some(Action::StartFilter)
+        }
         (KeyModifiers::NONE, KeyCode::Char('a')) => Some(Action::AddForm),
         (KeyModifiers::NONE, KeyCode::Char('e')) => Some(Action::EditForm),
         (KeyModifiers::SHIFT, KeyCode::Char('E')) | (KeyModifiers::NONE, KeyCode::Char('E')) => {
@@ -91,6 +100,12 @@ pub fn map_workspace_key(key: KeyEvent) -> Option<Action> {
         (KeyModifiers::NONE, KeyCode::Char('d')) => Some(Action::DeleteSelected),
         (KeyModifiers::NONE, KeyCode::Char('c')) => Some(Action::OpenConflicts),
         (KeyModifiers::NONE, KeyCode::Char('o')) => Some(Action::OpenOptions),
+        (KeyModifiers::NONE, KeyCode::Char('w'))
+        | (KeyModifiers::NONE, KeyCode::Char('W'))
+        | (KeyModifiers::SHIFT, KeyCode::Char('W')) => Some(Action::OpenProfiles),
+        (KeyModifiers::NONE, KeyCode::Char('x'))
+        | (KeyModifiers::NONE, KeyCode::Char('X'))
+        | (KeyModifiers::SHIFT, KeyCode::Char('X')) => Some(Action::OpenMatrix),
         (KeyModifiers::NONE, KeyCode::Char('m'))
         | (KeyModifiers::NONE, KeyCode::Char('M'))
         | (KeyModifiers::SHIFT, KeyCode::Char('M')) => Some(Action::ToggleHeroMascot),
@@ -107,8 +122,9 @@ pub fn map_workspace_key(key: KeyEvent) -> Option<Action> {
             Some(Action::ProbeAll)
         }
         (KeyModifiers::NONE, KeyCode::Char('t')) => Some(Action::ToggleDetailsFocus),
-        (KeyModifiers::NONE, KeyCode::Char('?'))
-        | (KeyModifiers::SHIFT, KeyCode::Char('?')) => Some(Action::ToggleHelp),
+        (KeyModifiers::NONE, KeyCode::Char('?')) | (KeyModifiers::SHIFT, KeyCode::Char('?')) => {
+            Some(Action::ToggleHelp)
+        }
         (KeyModifiers::NONE, KeyCode::Esc) => Some(Action::CancelModal),
         _ => None,
     }
@@ -240,6 +256,22 @@ mod tests {
         assert_eq!(
             map_workspace_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
             Some(Action::FoldRight)
+        );
+        assert_eq!(
+            map_workspace_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+            Some(Action::OpenProfiles)
+        );
+        assert_eq!(
+            map_workspace_key(KeyEvent::new(KeyCode::Char('W'), KeyModifiers::SHIFT)),
+            Some(Action::OpenProfiles)
+        );
+        assert_eq!(
+            map_workspace_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            Some(Action::OpenMatrix)
+        );
+        assert_eq!(
+            map_workspace_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT)),
+            Some(Action::OpenMatrix)
         );
     }
 }

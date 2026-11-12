@@ -1,4 +1,5 @@
 use crate::app::{ActiveMode, App, WorkspaceSection};
+use crate::domain::model::{HarnessKind, ProjectPolicy};
 use crate::mascot::{
     build_ascii_splash_lines, render_fullscreen_background_canvas_with_state, sparkle_glyph,
 };
@@ -133,6 +134,27 @@ pub fn draw(f: &mut Frame, app: &App, base_theme: &Theme) {
                 theme,
             );
         }
+        ActiveMode::ProfilesModal { selected, items } => {
+            let modal_h = (items.len() + 8).clamp(10, 22) as u16;
+            fx_areas
+                .active_modal
+                .set(centered_rect(58, modal_h, area));
+            draw_profiles_modal(f, area, app, *selected, items, theme);
+        }
+        ActiveMode::NewProfileModal { input } => {
+            fx_areas
+                .active_modal
+                .set(centered_rect(52, 8, area));
+            draw_new_profile_modal(f, area, input, theme);
+        }
+        ActiveMode::MatrixModal { server_name, selected } => {
+            let project_count = app.loaded.claude.project_paths().len();
+            let modal_h = (9 + HarnessKind::ALL.len() + if project_count > 0 { 1 + project_count } else { 0 }).clamp(14, 26) as u16;
+            fx_areas
+                .active_modal
+                .set(centered_rect(68, modal_h, area));
+            draw_matrix_modal(f, area, app, server_name, *selected, theme);
+        }
         ActiveMode::Help => {
             let (help_w, help_h) = help_modal_dimensions(area);
             fx_areas
@@ -178,21 +200,115 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ("  ↻ auto: off".to_string(), theme.muted)
     };
 
-    let (mcp_tab_style, plugin_tab_style, section_active, section_total) = match app.section {
-        WorkspaceSection::Mcps => (theme.highlight, theme.muted, active, total),
-        WorkspaceSection::Plugins => (theme.muted, theme.highlight, active_plugins, total_plugins),
+    let active_guidelines = app
+        .guidelines_statuses
+        .iter()
+        .filter(|s| s.exists && s.matches_canonical)
+        .count();
+    let total_guidelines = app.guidelines_statuses.len();
+
+    let total_refs = app.loaded.refs.refs.len();
+    let cache_dir = app
+        .paths
+        .as_ref()
+        .map(|p| p.refs_cache_dir.clone())
+        .unwrap_or_else(|| std::path::PathBuf::from("refs"));
+    let active_refs = app
+        .loaded
+        .refs
+        .refs
+        .iter()
+        .filter(|(alias, entry)| {
+            let path = app.loaded.refs.effective_path(alias, entry, &cache_dir);
+            path.exists() && path.join(".git").exists()
+        })
+        .count();
+
+    let (mcp_tab_style, plugin_tab_style, guidelines_tab_style, refs_tab_style, section_active, section_total) =
+        match app.section {
+            WorkspaceSection::Mcps => (
+                theme.highlight,
+                theme.muted,
+                theme.muted,
+                theme.muted,
+                active,
+                total,
+            ),
+            WorkspaceSection::Plugins => (
+                theme.muted,
+                theme.highlight,
+                theme.muted,
+                theme.muted,
+                active_plugins,
+                total_plugins,
+            ),
+            WorkspaceSection::Guidelines => (
+                theme.muted,
+                theme.muted,
+                theme.highlight,
+                theme.muted,
+                active_guidelines,
+                total_guidelines,
+            ),
+            WorkspaceSection::Refs => (
+                theme.muted,
+                theme.muted,
+                theme.muted,
+                theme.highlight,
+                active_refs,
+                total_refs,
+            ),
+        };
+
+    let tab3_span = if area.width >= 105 {
+        Some(Span::styled(
+            format!("[3: Guidelines ({active_guidelines}/{total_guidelines})]"),
+            guidelines_tab_style,
+        ))
+    } else if area.width >= 88 {
+        Some(Span::styled("[3: Rules]".to_string(), guidelines_tab_style))
+    } else if app.section == WorkspaceSection::Guidelines {
+        Some(Span::styled("[3: Guidelines]".to_string(), guidelines_tab_style))
+    } else {
+        None
     };
 
-    let line1 = Line::from(vec![
+    let tab4_span = if area.width >= 115 {
+        Some(Span::styled(
+            format!("[4: Refs ({active_refs}/{total_refs})]"),
+            refs_tab_style,
+        ))
+    } else if area.width >= 98 {
+        Some(Span::styled("[4: Refs]".to_string(), refs_tab_style))
+    } else if app.section == WorkspaceSection::Refs {
+        Some(Span::styled("[4: Refs]".to_string(), refs_tab_style))
+    } else {
+        None
+    };
+
+    let mut line1_spans = vec![
         Span::styled(format!(" {sp} maga "), theme.highlight),
         Span::styled(" · ", theme.header),
         Span::styled(format!("[1: MCPs ({total})]"), mcp_tab_style),
         Span::styled("  ", theme.base),
         Span::styled(format!("[2: Plugins ({total_plugins})]"), plugin_tab_style),
-        Span::styled("  ", theme.base),
-        Span::styled(sync_badge, sync_style),
-        Span::styled(format!("  [{section_active}/{section_total}]"), theme.muted),
-    ]);
+    ];
+    if let Some(s) = tab3_span {
+        line1_spans.push(Span::styled("  ", theme.base));
+        line1_spans.push(s);
+    }
+    if let Some(s) = tab4_span {
+        line1_spans.push(Span::styled("  ", theme.base));
+        line1_spans.push(s);
+    }
+    line1_spans.push(Span::styled("  ", theme.base));
+    line1_spans.push(Span::styled(sync_badge, sync_style));
+    line1_spans.push(Span::styled(format!("  [{section_active}/{section_total}]"), theme.muted));
+    if let Some(ref prof) = app.loaded.config.active_profile {
+        line1_spans.push(Span::styled("  ", theme.base));
+        line1_spans.push(Span::styled(format!("[Profile: {prof}]"), theme.accent));
+    }
+    let line1 = Line::from(line1_spans);
     let mut line2_spans = vec![Span::styled(refresh_badge, refresh_style)];
     if let Some((ref msg, is_err)) = app.status_message {
         let msg_style = if is_err { theme.error } else { theme.accent };
@@ -214,6 +330,9 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             WorkspaceSection::Plugins => {
                 " Filter Plugins (name, desc, harness, skill/hook/mcp, is:/harness:/type:/desc:/skill:/hook:/mcp:) · Enter: keep · Esc: clear"
             }
+            WorkspaceSection::Guidelines | WorkspaceSection::Refs => {
+                " Guidelines View · Esc: back to normal"
+            }
         },
         ActiveMode::Form(_) => {
             " Tab/Shift+Tab: field · Space: switch transport · Enter: save · Esc: cancel"
@@ -227,21 +346,53 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ActiveMode::ConfirmDelete { .. } | ActiveMode::ConfirmDeletePlugin { .. } => {
             " y/Enter: Confirm delete · n/Esc: Cancel"
         }
+        ActiveMode::ProfilesModal { .. } => {
+            " ↑/↓/j/k: Select · Enter: Apply · a: New · e: $EDITOR · d: Delete · Esc: Cancel"
+        }
+        ActiveMode::NewProfileModal { .. } => " Enter: Create & switch profile · Esc: Cancel",
+        ActiveMode::MatrixModal { .. } => " ↑/↓/j/k: Navigate · Space: Toggle override · Enter/Esc: Close & Save",
         ActiveMode::Help => " j/k/↑/↓/PgUp/PgDn/g/G: Scroll shortcuts · Esc/q/?: Close help",
         ActiveMode::Normal if app.details_focused => {
             " j/k/PgUp/PgDn/g/G: scroll DETAILS  p: re-probe  t/Esc: return to list  ?: help  q: quit"
         }
         ActiveMode::Normal => match app.section {
             WorkspaceSection::Mcps => {
-                " Tab/1/2: view  j/k: nav  Space: toggle  p/P: probe  t: tools  m: mascot  o: options  r/R: refresh  /: filter  a/e/E: edit  d: del  c: conflicts  ?: help  q: quit"
+                " Tab/1/2/3/4: view  j/k: nav  Space: toggle  w: profile  x: matrix  p/P: probe  t: tools  m: mascot  o: options  r/R: refresh  /: filter  a/e/E: edit  d: del  c: conflicts  ?: help  q: quit"
             }
             WorkspaceSection::Plugins => {
-                " Tab/1/2: view  j/k: nav  h/l: fold  Space/Enter: toggle/fold  E: edit config  d: del  t: details  m: mascot  o: options  r/R: refresh  /: filter  ?: help  q: quit"
+                " Tab/1/2/3/4: view  j/k: nav  h/l: fold  Space/Enter: toggle/fold  E: edit config  d: del  t: details  m: mascot  o: options  r/R: refresh  /: filter  ?: help  q: quit"
+            }
+            WorkspaceSection::Guidelines => {
+                " Tab/1/2/3/4: view  j/k: nav  e/Enter: edit AGENTS.md  s: resync links  t: details  r/R: refresh  ?: help  q: quit"
+            }
+            WorkspaceSection::Refs => {
+                " Tab/1/2/3/4: view  j/k: nav  Enter: sync ref  r/R: refresh  ?: help  q: quit"
             }
         },
     };
 
-    let p = Paragraph::new(Span::styled(hints, theme.status_bar));
+    let update_badge = app
+        .available_update()
+        .map(|ver| format!("✦ Update: {ver} (maga --update) "));
+
+    let p = if let Some(badge) = update_badge {
+        let badge_len = badge.chars().count();
+        if (area.width as usize) > badge_len + 35 {
+            let left_width = (area.width as usize).saturating_sub(badge_len);
+            let truncated_hints: String = hints.chars().take(left_width).collect();
+            let pad_len = left_width.saturating_sub(truncated_hints.chars().count());
+            let padding = " ".repeat(pad_len);
+            Paragraph::new(Line::from(vec![
+                Span::styled(truncated_hints, theme.status_bar),
+                Span::raw(padding),
+                Span::styled(badge, theme.warning),
+            ]))
+        } else {
+            Paragraph::new(Span::styled(hints, theme.status_bar))
+        }
+    } else {
+        Paragraph::new(Span::styled(hints, theme.status_bar))
+    };
     f.render_widget(p, area);
 }
 
@@ -323,6 +474,207 @@ fn draw_confirm_delete_plugin_modal(
         .alignment(Alignment::Center)
         .block(block)
         .wrap(Wrap { trim: false });
+    f.render_widget(p, modal);
+}
+
+fn draw_profiles_modal(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    selected: usize,
+    items: &[String],
+    theme: &Theme,
+) {
+    let modal_h = (items.len() + 8).clamp(10, 22) as u16;
+    let modal = centered_rect(58, modal_h, area);
+    f.render_widget(Clear, modal);
+
+    let active_prof = app.loaded.config.active_profile.as_deref().unwrap_or("");
+    let block = Block::default()
+        .title(Span::styled(" ✦ SWITCH MCP PROFILE ✦ ", theme.header))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.accent)
+        .padding(Padding::new(PADDING_SM, PADDING_SM, PADDING_XS, PADDING_XS));
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Select active profile overlay (Enter: apply, a: new, e: edit, d: del):",
+        theme.muted,
+    )));
+    lines.push(Line::from(""));
+
+    for (idx, item) in items.iter().enumerate() {
+        let is_selected = idx == selected;
+        let is_active = (idx == 0 && active_prof.is_empty()) || item == active_prof;
+        let prefix = if is_selected { "▶ " } else { "  " };
+        let active_badge = if is_active { " [active]" } else { "" };
+        let style = if is_selected {
+            theme.highlight
+        } else if is_active {
+            theme.accent
+        } else {
+            theme.base
+        };
+        lines.push(Line::from(vec![
+            Span::styled(prefix, theme.accent),
+            Span::styled(item.clone(), style),
+            Span::styled(active_badge, theme.success),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("[Enter: Apply] ", theme.accent),
+        Span::styled("[a: New] ", theme.base),
+        Span::styled("[e: $EDITOR] ", theme.base),
+        Span::styled("[d: Delete] ", theme.error),
+        Span::styled("[Esc: Cancel]", theme.muted),
+    ]));
+
+    let p = Paragraph::new(lines).block(block);
+    f.render_widget(p, modal);
+}
+
+fn draw_matrix_modal(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    server_name: &str,
+    selected: usize,
+    theme: &Theme,
+) {
+    let projects = app.loaded.claude.project_paths();
+    let modal_h = (9 + HarnessKind::ALL.len() + if projects.is_empty() { 0 } else { 1 + projects.len() }).clamp(14, 26) as u16;
+    let modal = centered_rect(68, modal_h, area);
+    f.render_widget(Clear, modal);
+
+    let block = Block::default()
+        .title(Span::styled(format!(" ✦ HARNESS MATRIX: {server_name} ✦ "), theme.header))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.accent)
+        .padding(Padding::new(PADDING_SM, PADDING_SM, PADDING_XS, PADDING_XS));
+
+    let server_cfg = app.outcome.canonical.get(server_name).cloned().unwrap_or_else(|| {
+        crate::domain::model::McpServerConfig::new_http("http://localhost")
+    });
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("Global Base: ", theme.muted),
+        Span::styled(
+            if server_cfg.enabled { "Enabled" } else { "Disabled" },
+            if server_cfg.enabled { theme.success } else { theme.error },
+        ),
+        Span::styled("  ·  Space: toggle  ·  Enter/Esc: done", theme.muted),
+    ]));
+    lines.push(Line::from(""));
+
+    // Row 0: Project Policy (Claude Code)
+    let is_row_0 = selected == 0;
+    let r0_prefix = if is_row_0 { "▶ " } else { "  " };
+    let policy_str = match server_cfg.project_policy {
+        ProjectPolicy::Mirror => "Mirror (syncs all projects)",
+        ProjectPolicy::Preserve => "Preserve (keeps project custom overrides)",
+    };
+    lines.push(Line::from(vec![
+        Span::styled(r0_prefix, theme.accent),
+        Span::styled("Claude Project Policy: ", if is_row_0 { theme.highlight } else { theme.base }),
+        Span::styled(policy_str, theme.accent),
+    ]));
+
+    // Rows 1..=5: Harness overrides
+    for (i, kind) in HarnessKind::ALL.iter().enumerate() {
+        let row_idx = i + 1;
+        let is_sel = selected == row_idx;
+        let prefix = if is_sel { "▶ " } else { "  " };
+        let override_val = server_cfg.harnesses.get(kind);
+        let status_str = match override_val {
+            None => format!("Inherit (Global: {})", if server_cfg.enabled { "Enabled" } else { "Disabled" }),
+            Some(true) => "Explicit: Enabled".to_string(),
+            Some(false) => "Explicit: Disabled".to_string(),
+        };
+        let status_style = match override_val {
+            None => theme.muted,
+            Some(true) => theme.success,
+            Some(false) => theme.error,
+        };
+        lines.push(Line::from(vec![
+            Span::styled(prefix, theme.accent),
+            Span::styled(format!("{:<15}: ", kind.display_name()), if is_sel { theme.highlight } else { theme.base }),
+            Span::styled(status_str, status_style),
+        ]));
+    }
+
+    // Claude Local Projects (if any)
+    if !projects.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "── CLAUDE LOCAL PROJECTS (Per-Project Overrides) ──",
+            theme.header,
+        )));
+        for (i, proj_path) in projects.iter().enumerate() {
+            let row_idx = 1 + HarnessKind::ALL.len() + i;
+            let is_sel = selected == row_idx;
+            let prefix = if is_sel { "▶ " } else { "  " };
+            let state = app.loaded.claude.project_server_state(proj_path, server_name);
+            let (status_str, status_style) = match state {
+                None => (
+                    format!("Inherit ({})", if server_cfg.enabled { "Global On" } else { "Global Off" }),
+                    theme.muted,
+                ),
+                Some(true) => ("[Project: Enabled]".to_string(), theme.success),
+                Some(false) => ("[Project: Disabled]".to_string(), theme.error),
+            };
+
+            let display_path = if proj_path.len() > 30 {
+                let tail: String = proj_path.chars().rev().take(27).collect();
+                format!("...{}", tail.chars().rev().collect::<String>())
+            } else {
+                proj_path.clone()
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(prefix, theme.accent),
+                Span::styled(format!("{:<30}: ", display_path), if is_sel { theme.highlight } else { theme.base }),
+                Span::styled(status_str, status_style),
+            ]));
+        }
+    }
+
+    let p = Paragraph::new(lines).block(block);
+    f.render_widget(p, modal);
+}
+
+fn draw_new_profile_modal(
+    f: &mut Frame,
+    area: Rect,
+    input: &str,
+    theme: &Theme,
+) {
+    let modal = centered_rect(52, 8, area);
+    f.render_widget(Clear, modal);
+
+    let block = Block::default()
+        .title(Span::styled(" ✦ CREATE NEW MCP PROFILE ✦ ", theme.header))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.accent)
+        .padding(Padding::new(PADDING_SM, PADDING_SM, PADDING_XS, PADDING_XS));
+
+    let lines = vec![
+        Line::from(Span::styled("Profile name (e.g. work, personal, dev):", theme.muted)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("▶ ", theme.accent),
+            Span::styled(input, theme.highlight),
+            Span::styled("█", theme.accent),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("[Enter: Create & Activate]  [Esc: Cancel]", theme.muted)),
+    ];
+
+    let p = Paragraph::new(lines).block(block);
     f.render_widget(p, modal);
 }
 
@@ -507,6 +859,13 @@ fn draw_help_modal(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             Span::styled("o               ", theme.accent),
             Span::styled(
                 "Open Options modal (theme, mascot, refresh, harnesses)",
+                theme.base,
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("w / x           ", theme.accent),
+            Span::styled(
+                "Open Profiles switcher (w) or Harness Matrix overrides (x)",
                 theme.base,
             ),
         ]),
@@ -991,5 +1350,53 @@ mod tests {
         let modal_frame = render_to_string(96, 24, &app, false);
         assert!(modal_frame.contains("CONFIRM REMOVE PLUGIN"));
         assert!(modal_frame.contains("Deletes dir: /tmp/plugins/ponytail"));
+    }
+
+    #[test]
+    fn renders_profiles_modal_and_matrix_modal() {
+        let mut app = App::new(None, crate::domain::storage::LoadedConfigs::default(), 96, 24);
+        app.mode = ActiveMode::ProfilesModal {
+            selected: 0,
+            items: vec!["Default (All Servers)".to_string(), "work".to_string()],
+        };
+        let p_frame = render_to_string(96, 24, &app, false);
+        assert!(p_frame.contains("SWITCH MCP PROFILE"));
+        assert!(p_frame.contains("Default (All Servers)"));
+        assert!(p_frame.contains("work"));
+        assert!(p_frame.contains("[a: New]"));
+
+        // Render NewProfileModal
+        app.mode = ActiveMode::NewProfileModal {
+            input: "client-a".to_string(),
+        };
+        let np_frame = render_to_string(96, 24, &app, false);
+        assert!(np_frame.contains("CREATE NEW MCP PROFILE"));
+        assert!(np_frame.contains("client-a"));
+
+        // Matrix modal with local projects
+        if let serde_json::Value::Object(map) = serde_json::json!({
+            "projects": {
+                "/home/user/code/maga": {
+                    "enabledMcpServers": ["context7"]
+                }
+            }
+        }) {
+            app.loaded.claude.raw_root = map;
+        }
+        app.outcome.canonical.insert(
+            "context7".to_string(),
+            crate::domain::model::McpServerConfig::new_http("https://mcp.context7.com/mcp"),
+        );
+        app.mode = ActiveMode::MatrixModal {
+            server_name: "context7".to_string(),
+            selected: 0,
+        };
+        let m_frame = render_to_string(96, 24, &app, false);
+        assert!(m_frame.contains("HARNESS MATRIX: context7"));
+        assert!(m_frame.contains("Claude Project Policy"));
+        assert!(m_frame.contains("Claude Code"));
+        assert!(m_frame.contains("CLAUDE LOCAL PROJECTS"));
+        assert!(m_frame.contains("/home/user/code/maga"));
+        assert!(m_frame.contains("[Project: Enabled]"));
     }
 }

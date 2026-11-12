@@ -34,6 +34,8 @@ pub fn draw_workspace(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         match app.section {
             WorkspaceSection::Mcps => draw_server_list(f, area, app, theme, &fx_areas),
             WorkspaceSection::Plugins => draw_plugin_list(f, area, app, theme, &fx_areas),
+            WorkspaceSection::Guidelines => draw_guidelines_list(f, area, app, theme, &fx_areas),
+            WorkspaceSection::Refs => draw_refs_list(f, area, app, theme, &fx_areas),
         }
         return;
     }
@@ -47,6 +49,8 @@ pub fn draw_workspace(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     match app.section {
         WorkspaceSection::Mcps => draw_server_list(f, columns[0], app, theme, &fx_areas),
         WorkspaceSection::Plugins => draw_plugin_list(f, columns[0], app, theme, &fx_areas),
+        WorkspaceSection::Guidelines => draw_guidelines_list(f, columns[0], app, theme, &fx_areas),
+        WorkspaceSection::Refs => draw_refs_list(f, columns[0], app, theme, &fx_areas),
     }
 
     let show_hero_showcase = hero_mascot_enabled
@@ -67,6 +71,12 @@ pub fn draw_workspace(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         match app.section {
             WorkspaceSection::Mcps => draw_detail_panel(f, right_rows[0], app, theme),
             WorkspaceSection::Plugins => draw_plugin_detail_panel(f, right_rows[0], app, theme),
+            WorkspaceSection::Guidelines => {
+                draw_guidelines_detail_panel(f, right_rows[0], app, theme)
+            }
+            WorkspaceSection::Refs => {
+                draw_refs_detail_panel(f, right_rows[0], app, theme)
+            }
         }
         draw_companion_panel(f, right_rows[1], app, theme, &fx_areas);
     } else {
@@ -74,6 +84,12 @@ pub fn draw_workspace(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         match app.section {
             WorkspaceSection::Mcps => draw_detail_panel(f, columns[1], app, theme),
             WorkspaceSection::Plugins => draw_plugin_detail_panel(f, columns[1], app, theme),
+            WorkspaceSection::Guidelines => {
+                draw_guidelines_detail_panel(f, columns[1], app, theme)
+            }
+            WorkspaceSection::Refs => {
+                draw_refs_detail_panel(f, columns[1], app, theme)
+            }
         }
     }
 
@@ -1047,6 +1063,404 @@ fn mask_sensitive_value(key: &str, val: &str) -> String {
 }
 
 /// Truncates `text` cleanly on Unicode character boundaries so its terminal display width does not exceed `max_width`.
+fn draw_guidelines_list(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+    _fx_areas: &crate::fx::FxAreas,
+) {
+    let statuses = &app.guidelines_statuses;
+    let total = statuses.len();
+    let selected_idx = app.guidelines_selected.min(total.saturating_sub(1));
+    let synced = statuses
+        .iter()
+        .filter(|s| s.exists && s.matches_canonical)
+        .count();
+
+    let title = format!(" HARNESS GUIDELINES ({synced}/{total} Synced) ");
+    let border_style = if matches!(app.mode, ActiveMode::Normal) && !app.details_focused {
+        theme.active_border
+    } else {
+        theme.border
+    };
+
+    let block = Block::default()
+        .title(Span::styled(title, theme.header))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .padding(Padding::new(PADDING_SM, PADDING_SM, PADDING_XS, PADDING_XS));
+
+    let inner = block.inner(area);
+
+    let items: Vec<ListItem> = statuses
+        .iter()
+        .enumerate()
+        .map(|(idx, s)| {
+            let is_selected = idx == selected_idx;
+            let cursor = if is_selected { "▸ " } else { "  " };
+
+            let (badge, badge_style) = if s.exists && s.matches_canonical {
+                let sym_tag = if s.is_symlink {
+                    "[✓ Symlink]"
+                } else {
+                    "[✓ Link]"
+                };
+                (sym_tag, theme.success)
+            } else if s.exists {
+                ("[! Drift]", theme.warning)
+            } else {
+                ("[✗ Missing]", theme.error)
+            };
+
+            let row_style = if is_selected {
+                theme.highlight
+            } else {
+                theme.base
+            };
+
+            let harness_name = s.harness.to_string();
+            let path_str = s.path.display().to_string();
+            let path_avail_width = inner.width.saturating_sub(35) as usize;
+            let truncated_path = truncate_display_width(&path_str, path_avail_width.max(10));
+
+            let line = Line::from(vec![
+                Span::styled(
+                    cursor,
+                    if is_selected {
+                        theme.accent
+                    } else {
+                        theme.muted
+                    },
+                ),
+                Span::styled(format!("{badge:<13} "), badge_style),
+                Span::styled(format!("{harness_name:<22} "), row_style),
+                Span::styled(truncated_path, theme.muted),
+            ]);
+
+            ListItem::new(line)
+        })
+        .collect();
+
+    let list = List::new(items).block(block);
+    f.render_widget(list, area);
+}
+
+fn draw_guidelines_detail_panel(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let border_style = if app.details_focused {
+        theme.active_border
+    } else {
+        theme.border
+    };
+
+    let block = Block::default()
+        .title(Span::styled(" GUIDELINES INSPECTOR ", theme.header))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .padding(Padding::new(PADDING_SM, PADDING_SM, PADDING_XS, PADDING_XS));
+
+    let canonical = crate::domain::guidelines::canonical_guidelines_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "~/.agents/AGENTS.md".to_string());
+
+    let selected_status = app.guidelines_statuses.get(app.guidelines_selected);
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("Canonical Source: ", theme.header),
+        Span::styled(canonical, theme.accent),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Role:             ", theme.muted),
+        Span::styled(
+            "Single source of truth for developer communication & cognitive ergonomics.",
+            theme.base,
+        ),
+    ]));
+
+    if let Ok(Some(metrics)) = crate::domain::guidelines::canonical_guidelines_metrics() {
+        let (budget_label, budget_style) = if metrics.exceeds_recommended_budget {
+            ("⚠ OVERSIZED (Prompt Bloat Warning)", theme.warning)
+        } else {
+            ("✓ Healthy (Within Budget)", theme.success)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled("Prompt Budget:    ", theme.muted),
+            Span::styled(
+                format!("{} lines, {} chars ", metrics.line_count, metrics.char_count),
+                theme.base,
+            ),
+            Span::styled(budget_label, budget_style),
+        ]));
+    }
+
+    let refs_count = app.loaded.refs.refs.len();
+    lines.push(Line::from(vec![
+        Span::styled("Offline Refs:     ", theme.muted),
+        Span::styled(
+            format!("{refs_count} tracked in refs.toml"),
+            theme.base,
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    if let Some(s) = selected_status {
+        lines.push(Line::from(vec![
+            Span::styled("Selected Harness: ", theme.header),
+            Span::styled(s.harness.to_string(), theme.highlight),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Target Path:      ", theme.muted),
+            Span::styled(s.path.display().to_string(), theme.base),
+        ]));
+
+        let (status_text, status_style) = if s.exists && s.matches_canonical {
+            let link_desc = if s.is_symlink {
+                "Valid Symbolic Link (In Sync)"
+            } else {
+                "Valid Hard Link (In Sync)"
+            };
+            (link_desc, theme.success)
+        } else if s.exists {
+            ("Content Differs from Canonical (Drift)", theme.warning)
+        } else {
+            ("Target File Missing", theme.error)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled("Link Health:      ", theme.muted),
+            Span::styled(status_text, status_style),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Is Symlink:       ", theme.muted),
+            Span::styled(if s.is_symlink { "Yes" } else { "No" }, theme.base),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("Actions:", theme.header)));
+    lines.push(Line::from(vec![
+        Span::styled("  e / Enter  ", theme.accent),
+        Span::styled("Open ~/.agents/AGENTS.md in configured $EDITOR", theme.base),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  s          ", theme.accent),
+        Span::styled("Re-synchronize & repair links to all 6 harnesses", theme.base),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  r          ", theme.accent),
+        Span::styled("Refresh live status from filesystem", theme.base),
+    ]));
+
+    let p = Paragraph::new(lines).block(block);
+    f.render_widget(p, area);
+}
+
+fn draw_refs_list(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+    _fx_areas: &crate::fx::FxAreas,
+) {
+    let refs_map = &app.loaded.refs.refs;
+    let total = refs_map.len();
+    let selected_idx = app.refs_selected.min(total.saturating_sub(1));
+
+    let cache_dir = app
+        .paths
+        .as_ref()
+        .map(|p| p.refs_cache_dir.clone())
+        .unwrap_or_else(|| std::path::PathBuf::from("refs"));
+
+    let cloned_count = refs_map
+        .iter()
+        .filter(|(alias, entry)| {
+            let p = app.loaded.refs.effective_path(alias, entry, &cache_dir);
+            p.exists() && p.join(".git").exists()
+        })
+        .count();
+
+    let title = format!(" OFFLINE REFERENCES ({cloned_count}/{total} Cloned) ");
+    let border_style = if matches!(app.mode, ActiveMode::Normal) && !app.details_focused {
+        theme.active_border
+    } else {
+        theme.border
+    };
+
+    let block = Block::default()
+        .title(Span::styled(title, theme.header))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .padding(Padding::new(PADDING_SM, PADDING_SM, PADDING_XS, PADDING_XS));
+
+    let inner = block.inner(area);
+
+    if refs_map.is_empty() {
+        let empty_lines = vec![
+            Line::from(""),
+            Line::from(Span::styled("No references tracked in refs.toml", theme.muted)),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Press ", theme.muted),
+                Span::styled("e", theme.accent),
+                Span::styled(" to open refs.toml in $EDITOR and add repositories.", theme.muted),
+            ]),
+        ];
+        let p = Paragraph::new(empty_lines).block(block);
+        f.render_widget(p, area);
+        return;
+    }
+
+    let items: Vec<ListItem> = refs_map
+        .iter()
+        .enumerate()
+        .map(|(idx, (alias, entry))| {
+            let is_selected = idx == selected_idx;
+            let cursor = if is_selected { "▸ " } else { "  " };
+
+            let target_path = app.loaded.refs.effective_path(alias, entry, &cache_dir);
+            let is_cloned = target_path.exists() && target_path.join(".git").exists();
+
+            let (badge, badge_style) = if is_cloned {
+                ("[✓ Cloned]", theme.success)
+            } else {
+                ("[✗ Not Cloned]", theme.warning)
+            };
+
+            let row_style = if is_selected {
+                theme.highlight
+            } else {
+                theme.base
+            };
+
+            let path_str = target_path.display().to_string();
+            let path_avail_width = inner.width.saturating_sub(35) as usize;
+            let truncated_path = truncate_display_width(&path_str, path_avail_width.max(10));
+
+            let line = Line::from(vec![
+                Span::styled(cursor, theme.accent),
+                Span::styled(format!("{:<16} ", alias), row_style),
+                Span::styled(format!("{:<15} ", badge), badge_style),
+                Span::styled(truncated_path, theme.muted),
+            ]);
+
+            ListItem::new(line)
+        })
+        .collect();
+
+    let list = List::new(items).block(block);
+    f.render_widget(list, area);
+}
+
+fn draw_refs_detail_panel(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let border_style = if app.details_focused {
+        theme.active_border
+    } else {
+        theme.border
+    };
+
+    let block = Block::default()
+        .title(Span::styled(" REFERENCE INSPECTOR ", theme.header))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .padding(Padding::new(PADDING_SM, PADDING_SM, PADDING_XS, PADDING_XS));
+
+    let cache_dir = app
+        .paths
+        .as_ref()
+        .map(|p| p.refs_cache_dir.clone())
+        .unwrap_or_else(|| std::path::PathBuf::from("refs"));
+
+    let selected_entry = app
+        .loaded
+        .refs
+        .refs
+        .iter()
+        .nth(app.refs_selected);
+
+    let mut lines = Vec::new();
+
+    if let Some((alias, entry)) = selected_entry {
+        let target_path = app.loaded.refs.effective_path(alias, entry, &cache_dir);
+        let is_cloned = target_path.exists() && target_path.join(".git").exists();
+
+        lines.push(Line::from(vec![
+            Span::styled("Alias:        ", theme.header),
+            Span::styled(alias.clone(), theme.accent),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Repository:   ", theme.muted),
+            Span::styled(entry.url.clone(), theme.base),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Branch/Tag:   ", theme.muted),
+            Span::styled(
+                entry.branch.as_deref().unwrap_or("default (HEAD)"),
+                theme.base,
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Description:  ", theme.muted),
+            Span::styled(
+                entry.description.as_deref().unwrap_or("-"),
+                theme.base,
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Local Path:   ", theme.muted),
+            Span::styled(target_path.display().to_string(), theme.base),
+        ]));
+
+        let (status_text, status_style) = if is_cloned {
+            ("Cloned (Available offline for AI agents)", theme.success)
+        } else {
+            ("Not Cloned (Pending shallow clone download)", theme.warning)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled("Clone State:  ", theme.muted),
+            Span::styled(status_text, status_style),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "No reference selected.",
+            theme.muted,
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("Actions:", theme.header)));
+    lines.push(Line::from(vec![
+        Span::styled("  c / Enter  ", theme.accent),
+        Span::styled("Shallow-clone or refresh selected repository", theme.base),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  u          ", theme.accent),
+        Span::styled("Pull latest commits (git pull --depth 1)", theme.base),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  e / E      ", theme.accent),
+        Span::styled("Open refs.toml in configured $EDITOR", theme.base),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  s          ", theme.accent),
+        Span::styled("Re-synchronize guidelines and update offline lookup index", theme.base),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  r          ", theme.accent),
+        Span::styled("Reload references from disk", theme.base),
+    ]));
+
+    let p = Paragraph::new(lines).block(block);
+    f.render_widget(p, area);
+}
+
 pub fn truncate_display_width(text: &str, max_width: usize) -> String {
     if UnicodeWidthStr::width(text) <= max_width {
         return text.to_string();

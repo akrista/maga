@@ -116,7 +116,7 @@ fn parse_agy_server(obj: &Map<String, Value>) -> Option<McpServerConfig> {
     let env = extract_string_map(obj.get("env"));
     let headers = extract_string_map(obj.get("headers"));
 
-    Some(McpServerConfig {
+    let mut server = McpServerConfig {
         enabled,
         description: None,
         transport,
@@ -125,7 +125,11 @@ fn parse_agy_server(obj: &Map<String, Value>) -> Option<McpServerConfig> {
         env,
         url,
         headers,
-    })
+        harnesses: std::collections::BTreeMap::new(),
+        project_policy: crate::domain::model::ProjectPolicy::Mirror,
+    };
+    server.unwrap_windows_shim();
+    Some(server)
 }
 
 fn serialize_agy_server(server: &McpServerConfig) -> Value {

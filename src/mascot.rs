@@ -4098,6 +4098,7 @@ pub fn companion_mood_for_app(app: &App) -> CompanionMood {
     let active_filter = match app.section {
         WorkspaceSection::Mcps => !app.filter_query.is_empty(),
         WorkspaceSection::Plugins => !app.plugin_filter_query.is_empty(),
+        _ => false,
     };
     if !app.outcome.conflicts.is_empty()
         || app
@@ -5608,6 +5609,7 @@ pub fn build_companion_dialogue(app: &App, theme: &Theme, anim_tick: usize) -> V
                     )));
                 }
             }
+            _ => {}
         }
     }
 

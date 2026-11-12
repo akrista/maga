@@ -5,7 +5,7 @@ use crate::domain::grok::GrokDocument;
 use crate::domain::model::{
     DEFAULT_AGY_CONFIG_PATH, DEFAULT_CLAUDE_CONFIG_PATH, DEFAULT_COPILOT_CONFIG_PATH,
     DEFAULT_GROK_CONFIG_PATH, DEFAULT_OPENCODE_CONFIG_PATH, HarnessKind, MagaConfig, McpRegistry,
-    McpServerConfig,
+    McpServerConfig, ProfilesConfig,
 };
 use crate::domain::opencode::OpenCodeDocument;
 use crate::domain::plugins::{HarnessPlugin, PluginsLedger, discover_all_harness_plugins};
@@ -21,6 +21,9 @@ pub struct StoragePaths {
     pub config_toml: PathBuf,
     pub mcp_toml: PathBuf,
     pub plugins_toml: PathBuf,
+    pub profiles_toml: PathBuf,
+    pub refs_toml: PathBuf,
+    pub refs_cache_dir: PathBuf,
     pub agy_json: PathBuf,
     pub claude_json: PathBuf,
     pub copilot_json: PathBuf,
@@ -31,6 +34,7 @@ pub struct StoragePaths {
     pub copilot_overridden: bool,
     pub grok_overridden: bool,
     pub opencode_overridden: bool,
+    pub isolated: bool,
 }
 
 impl StoragePaths {
@@ -42,10 +46,18 @@ impl StoragePaths {
             .unwrap_or_else(|| home.join(".config"));
         let maga_dir = config_root.join("maga");
 
+        let data_root = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local").join("share"));
+        let refs_cache_dir = data_root.join("maga").join("refs");
+
         Ok(Self {
             config_toml: maga_dir.join("config.toml"),
             mcp_toml: maga_dir.join("mcp.toml"),
             plugins_toml: maga_dir.join("plugins.toml"),
+            profiles_toml: maga_dir.join("profiles.toml"),
+            refs_toml: maga_dir.join("refs.toml"),
+            refs_cache_dir,
             agy_json: home.join(".gemini").join("config").join("mcp_config.json"),
             claude_json: home.join(".claude.json"),
             copilot_json: home.join(".copilot").join("mcp-config.json"),
@@ -56,6 +68,7 @@ impl StoragePaths {
             copilot_overridden: false,
             grok_overridden: false,
             opencode_overridden: false,
+            isolated: false,
         })
     }
 
@@ -65,6 +78,9 @@ impl StoragePaths {
             config_toml: dir.join("config.toml"),
             mcp_toml: dir.join("mcp.toml"),
             plugins_toml: dir.join("plugins.toml"),
+            profiles_toml: dir.join("profiles.toml"),
+            refs_toml: dir.join("refs.toml"),
+            refs_cache_dir: dir.join("refs"),
             agy_json: dir.join("mcp_config.json"),
             claude_json: dir.join(".claude.json"),
             copilot_json: dir.join("mcp-config.json"),
@@ -75,6 +91,7 @@ impl StoragePaths {
             copilot_overridden: false,
             grok_overridden: false,
             opencode_overridden: false,
+            isolated: true,
         }
     }
 
@@ -218,6 +235,33 @@ impl StoragePaths {
         }
         self.opencode_json.clone()
     }
+
+    pub fn dotenv_search_paths(&self) -> Vec<PathBuf> {
+        if self.isolated {
+            return self
+                .mcp_toml
+                .parent()
+                .map(|maga_dir| maga_dir.join(".env.local"))
+                .into_iter()
+                .collect();
+        }
+
+        let mut paths = vec![
+            expand_tilde("~/.env.local"),
+            expand_tilde("~/.config/maga/.env.local"),
+        ];
+        if let Some(maga_dir) = self.mcp_toml.parent() {
+            let local = maga_dir.join(".env.local");
+            if !paths.contains(&local) {
+                paths.push(local);
+            }
+        }
+        paths
+    }
+
+    pub fn load_env_context(&self) -> BTreeMap<String, String> {
+        crate::domain::model::load_env_context(&self.dotenv_search_paths())
+    }
 }
 
 pub fn expand_tilde(path_str: &str) -> PathBuf {
@@ -243,6 +287,11 @@ pub struct LoadedConfigs {
     pub plugins_ledger: PluginsLedger,
     pub plugins_ledger_exists: bool,
     pub plugins_ledger_needs_save: bool,
+    pub profiles: ProfilesConfig,
+    pub profiles_exists: bool,
+    pub profiles_needs_save: bool,
+    pub refs: crate::domain::refs::RefsRegistry,
+    pub refs_exists: bool,
     pub harness_plugins: BTreeMap<HarnessKind, Vec<HarnessPlugin>>,
     pub agy: AgyDocument,
     pub claude: ClaudeDocument,
@@ -373,6 +422,25 @@ impl LoadedConfigs {
         let plugins_ledger_needs_save =
             plugins_ledger != prev_ledger || (!plugins_ledger_exists && !plugins_ledger.is_empty());
 
+        let profiles_exists = paths.profiles_toml.exists();
+        let profiles = if profiles_exists {
+            let content = fs::read_to_string(&paths.profiles_toml)
+                .map_err(|e| format!("Failed to read {}: {e}", paths.profiles_toml.display()))?;
+            ProfilesConfig::from_toml_str(&content)?
+        } else {
+            ProfilesConfig::default()
+        };
+
+        let refs_exists = paths.refs_toml.exists();
+        let refs = if refs_exists {
+            let content = fs::read_to_string(&paths.refs_toml)
+                .map_err(|e| format!("Failed to read {}: {e}", paths.refs_toml.display()))?;
+            crate::domain::refs::RefsRegistry::from_toml(&content)
+                .map_err(|e| format!("Failed to parse {}: {e}", paths.refs_toml.display()))?
+        } else {
+            crate::domain::refs::RefsRegistry::default()
+        };
+
         Ok(Self {
             config,
             config_exists,
@@ -383,6 +451,11 @@ impl LoadedConfigs {
             plugins_ledger,
             plugins_ledger_exists,
             plugins_ledger_needs_save,
+            profiles,
+            profiles_exists,
+            profiles_needs_save: false,
+            refs,
+            refs_exists,
             harness_plugins,
             agy,
             claude,
@@ -392,12 +465,32 @@ impl LoadedConfigs {
         })
     }
 
+    /// Writes `profiles.toml` atomically to disk.
+    pub fn save_profiles(&mut self, paths: &StoragePaths) -> Result<(), String> {
+        let profiles_str = self.profiles.to_toml_string()?;
+        write_atomic_with_backup(&paths.profiles_toml, &profiles_str)?;
+        self.profiles_exists = true;
+        self.profiles_needs_save = false;
+        Ok(())
+    }
+
     /// Writes `config.toml` atomically to disk.
     pub fn save_config(&mut self, paths: &StoragePaths) -> Result<(), String> {
         let config_str = self.config.to_toml_string()?;
         write_atomic_with_backup(&paths.config_toml, &config_str)?;
         self.config_exists = true;
         self.config_needs_save = false;
+        Ok(())
+    }
+
+    /// Writes `refs.toml` atomically to disk.
+    pub fn save_refs(&mut self, paths: &StoragePaths) -> Result<(), String> {
+        let refs_str = self
+            .refs
+            .to_toml()
+            .map_err(|e| format!("Failed to serialize refs registry: {e}"))?;
+        write_atomic_with_backup(&paths.refs_toml, &refs_str)?;
+        self.refs_exists = true;
         Ok(())
     }
 
@@ -430,6 +523,17 @@ impl LoadedConfigs {
         paths: &StoragePaths,
         canonical: &BTreeMap<String, McpServerConfig>,
     ) -> Result<(), String> {
+        self.save_all_with_options(paths, canonical, cfg!(windows), None)
+    }
+
+    /// Synchronizes configurations with explicit platform wrapping and environment context options.
+    pub fn save_all_with_options(
+        &mut self,
+        paths: &StoragePaths,
+        canonical: &BTreeMap<String, McpServerConfig>,
+        is_windows: bool,
+        custom_env: Option<&BTreeMap<String, String>>,
+    ) -> Result<(), String> {
         self.mcp.mcps = canonical.clone();
 
         let mcp_str = self.mcp.to_toml_string()?;
@@ -440,41 +544,77 @@ impl LoadedConfigs {
         if self.plugins_ledger_needs_save {
             self.save_plugins_ledger(paths)?;
         }
+        if self.profiles_needs_save {
+            self.save_profiles(paths)?;
+        }
 
         write_atomic_with_backup(&paths.mcp_toml, &mcp_str)?;
         self.mcp_exists = true;
         self.mcp_had_spaced_keys = false;
 
+        let default_env;
+        let env_ref = match custom_env {
+            Some(e) => e,
+            None => {
+                default_env = paths.load_env_context();
+                &default_env
+            }
+        };
+
+        let active_prof = self
+            .config
+            .active_profile
+            .as_deref()
+            .or(self.profiles.active.as_deref());
+
+        let export_for_harness = |harness: HarnessKind| -> BTreeMap<String, McpServerConfig> {
+            canonical
+                .iter()
+                .map(|(k, v)| {
+                    let mut exported = v.for_harness_export(is_windows, env_ref);
+                    let profile_active = self.profiles.is_server_active(active_prof, k);
+                    let harness_enabled = v.enabled_for_harness(harness);
+                    exported.enabled = profile_active && harness_enabled;
+                    (k.clone(), exported)
+                })
+                .collect()
+        };
+
         if self.config.tools.antigravity.enabled {
-            let agy_str = self.agy.to_json_string(canonical)?;
+            let agy_servers = export_for_harness(HarnessKind::Antigravity);
+            let agy_str = self.agy.to_json_string(&agy_servers)?;
             let agy_path = paths.effective_agy_path(&self.config);
             write_atomic_with_backup(&agy_path, &agy_str)?;
             self.agy = AgyDocument::parse_json_str(&agy_str)?;
         }
 
         if self.config.tools.claude.enabled {
-            let claude_str = self.claude.to_json_string(canonical)?;
+            let claude_servers = export_for_harness(HarnessKind::Claude);
+            let claude_str = self.claude.to_json_string(&claude_servers)?;
             let claude_path = paths.effective_claude_path(&self.config);
             write_atomic_with_backup(&claude_path, &claude_str)?;
             self.claude = ClaudeDocument::parse_json_str(&claude_str)?;
         }
 
         if self.config.tools.copilot.enabled {
-            let copilot_str = self.copilot.to_json_string(canonical)?;
+            let copilot_servers = export_for_harness(HarnessKind::Copilot);
+            let copilot_str = self.copilot.to_json_string(&copilot_servers)?;
             let copilot_path = paths.effective_copilot_path(&self.config);
             write_atomic_with_backup(&copilot_path, &copilot_str)?;
             self.copilot = CopilotDocument::parse_json_str(&copilot_str)?;
         }
 
         if self.config.tools.grok.enabled {
-            let grok_str = self.grok.to_toml_string(canonical)?;
+            let grok_servers = export_for_harness(HarnessKind::Grok);
+            let grok_str = self.grok.to_toml_string(&grok_servers)?;
             let grok_path = paths.effective_grok_path(&self.config);
             write_atomic_with_backup(&grok_path, &grok_str)?;
             self.grok = GrokDocument::parse_toml_str(&grok_str)?;
         }
 
         if self.config.tools.opencode.enabled {
-            let opencode_str = self.opencode.to_json_string(canonical)?;
+            let opencode_servers = export_for_harness(HarnessKind::OpenCode);
+            let opencode_str = self.opencode.to_json_string(&opencode_servers)?;
             let opencode_path = paths.effective_opencode_path(&self.config);
             write_atomic_with_backup(&opencode_path, &opencode_str)?;
             self.opencode = OpenCodeDocument::parse_json_str(&opencode_str)?;
@@ -482,6 +622,95 @@ impl LoadedConfigs {
 
         Ok(())
     }
+
+    /// Performs a headless check across all enabled harnesses without modifying any files.
+    pub fn check_headless(
+        &self,
+        paths: &StoragePaths,
+    ) -> crate::domain::reconcile::ConvergenceStatus {
+        let enabled_servers = self.enabled_harness_servers();
+        // Check if any harness file is missing on disk
+        let any_missing_file = HarnessKind::ALL.into_iter().any(|kind| {
+            self.config.tools.is_enabled(kind)
+                && !paths.effective_harness_path(kind, &self.config).exists()
+        });
+
+        let env_context = paths.load_env_context();
+        let mut status = crate::domain::reconcile::evaluate_convergence_with_env(
+            &self.mcp.mcps,
+            &enabled_servers,
+            Some(&env_context),
+        );
+        if let crate::domain::reconcile::ConvergenceStatus::Converged = status
+            && any_missing_file
+        {
+            status = crate::domain::reconcile::ConvergenceStatus::Drift {
+                drift_harnesses: Vec::new(),
+                imported_count: 0,
+            };
+        }
+        status
+    }
+
+    /// Performs headless sync across all enabled harnesses.
+    /// If `force` is true, authoritatively pushes `mcp.toml` to all harnesses.
+    /// If `force` is false, runs safe two-way reconciliation and returns `Err(conflicts)` if conflicts exist.
+    /// Returns `Ok(true)` if files were written, or `Ok(false)` if already converged (idempotent skip).
+    pub fn sync_headless(
+        &mut self,
+        paths: &StoragePaths,
+        force: bool,
+    ) -> Result<bool, HeadlessSyncError> {
+        let enabled_servers = self.enabled_harness_servers();
+
+        if force {
+            let canonical = self.mcp.mcps.clone();
+            self.save_all(paths, &canonical)
+                .map_err(HeadlessSyncError::Io)?;
+            return Ok(true);
+        }
+
+        let any_missing_file = HarnessKind::ALL.into_iter().any(|kind| {
+            self.config.tools.is_enabled(kind)
+                && !paths.effective_harness_path(kind, &self.config).exists()
+        });
+
+        let env_context = paths.load_env_context();
+        let outcome = crate::domain::reconcile::reconcile_harnesses_with_env(
+            &self.mcp.mcps,
+            &enabled_servers,
+            Some(&env_context),
+        );
+        if !outcome.conflicts.is_empty() {
+            return Err(HeadlessSyncError::Conflicted(outcome.conflicts));
+        }
+
+        let is_converged = !any_missing_file
+            && !self.mcp_had_spaced_keys
+            && self.mcp.mcps == outcome.canonical
+            && enabled_servers.iter().all(|(k, map)| {
+                crate::domain::reconcile::harness_maps_match_with_env(
+                    map,
+                    &outcome.canonical,
+                    Some(&env_context),
+                ) && !self.harness_has_raw_spaced_keys(*k)
+            });
+
+        if is_converged && self.config_exists && !self.config_needs_save {
+            return Ok(false);
+        }
+
+        self.save_all(paths, &outcome.canonical)
+            .map_err(HeadlessSyncError::Io)?;
+        Ok(true)
+    }
+}
+
+/// Errors returned by `sync_headless`.
+#[derive(Debug)]
+pub enum HeadlessSyncError {
+    Conflicted(Vec<crate::domain::reconcile::McpConflict>),
+    Io(String),
 }
 
 /// Writes `content` to `target` atomically via a temporary file in the same directory,
@@ -561,6 +790,40 @@ pub fn write_atomic_with_backup(target: &Path, content: &str) -> Result<(), Stri
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn resolves_refs_paths_and_persists_refs_registry() {
+        let dir = tempdir().expect("create tempdir");
+        let paths = StoragePaths::in_dir(dir.path());
+
+        assert_eq!(paths.refs_toml, dir.path().join("refs.toml"));
+        assert_eq!(paths.refs_cache_dir, dir.path().join("refs"));
+
+        let mut configs = LoadedConfigs::load(&paths).expect("load configs");
+        assert!(!configs.refs_exists);
+        assert!(configs.refs.refs.is_empty());
+
+        configs.refs.refs.insert(
+            "pangolin".to_string(),
+            crate::domain::refs::RefRepoEntry {
+                url: "https://github.com/fosrl/docs".to_string(),
+                branch: Some("main".to_string()),
+                description: Some("Pangolin documentation".to_string()),
+                path: None,
+            },
+        );
+
+        configs.save_refs(&paths).expect("save refs");
+        assert!(paths.refs_toml.exists());
+
+        let reloaded = LoadedConfigs::load(&paths).expect("reload configs");
+        assert!(reloaded.refs_exists);
+        assert_eq!(reloaded.refs.refs.len(), 1);
+        assert_eq!(
+            reloaded.refs.refs.get("pangolin").unwrap().url,
+            "https://github.com/fosrl/docs"
+        );
+    }
 
     #[test]
     fn atomic_write_creates_backup_and_replaces_file() {
@@ -917,6 +1180,152 @@ url = "https://mcp.docs.astro.build/mcp"
         assert_eq!(
             expand_tilde(r"~\.gemini\config\mcp_config.json"),
             home.join(r".gemini\config\mcp_config.json")
+        );
+    }
+
+    #[test]
+    fn headless_check_and_sync_idempotency_and_force() {
+        let dir = tempdir().expect("create tempdir");
+        let paths = StoragePaths::in_dir(dir.path());
+
+        // Setup canonical mcp.toml with "sqlite"
+        let mut loaded = LoadedConfigs::default();
+        let server = McpServerConfig::new_stdio("/usr/bin/sqlite-mcp", vec!["mcp".to_string()]);
+        loaded
+            .mcp
+            .mcps
+            .insert("sqlite-mcp".to_string(), server.clone());
+        loaded
+            .save_all(&paths, &loaded.mcp.mcps.clone())
+            .expect("save initial");
+
+        // 1. Initial check after save_all -> Converged
+        let status = loaded.check_headless(&paths);
+        assert_eq!(
+            status,
+            crate::domain::reconcile::ConvergenceStatus::Converged
+        );
+
+        // 2. Headless sync when converged -> returns Ok(false) without rewriting files
+        let bak_path = dir.path().join("mcp.toml.bak");
+        let _ = fs::remove_file(&bak_path);
+        let synced = loaded.sync_headless(&paths, false).expect("sync converged");
+        assert!(!synced);
+        assert!(!bak_path.exists());
+
+        // 3. Harness is edited on disk (Claude adds a new untracked server) -> Drift
+        let new_server = McpServerConfig::new_stdio("npx", vec!["filesystem".to_string()]);
+        let claude_doc = crate::domain::claude::ClaudeDocument::default();
+        let mut claude_map = BTreeMap::new();
+        claude_map.insert("sqlite-mcp".to_string(), server.clone());
+        claude_map.insert("filesystem".to_string(), new_server);
+        let claude_str = claude_doc.to_json_string(&claude_map).unwrap();
+        fs::write(&paths.claude_json, &claude_str).unwrap();
+
+        let reloaded = LoadedConfigs::load(&paths).expect("reload");
+        let status = reloaded.check_headless(&paths);
+        assert!(matches!(
+            status,
+            crate::domain::reconcile::ConvergenceStatus::Drift { .. }
+        ));
+
+        // 4. Safe sync when there's definition drift on sqlite-mcp between mcp.toml and Claude -> conflict
+        let mut conflicting = server.clone();
+        conflicting.args.push("--conflict".to_string());
+        claude_map.insert("sqlite-mcp".to_string(), conflicting);
+        let claude_str2 = claude_doc.to_json_string(&claude_map).unwrap();
+        fs::write(&paths.claude_json, &claude_str2).unwrap();
+
+        let mut reloaded_conflicted = LoadedConfigs::load(&paths).expect("reload conflicted");
+        let res = reloaded_conflicted.sync_headless(&paths, false);
+        assert!(matches!(res, Err(HeadlessSyncError::Conflicted(_))));
+
+        // 5. Force sync -> succeeds and pushes canonical mcp.toml
+        let force_res = reloaded_conflicted
+            .sync_headless(&paths, true)
+            .expect("force sync");
+        assert!(force_res);
+        let check_after_force = reloaded_conflicted.check_headless(&paths);
+        assert_eq!(
+            check_after_force,
+            crate::domain::reconcile::ConvergenceStatus::Converged
+        );
+    }
+
+    #[test]
+    fn cross_os_windows_and_debian_export_with_env_interpolation_and_idempotent_sync() {
+        let dir = tempdir().expect("create tempdir");
+        let paths = StoragePaths::in_dir(dir.path());
+
+        // Write .env.local in maga directory
+        let env_file = dir.path().join(".env.local");
+        fs::write(&env_file, "DB_PASS=UltraSecret123!\nDB_HOST=10.0.0.5\n").unwrap();
+
+        let mut loaded = LoadedConfigs::default();
+        let server = McpServerConfig::new_stdio(
+            "dbhub",
+            vec![
+                "--transport".to_string(),
+                "stdio".to_string(),
+                "--dsn".to_string(),
+                "sqlserver://sa:${DB_PASS}@${DB_HOST}:1433/App".to_string(),
+            ],
+        );
+        loaded.mcp.mcps.insert("dbhub".to_string(), server);
+
+        // 1. Export in Windows mode (is_windows = true)
+        loaded
+            .save_all_with_options(&paths, &loaded.mcp.mcps.clone(), true, None)
+            .expect("save windows export");
+
+        // Canonical mcp.toml MUST retain template and bare command
+        let mcp_toml_content = fs::read_to_string(&paths.mcp_toml).expect("read mcp.toml");
+        assert!(mcp_toml_content.contains("command = \"dbhub\""));
+        assert!(mcp_toml_content.contains("${DB_PASS}"));
+        assert!(!mcp_toml_content.contains("cmd"));
+        assert!(!mcp_toml_content.contains("UltraSecret123!"));
+
+        // Claude on disk MUST have cmd /c shim and interpolated secrets
+        let claude_content = fs::read_to_string(&paths.claude_json).expect("read claude.json");
+        assert!(claude_content.contains("\"command\": \"cmd\""));
+        assert!(claude_content.contains("\"/c\""));
+        assert!(claude_content.contains("sqlserver://sa:UltraSecret123!@10.0.0.5:1433/App"));
+
+        // 2. Reloading from disk should unwrap shims and converge without false drift
+        let mut reloaded = LoadedConfigs::load(&paths).expect("reload");
+        assert_eq!(reloaded.mcp.mcps["dbhub"].command.as_deref(), Some("dbhub"));
+        assert_eq!(
+            reloaded.claude.servers["dbhub"].command.as_deref(),
+            Some("dbhub")
+        );
+
+        let status = reloaded.check_headless(&paths);
+        assert_eq!(
+            status,
+            crate::domain::reconcile::ConvergenceStatus::Converged
+        );
+
+        // 3. Headless safe sync is idempotent
+        let synced = reloaded
+            .sync_headless(&paths, false)
+            .expect("sync headless");
+        assert!(!synced, "Converged state should not trigger file rewrites");
+
+        // 4. Export in Debian / Unix mode (is_windows = false)
+        reloaded
+            .save_all_with_options(&paths, &reloaded.mcp.mcps.clone(), false, None)
+            .expect("save debian export");
+
+        let claude_debian = fs::read_to_string(&paths.claude_json).expect("read claude.json");
+        assert!(claude_debian.contains("\"command\": \"dbhub\""));
+        assert!(!claude_debian.contains("\"/c\""));
+        assert!(claude_debian.contains("UltraSecret123!"));
+
+        let reloaded_debian = LoadedConfigs::load(&paths).expect("reload debian");
+        let status_debian = reloaded_debian.check_headless(&paths);
+        assert_eq!(
+            status_debian,
+            crate::domain::reconcile::ConvergenceStatus::Converged
         );
     }
 }

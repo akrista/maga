@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 /// Transport mechanism used by an MCP server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,6 +17,19 @@ impl Transport {
             Self::Http => "http",
         }
     }
+}
+
+/// Project scoping policy for harnesses with per-project isolation (e.g., Claude Code).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectPolicy {
+    #[default]
+    Mirror,
+    Preserve,
+}
+
+fn is_default_project_policy(policy: &ProjectPolicy) -> bool {
+    matches!(policy, ProjectPolicy::Mirror)
 }
 
 /// Canonical representation of an MCP server managed by `maga`.
@@ -36,6 +50,10 @@ pub struct McpServerConfig {
     pub url: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub harnesses: BTreeMap<HarnessKind, bool>,
+    #[serde(default, skip_serializing_if = "is_default_project_policy")]
+    pub project_policy: ProjectPolicy,
 }
 
 fn default_enabled() -> bool {
@@ -66,6 +84,8 @@ impl McpServerConfig {
             env: BTreeMap::new(),
             url: None,
             headers: BTreeMap::new(),
+            harnesses: BTreeMap::new(),
+            project_policy: ProjectPolicy::Mirror,
         }
     }
 
@@ -79,7 +99,14 @@ impl McpServerConfig {
             env: BTreeMap::new(),
             url: Some(url.into()),
             headers: BTreeMap::new(),
+            harnesses: BTreeMap::new(),
+            project_policy: ProjectPolicy::Mirror,
         }
+    }
+
+    /// Returns the effective enabled state for a specific harness.
+    pub fn enabled_for_harness(&self, harness: HarnessKind) -> bool {
+        self.harnesses.get(&harness).copied().unwrap_or(self.enabled)
     }
 
     /// Trims `self.description` in-place and sets it to `None` when blank.
@@ -134,6 +161,297 @@ impl McpServerConfig {
             }
             Transport::Http => self.url.clone().unwrap_or_default(),
         }
+    }
+
+    /// Returns a new configuration with environment variable placeholders (`${VAR}` and `$VAR`)
+    /// interpolated from `env`. Missing placeholders are preserved literally.
+    pub fn interpolate(&self, env: &BTreeMap<String, String>) -> Self {
+        let command = self.command.as_ref().map(|c| interpolate_string(c, env));
+        let args = self
+            .args
+            .iter()
+            .map(|a| interpolate_string(a, env))
+            .collect();
+        let mut new_env = BTreeMap::new();
+        for (k, v) in &self.env {
+            new_env.insert(k.clone(), interpolate_string(v, env));
+        }
+        let url = self.url.as_ref().map(|u| interpolate_string(u, env));
+        let mut new_headers = BTreeMap::new();
+        for (k, v) in &self.headers {
+            new_headers.insert(k.clone(), interpolate_string(v, env));
+        }
+
+        Self {
+            enabled: self.enabled,
+            description: self.description.clone(),
+            transport: self.transport,
+            command,
+            args,
+            env: new_env,
+            url,
+            headers: new_headers,
+            harnesses: self.harnesses.clone(),
+            project_policy: self.project_policy,
+        }
+    }
+
+    /// Normalizes this server's command and arguments in-place by unwrapping Windows `cmd /c` shims.
+    pub fn unwrap_windows_shim(&mut self) {
+        if self.transport == Transport::Stdio {
+            let (cmd, args) = normalize_command_and_args(self.command.as_deref(), &self.args);
+            self.command = cmd;
+            self.args = args;
+        }
+    }
+
+    /// Prepares this configuration for export to a target harness on the specified OS.
+    /// Interpolates environment variables and wraps non-PE commands in `cmd /c` on Windows.
+    pub fn for_harness_export(&self, is_windows: bool, env: &BTreeMap<String, String>) -> Self {
+        let interpolated = self.interpolate(env);
+        if interpolated.transport == Transport::Stdio {
+            let (cmd, args) = wrap_command_for_platform(
+                interpolated.command.as_deref(),
+                &interpolated.args,
+                is_windows,
+            );
+            Self {
+                command: cmd,
+                args,
+                ..interpolated
+            }
+        } else {
+            interpolated
+        }
+    }
+
+    /// Compares this harness-provided configuration against a canonical configuration,
+    /// considering both literal equality and template equality after variable interpolation
+    /// and Windows shim normalization.
+    pub fn matches_canonical_or_interpolated(
+        &self,
+        canonical: &Self,
+        env: &BTreeMap<String, String>,
+    ) -> bool {
+        let mut unshimmed_self = self.clone();
+        unshimmed_self.unwrap_windows_shim();
+
+        let mut unshimmed_canonical = canonical.clone();
+        unshimmed_canonical.unwrap_windows_shim();
+
+        if unshimmed_self.same_harness_state(&unshimmed_canonical) {
+            return true;
+        }
+
+        let interpolated = unshimmed_canonical.interpolate(env);
+        unshimmed_self.same_harness_state(&interpolated)
+    }
+}
+
+/// Parses environment variables from a dotenv formatted string.
+/// Supports standard KEY=VALUE lines, quotes, `export` prefixes, and `#` comments.
+pub fn parse_dotenv_str(input: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for raw_line in input.lines() {
+        let mut line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("export ") {
+            line = rest.trim();
+        }
+        let Some((raw_key, raw_val)) = line.split_once('=') else {
+            continue;
+        };
+        let key = raw_key.trim();
+        if key.is_empty() {
+            continue;
+        }
+
+        let mut val = raw_val.trim();
+        if val.starts_with('"') {
+            if let Some(end) = val[1..].find('"') {
+                val = &val[1..1 + end];
+            } else {
+                val = val.trim_start_matches('"');
+            }
+        } else if val.starts_with('\'') {
+            if let Some(end) = val[1..].find('\'') {
+                val = &val[1..1 + end];
+            } else {
+                val = val.trim_start_matches('\'');
+            }
+        } else if let Some((clean_val, _)) = val.split_once('#') {
+            val = clean_val.trim();
+        }
+
+        map.insert(key.to_string(), val.to_string());
+    }
+    map
+}
+
+/// Default search paths for dotenv files:
+/// 1. `~/.env.local`
+/// 2. `~/.config/maga/.env.local`
+pub fn default_dotenv_paths() -> Vec<PathBuf> {
+    vec![
+        crate::domain::storage::expand_tilde("~/.env.local"),
+        crate::domain::storage::expand_tilde("~/.config/maga/.env.local"),
+    ]
+}
+
+/// Loads environment variables from the given dotenv search paths in order,
+/// overlaid on process environment variables (`std::env::vars()`).
+/// Later file entries override earlier entries, and files override process variables.
+pub fn load_env_context(search_paths: &[PathBuf]) -> BTreeMap<String, String> {
+    let mut env: BTreeMap<String, String> = std::env::vars().collect();
+    for path in search_paths {
+        if path.is_file()
+            && let Ok(content) = std::fs::read_to_string(path)
+        {
+            let parsed = parse_dotenv_str(&content);
+            env.extend(parsed);
+        }
+    }
+    env
+}
+
+/// Loads environment variables from default dotenv locations overlaid on process env.
+pub fn load_default_env() -> BTreeMap<String, String> {
+    load_env_context(&default_dotenv_paths())
+}
+
+/// Interpolates `${VAR}` and `$VAR` placeholders within `input` using `env`.
+/// Supports default fallback `${VAR:-default}`. Missing or malformed placeholders
+/// are safely preserved without panic.
+pub fn interpolate_string(input: &str, env: &BTreeMap<String, String>) -> String {
+    let mut out = String::with_capacity(input.len());
+    let chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        if chars[i] == '$' {
+            if i + 1 < len && chars[i + 1] == '{' {
+                if let Some(close_rel) = chars[i + 2..].iter().position(|&c| c == '}') {
+                    let close_idx = i + 2 + close_rel;
+                    let expr: String = chars[i + 2..close_idx].iter().collect();
+                    if let Some((var, def)) = expr.split_once(":-") {
+                        let var = var.trim();
+                        if let Some(val) = env.get(var) {
+                            out.push_str(val);
+                        } else {
+                            out.push_str(def);
+                        }
+                    } else {
+                        let var = expr.trim();
+                        if !var.is_empty() {
+                            if let Some(val) = env.get(var) {
+                                out.push_str(val);
+                            } else {
+                                let raw: String = chars[i..=close_idx].iter().collect();
+                                out.push_str(&raw);
+                            }
+                        } else {
+                            let raw: String = chars[i..=close_idx].iter().collect();
+                            out.push_str(&raw);
+                        }
+                    }
+                    i = close_idx + 1;
+                    continue;
+                } else {
+                    let raw: String = chars[i..].iter().collect();
+                    out.push_str(&raw);
+                    break;
+                }
+            } else if i + 1 < len && (chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == '_') {
+                let mut end = i + 1;
+                while end < len && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
+                    end += 1;
+                }
+                let var: String = chars[i + 1..end].iter().collect();
+                if let Some(val) = env.get(&var) {
+                    out.push_str(val);
+                } else {
+                    let raw: String = chars[i..end].iter().collect();
+                    out.push_str(&raw);
+                }
+                i = end;
+                continue;
+            } else {
+                out.push('$');
+                i += 1;
+            }
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    out
+}
+
+/// Normalizes command and args by unwrapping Windows `cmd /c <command> ...` shims
+/// into a canonical bare command and its arguments.
+pub fn normalize_command_and_args(
+    command: Option<&str>,
+    args: &[String],
+) -> (Option<String>, Vec<String>) {
+    let Some(cmd) = command else {
+        return (None, args.to_vec());
+    };
+
+    let trimmed = cmd.trim();
+    let is_cmd = trimmed.eq_ignore_ascii_case("cmd") || trimmed.eq_ignore_ascii_case("cmd.exe");
+
+    if is_cmd && args.len() >= 2 && args[0].eq_ignore_ascii_case("/c") {
+        let bare_cmd = args[1].clone();
+        let remaining_args = args[2..].to_vec();
+        (Some(bare_cmd), remaining_args)
+    } else {
+        (Some(trimmed.to_string()), args.to_vec())
+    }
+}
+
+/// Wraps command and args for Windows execution when needed.
+/// Bare CLI tools (e.g. `dbhub`, `npx`) on Windows require `cmd /c` wrapping
+/// to spawn correctly in harness environments.
+pub fn wrap_command_for_platform(
+    command: Option<&str>,
+    args: &[String],
+    is_windows: bool,
+) -> (Option<String>, Vec<String>) {
+    let Some(cmd) = command else {
+        return (None, args.to_vec());
+    };
+
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return (Some(trimmed.to_string()), args.to_vec());
+    }
+
+    if !is_windows {
+        return (Some(trimmed.to_string()), args.to_vec());
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let is_shell_or_exe = lower == "cmd"
+        || lower == "cmd.exe"
+        || lower == "powershell"
+        || lower == "powershell.exe"
+        || lower == "pwsh"
+        || lower == "pwsh.exe"
+        || lower.ends_with(".exe")
+        || lower.ends_with(".bat");
+
+    if is_shell_or_exe {
+        (Some(trimmed.to_string()), args.to_vec())
+    } else {
+        let mut wrapped = Vec::with_capacity(args.len() + 2);
+        wrapped.push("/c".to_string());
+        wrapped.push(trimmed.to_string());
+        wrapped.extend_from_slice(args);
+        (Some("cmd".to_string()), wrapped)
     }
 }
 
@@ -480,6 +798,8 @@ pub struct MagaConfig {
     pub refresh: RefreshConfig,
     #[serde(default)]
     pub tools: ToolsConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_profile: Option<String>,
     #[serde(flatten)]
     pub settings: toml::Table,
 }
@@ -686,10 +1006,17 @@ impl McpRegistry {
         Ok(())
     }
 
+    pub fn unwrap_windows_shims(&mut self) {
+        for server in self.mcps.values_mut() {
+            server.unwrap_windows_shim();
+        }
+    }
+
     pub fn from_toml_str(input: &str) -> Result<Self, String> {
         let mut cfg: Self = toml::from_str(input).map_err(|e| format!("Invalid TOML: {e}"))?;
         cfg.normalize_names();
         cfg.normalize_descriptions();
+        cfg.unwrap_windows_shims();
         cfg.validate()?;
         Ok(cfg)
     }
@@ -726,8 +1053,89 @@ impl SingleServerSnippet {
             toml::from_str(input).map_err(|e| format!("TOML syntax error: {e}"))?;
         validate_mcp_server_name(&snippet.name)?;
         snippet.config.normalize_description();
+        snippet.config.unwrap_windows_shim();
         snippet.config.validate()?;
         Ok(snippet)
+    }
+}
+
+/// Profile definition specifying included/excluded server names or glob patterns.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ProfileDefinition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+}
+
+impl ProfileDefinition {
+    pub fn matches_server(&self, server_name: &str) -> bool {
+        let excluded = self.exclude.iter().any(|p| pattern_matches(p, server_name));
+        if excluded {
+            return false;
+        }
+        if self.include.is_empty() || self.include.iter().any(|p| p == "*") {
+            return true;
+        }
+        self.include.iter().any(|p| pattern_matches(p, server_name))
+    }
+}
+
+pub fn pattern_matches(pattern: &str, name: &str) -> bool {
+    if pattern == "*" || pattern == name {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return name.starts_with(prefix);
+    }
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        return name.ends_with(suffix);
+    }
+    false
+}
+
+/// Ledger of named profiles stored in `~/.config/maga/profiles.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ProfilesConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, ProfileDefinition>,
+}
+
+impl ProfilesConfig {
+    pub fn from_toml_str(input: &str) -> Result<Self, String> {
+        if input.trim().is_empty() {
+            return Ok(Self::default());
+        }
+        toml::from_str(input).map_err(|e| format!("Invalid profiles TOML: {e}"))
+    }
+
+    pub fn to_toml_string(&self) -> Result<String, String> {
+        let body = toml::to_string_pretty(self)
+            .map_err(|e| format!("Failed to serialize profiles TOML: {e}"))?;
+        let header = "\
+# maga Named Profiles Configuration
+# Defines profiles (e.g. work, personal) with server include/exclude rules.
+#
+
+";
+        Ok(format!("{header}{body}"))
+    }
+
+    /// Evaluates if `server_name` is active under `profile_name`.
+    /// Returns `true` if profile is None, unknown, or if definition matches.
+    pub fn is_server_active(&self, profile_name: Option<&str>, server_name: &str) -> bool {
+        let Some(p_name) = profile_name else {
+            return true;
+        };
+        if let Some(def) = self.profiles.get(p_name) {
+            def.matches_server(server_name)
+        } else {
+            true
+        }
     }
 }
 
@@ -1058,5 +1466,270 @@ url = "https://mcp.example.com/mcp"
         let ui_level =
             MagaConfig::from_toml_str("[ui]\neditor = \"code --wait\"\n").expect("ui editor");
         assert_eq!(ui_level.configured_editor(), Some("code --wait"));
+    }
+
+    #[test]
+    fn parses_dotenv_str_with_quotes_comments_and_exports() {
+        let sample = r#"
+        # System settings
+        export DB_HOST=192.168.0.199
+        DB_PORT=1433 # default sqlserver port
+        DB_NAME="AppComplementare"
+        DB_USER='sa'
+        EMPTY_VAR=
+        # Inline comment after quoted
+        SECRET_PASS="P@ssw0rd!#123" # comment
+        "#;
+
+        let parsed = parse_dotenv_str(sample);
+        assert_eq!(
+            parsed.get("DB_HOST").map(String::as_str),
+            Some("192.168.0.199")
+        );
+        assert_eq!(parsed.get("DB_PORT").map(String::as_str), Some("1433"));
+        assert_eq!(
+            parsed.get("DB_NAME").map(String::as_str),
+            Some("AppComplementare")
+        );
+        assert_eq!(parsed.get("DB_USER").map(String::as_str), Some("sa"));
+        assert_eq!(parsed.get("EMPTY_VAR").map(String::as_str), Some(""));
+        assert_eq!(
+            parsed.get("SECRET_PASS").map(String::as_str),
+            Some("P@ssw0rd!#123")
+        );
+    }
+
+    #[test]
+    fn loads_env_context_with_file_and_process_fallback() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let env_file1 = temp.path().join("first.env");
+        let env_file2 = temp.path().join("second.env");
+
+        std::fs::write(&env_file1, "A=from_first\nB=from_first\n").unwrap();
+        std::fs::write(&env_file2, "B=from_second\nC=from_second\n").unwrap();
+
+        let loaded = load_env_context(&[env_file1, env_file2]);
+        assert_eq!(loaded.get("A").map(String::as_str), Some("from_first"));
+        assert_eq!(loaded.get("B").map(String::as_str), Some("from_second"));
+        assert_eq!(loaded.get("C").map(String::as_str), Some("from_second"));
+    }
+
+    #[test]
+    fn interpolates_placeholders_with_defaults_and_preserves_missing_and_malformed() {
+        let mut env = BTreeMap::new();
+        env.insert("USER".to_string(), "akrista".to_string());
+        env.insert("PORT".to_string(), "8080".to_string());
+
+        assert_eq!(interpolate_string("Hello ${USER}", &env), "Hello akrista");
+        assert_eq!(
+            interpolate_string("User $USER on port $PORT", &env),
+            "User akrista on port 8080"
+        );
+        assert_eq!(
+            interpolate_string("Fallback ${HOST:-localhost}", &env),
+            "Fallback localhost"
+        );
+        assert_eq!(
+            interpolate_string("Existing with fallback ${PORT:-3000}", &env),
+            "Existing with fallback 8080"
+        );
+
+        // Missing & malformed
+        assert_eq!(
+            interpolate_string("Missing ${MISSING_VAR}", &env),
+            "Missing ${MISSING_VAR}"
+        );
+        assert_eq!(
+            interpolate_string("Price is $100 and unclosed ${UNCLOSED", &env),
+            "Price is $100 and unclosed ${UNCLOSED"
+        );
+        assert_eq!(interpolate_string("Malformed ${}", &env), "Malformed ${}");
+
+        // Full McpServerConfig interpolation
+        let mut server = McpServerConfig::new_stdio(
+            "dbhub",
+            vec![
+                "--dsn".to_string(),
+                "sqlserver://${USER}:${PASS:-mypass}@localhost:${PORT}/db".to_string(),
+            ],
+        );
+        server
+            .env
+            .insert("APP_USER".to_string(), "${USER}".to_string());
+
+        let interpolated = server.interpolate(&env);
+        assert_eq!(
+            interpolated.args[1],
+            "sqlserver://akrista:mypass@localhost:8080/db"
+        );
+        assert_eq!(interpolated.env["APP_USER"], "akrista");
+    }
+
+    #[test]
+    fn unwraps_windows_command_shims_on_ingestion() {
+        let raw_toml = r#"
+[mcps.dbhub-mcp]
+transport = "stdio"
+command = "cmd"
+args = ["/c", "dbhub", "--transport", "stdio", "--dsn", "test"]
+"#;
+        let reg = McpRegistry::from_toml_str(raw_toml).expect("parse spaced registry");
+        let server = &reg.mcps["dbhub-mcp"];
+        assert_eq!(server.command.as_deref(), Some("dbhub"));
+        assert_eq!(server.args, vec!["--transport", "stdio", "--dsn", "test"]);
+
+        let (cmd, args) = normalize_command_and_args(
+            Some("cmd.exe"),
+            &["/C".to_string(), "npx".to_string(), "-y".to_string()],
+        );
+        assert_eq!(cmd.as_deref(), Some("npx"));
+        assert_eq!(args, vec!["-y"]);
+    }
+
+    #[test]
+    fn wraps_command_for_windows_and_leaves_unix_bare() {
+        let (cmd_win, args_win) = wrap_command_for_platform(
+            Some("dbhub"),
+            &["--transport".to_string(), "stdio".to_string()],
+            true,
+        );
+        assert_eq!(cmd_win.as_deref(), Some("cmd"));
+        assert_eq!(args_win, vec!["/c", "dbhub", "--transport", "stdio"]);
+
+        let (cmd_unix, args_unix) = wrap_command_for_platform(
+            Some("dbhub"),
+            &["--transport".to_string(), "stdio".to_string()],
+            false,
+        );
+        assert_eq!(cmd_unix.as_deref(), Some("dbhub"));
+        assert_eq!(args_unix, vec!["--transport", "stdio"]);
+
+        // Exe already or shell command not wrapped
+        let (cmd_exe, args_exe) =
+            wrap_command_for_platform(Some("C:\\bin\\tool.exe"), &["--flag".to_string()], true);
+        assert_eq!(cmd_exe.as_deref(), Some("C:\\bin\\tool.exe"));
+        assert_eq!(args_exe, vec!["--flag"]);
+    }
+
+    #[test]
+    fn matches_canonical_or_interpolated_handles_secrets_and_shims() {
+        let canonical = McpServerConfig::new_stdio(
+            "dbhub",
+            vec![
+                "--dsn".to_string(),
+                "sqlserver://sa:${DB_PASS}@127.0.0.1/app".to_string(),
+            ],
+        );
+
+        let mut env = BTreeMap::new();
+        env.insert("DB_PASS".to_string(), "secret123".to_string());
+
+        // Harness on Windows with cmd /c and expanded secret
+        let harness_win = McpServerConfig::new_stdio(
+            "cmd",
+            vec![
+                "/c".to_string(),
+                "dbhub".to_string(),
+                "--dsn".to_string(),
+                "sqlserver://sa:secret123@127.0.0.1/app".to_string(),
+            ],
+        );
+
+        assert!(harness_win.matches_canonical_or_interpolated(&canonical, &env));
+
+        // Real drift in secret or flag
+        let drifted = McpServerConfig::new_stdio(
+            "cmd",
+            vec![
+                "/c".to_string(),
+                "dbhub".to_string(),
+                "--dsn".to_string(),
+                "sqlserver://sa:wrong_secret@127.0.0.1/app".to_string(),
+            ],
+        );
+        assert!(!drifted.matches_canonical_or_interpolated(&canonical, &env));
+    }
+
+    #[test]
+    fn mcp_server_config_harnesses_and_project_policy_backwards_compatible() {
+        let legacy_toml = r#"
+[mcps.test-server]
+enabled = true
+transport = "http"
+url = "https://example.com/mcp"
+"#;
+        let registry = McpRegistry::from_toml_str(legacy_toml).expect("parse legacy toml");
+        let server = registry.mcps.get("test-server").expect("server present");
+        assert_eq!(server.project_policy, ProjectPolicy::Mirror);
+        assert!(server.harnesses.is_empty());
+        assert!(server.enabled_for_harness(HarnessKind::Claude));
+        assert!(server.enabled_for_harness(HarnessKind::Copilot));
+
+        let with_overrides_toml = r#"
+[mcps.test-server]
+enabled = true
+transport = "http"
+url = "https://example.com/mcp"
+project_policy = "preserve"
+
+[mcps.test-server.harnesses]
+claude = true
+copilot = false
+"#;
+        let reg2 = McpRegistry::from_toml_str(with_overrides_toml).expect("parse overrides");
+        let s2 = reg2.mcps.get("test-server").expect("server present");
+        assert_eq!(s2.project_policy, ProjectPolicy::Preserve);
+        assert_eq!(s2.harnesses.get(&HarnessKind::Claude), Some(&true));
+        assert_eq!(s2.harnesses.get(&HarnessKind::Copilot), Some(&false));
+        assert!(s2.enabled_for_harness(HarnessKind::Claude));
+        assert!(!s2.enabled_for_harness(HarnessKind::Copilot));
+        assert!(s2.enabled_for_harness(HarnessKind::Antigravity)); // falls back to enabled = true
+    }
+
+    #[test]
+    fn profiles_config_matching_and_parsing() {
+        let toml_str = r#"
+active = "work"
+
+[profiles.work]
+description = "Work environment"
+include = ["*"]
+exclude = ["personal-*", "spotify"]
+
+[profiles.personal]
+description = "Personal hacking"
+include = ["personal-*", "context7"]
+"#;
+        let cfg = ProfilesConfig::from_toml_str(toml_str).expect("parse profiles toml");
+        assert_eq!(cfg.active.as_deref(), Some("work"));
+        assert!(cfg.is_server_active(Some("work"), "context7"));
+        assert!(cfg.is_server_active(Some("work"), "jira-mcp"));
+        assert!(!cfg.is_server_active(Some("work"), "personal-notes"));
+        assert!(!cfg.is_server_active(Some("work"), "spotify"));
+
+        assert!(cfg.is_server_active(Some("personal"), "personal-notes"));
+        assert!(cfg.is_server_active(Some("personal"), "context7"));
+        assert!(!cfg.is_server_active(Some("personal"), "jira-mcp"));
+
+        let serialized = cfg.to_toml_string().expect("serialize profiles toml");
+        let reparsed = ProfilesConfig::from_toml_str(&serialized).expect("reparse profiles toml");
+        assert_eq!(cfg, reparsed);
+    }
+
+    #[test]
+    fn maga_config_roundtrip_with_active_profile() {
+        let raw = r#"
+active_profile = "work"
+
+[ui]
+theme = "elite"
+"#;
+        let cfg = MagaConfig::from_toml_str(raw).expect("parse config with active_profile");
+        assert_eq!(cfg.active_profile.as_deref(), Some("work"));
+
+        let serialized = cfg.to_toml_string().expect("serialize config");
+        assert!(serialized.contains("active_profile = \"work\""));
+        let reparsed = MagaConfig::from_toml_str(&serialized).expect("reparse config");
+        assert_eq!(cfg.active_profile, reparsed.active_profile);
     }
 }

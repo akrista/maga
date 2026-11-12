@@ -185,17 +185,96 @@ impl ReconcileOutcome {
 }
 
 /// Returns `true` if `harness_map` and `canonical_map` have the same keys and every entry matches
-/// via `McpServerConfig::same_harness_state` (ignoring `description`).
+/// (supporting `${ENV_VAR}` interpolation and Windows shim unwrapping).
 pub fn harness_maps_match(
     harness_map: &BTreeMap<String, McpServerConfig>,
     canonical_map: &BTreeMap<String, McpServerConfig>,
 ) -> bool {
+    harness_maps_match_with_env(harness_map, canonical_map, None)
+}
+
+/// Returns `true` if `harness_map` matches `canonical_map` using explicit environment variables.
+pub fn harness_maps_match_with_env(
+    harness_map: &BTreeMap<String, McpServerConfig>,
+    canonical_map: &BTreeMap<String, McpServerConfig>,
+    env: Option<&BTreeMap<String, String>>,
+) -> bool {
+    let default_env;
+    let env_ref = match env {
+        Some(e) => e,
+        None => {
+            default_env = crate::domain::model::load_default_env();
+            &default_env
+        }
+    };
     harness_map.len() == canonical_map.len()
         && harness_map.iter().all(|(k, h_cfg)| {
             canonical_map
                 .get(k)
-                .is_some_and(|c_cfg| h_cfg.same_harness_state(c_cfg))
+                .is_some_and(|c_cfg| h_cfg.matches_canonical_or_interpolated(c_cfg, env_ref))
         })
+}
+
+/// Status of harness convergence relative to canonical state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConvergenceStatus {
+    /// Canonical registry and all enabled harnesses are in exact sync with no drift or conflicts.
+    Converged,
+    /// Unreconciled drift exists between harnesses and canonical state (clean import or update possible), but no conflicts.
+    Drift {
+        drift_harnesses: Vec<HarnessKind>,
+        imported_count: usize,
+    },
+    /// One or more conflicts (definition drift or case collision) were detected.
+    Conflicted { conflicts: Vec<McpConflict> },
+}
+
+/// Evaluates whether canonical state and enabled harnesses are converged, have clean drift, or have conflicts.
+pub fn evaluate_convergence(
+    maga: &BTreeMap<String, McpServerConfig>,
+    harnesses: &[(HarnessKind, BTreeMap<String, McpServerConfig>)],
+) -> ConvergenceStatus {
+    let default_env = crate::domain::model::load_default_env();
+    evaluate_convergence_with_env(maga, harnesses, Some(&default_env))
+}
+
+/// Evaluates convergence using explicit environment variables for interpolation.
+pub fn evaluate_convergence_with_env(
+    maga: &BTreeMap<String, McpServerConfig>,
+    harnesses: &[(HarnessKind, BTreeMap<String, McpServerConfig>)],
+    env: Option<&BTreeMap<String, String>>,
+) -> ConvergenceStatus {
+    let outcome = reconcile_harnesses_with_env(maga, harnesses, env);
+    if !outcome.conflicts.is_empty() {
+        return ConvergenceStatus::Conflicted {
+            conflicts: outcome.conflicts,
+        };
+    }
+
+    let default_env;
+    let env_ref = match env {
+        Some(e) => e,
+        None => {
+            default_env = crate::domain::model::load_default_env();
+            &default_env
+        }
+    };
+
+    let mut drift_harnesses = Vec::new();
+    for (kind, map) in harnesses {
+        if !harness_maps_match_with_env(map, &outcome.canonical, Some(env_ref)) {
+            drift_harnesses.push(*kind);
+        }
+    }
+
+    if drift_harnesses.is_empty() && maga == &outcome.canonical {
+        ConvergenceStatus::Converged
+    } else {
+        ConvergenceStatus::Drift {
+            drift_harnesses,
+            imported_count: outcome.imported_count,
+        }
+    }
 }
 
 fn normalize_server_map(
@@ -210,6 +289,7 @@ fn normalize_server_map(
         }
         let mut cfg = v.clone();
         cfg.normalize_description();
+        cfg.unwrap_windows_shim();
         if &norm == k {
             out.insert(norm, cfg);
         } else {
@@ -251,6 +331,25 @@ pub fn reconcile_harnesses(
     maga: &BTreeMap<String, McpServerConfig>,
     harnesses: &[(HarnessKind, BTreeMap<String, McpServerConfig>)],
 ) -> ReconcileOutcome {
+    let default_env = crate::domain::model::load_default_env();
+    reconcile_harnesses_with_env(maga, harnesses, Some(&default_env))
+}
+
+/// Reconciles `maga` and enabled harnesses using the provided environment variable context
+/// for placeholder interpolation and secret preservation.
+pub fn reconcile_harnesses_with_env(
+    maga: &BTreeMap<String, McpServerConfig>,
+    harnesses: &[(HarnessKind, BTreeMap<String, McpServerConfig>)],
+    env: Option<&BTreeMap<String, String>>,
+) -> ReconcileOutcome {
+    let default_env;
+    let env_ref = match env {
+        Some(e) => e,
+        None => {
+            default_env = crate::domain::model::load_default_env();
+            &default_env
+        }
+    };
     let norm_maga = normalize_server_map(maga);
     let norm_harnesses: Vec<(HarnessKind, BTreeMap<String, McpServerConfig>)> = harnesses
         .iter()
@@ -375,7 +474,9 @@ pub fn reconcile_harnesses(
                 if present.is_empty() {
                     continue;
                 }
-                let all_match_m = present.iter().all(|(_, c)| c.same_harness_state(m));
+                let all_match_m = present
+                    .iter()
+                    .all(|(_, c)| c.matches_canonical_or_interpolated(m, env_ref));
                 if all_match_m {
                     continue;
                 }
@@ -386,7 +487,10 @@ pub fn reconcile_harnesses(
                 let all_harnesses_agree =
                     present.iter().all(|(_, c)| c.same_harness_state(first_h));
 
-                if all_harnesses_present && all_harnesses_agree && !first_h.same_harness_state(m) {
+                if all_harnesses_present
+                    && all_harnesses_agree
+                    && !first_h.matches_canonical_or_interpolated(m, env_ref)
+                {
                     // All enabled harnesses agree on a newer state than mcp.toml; preserve maga description
                     let mut adopted = first_h.clone();
                     if adopted.description.is_none() {
@@ -408,7 +512,10 @@ pub fn reconcile_harnesses(
                         entries.push((name.clone(), kind.short_name().to_string(), m.clone()));
                     }
                 }
-                if !entries.iter().any(|(_, _, c)| c.same_harness_state(m)) {
+                if !entries
+                    .iter()
+                    .any(|(_, _, c)| c.matches_canonical_or_interpolated(m, env_ref))
+                {
                     entries.push((name.clone(), "maga".to_string(), m.clone()));
                 }
 
@@ -432,10 +539,17 @@ pub fn reconcile_harnesses(
     }
 }
 
-fn opt_same_harness_state(a: Option<&McpServerConfig>, b: Option<&McpServerConfig>) -> bool {
+fn opt_same_harness_state(
+    a: Option<&McpServerConfig>,
+    b: Option<&McpServerConfig>,
+    env: &BTreeMap<String, String>,
+) -> bool {
     match (a, b) {
         (None, None) => true,
-        (Some(x), Some(y)) => x.same_harness_state(y),
+        (Some(x), Some(y)) => {
+            x.matches_canonical_or_interpolated(y, env)
+                || y.matches_canonical_or_interpolated(x, env)
+        }
         _ => false,
     }
 }
@@ -447,6 +561,30 @@ pub fn reconcile_live_reload_harnesses(
     disk_maga: &BTreeMap<String, McpServerConfig>,
     disk_harnesses: &[(HarnessKind, BTreeMap<String, McpServerConfig>)],
 ) -> ReconcileOutcome {
+    let default_env = crate::domain::model::load_default_env();
+    reconcile_live_reload_harnesses_with_env(
+        prev_canonical,
+        disk_maga,
+        disk_harnesses,
+        Some(&default_env),
+    )
+}
+
+/// Reconciles a live reload with explicit environment variables.
+pub fn reconcile_live_reload_harnesses_with_env(
+    prev_canonical: &BTreeMap<String, McpServerConfig>,
+    disk_maga: &BTreeMap<String, McpServerConfig>,
+    disk_harnesses: &[(HarnessKind, BTreeMap<String, McpServerConfig>)],
+    env: Option<&BTreeMap<String, String>>,
+) -> ReconcileOutcome {
+    let default_env;
+    let env_ref = match env {
+        Some(e) => e,
+        None => {
+            default_env = crate::domain::model::load_default_env();
+            &default_env
+        }
+    };
     let mut adj_maga = normalize_server_map(disk_maga);
     let mut adj_harnesses: Vec<(HarnessKind, BTreeMap<String, McpServerConfig>)> = disk_harnesses
         .iter()
@@ -502,12 +640,12 @@ pub fn reconcile_live_reload_harnesses(
                 }
                 cfg
             });
-            let h_changed = !opt_same_harness_state(h_val.as_ref(), prev);
+            let h_changed = !opt_same_harness_state(h_val.as_ref(), prev, env_ref);
             if h_changed {
                 match &target {
                     None => target = Some(h_val),
-                    Some(existing) if opt_same_harness_state(existing.as_ref(), h_val.as_ref()) => {
-                    }
+                    Some(existing)
+                        if opt_same_harness_state(existing.as_ref(), h_val.as_ref(), env_ref) => {}
                     Some(_) => {
                         conflict = true;
                     }
@@ -534,7 +672,7 @@ pub fn reconcile_live_reload_harnesses(
         }
     }
 
-    let mut outcome = reconcile_harnesses(&adj_maga, &adj_harnesses);
+    let mut outcome = reconcile_harnesses_with_env(&adj_maga, &adj_harnesses, Some(env_ref));
     outcome.imported_count += updated_count;
     outcome
 }
@@ -846,5 +984,137 @@ mod tests {
             live_outcome.canonical["context7"].description.as_deref(),
             Some("Upstash Context7 documentation MCP")
         );
+    }
+
+    #[test]
+    fn evaluates_convergence_status_converged_drift_and_conflict() {
+        let mut maga = BTreeMap::new();
+        let server = McpServerConfig::new_http("https://mcp.context7.com/mcp");
+        maga.insert("context7".to_string(), server.clone());
+
+        let mut agy = BTreeMap::new();
+        agy.insert("context7".to_string(), server.clone());
+
+        let harnesses = vec![(HarnessKind::Antigravity, agy.clone())];
+
+        // 1. Converged
+        assert_eq!(
+            evaluate_convergence(&maga, &harnesses),
+            ConvergenceStatus::Converged
+        );
+
+        // 2. Clean Drift (server in Agy not yet in maga)
+        let mut agy_drift = agy.clone();
+        agy_drift.insert(
+            "filesystem".to_string(),
+            McpServerConfig::new_stdio("npx", vec!["filesystem".to_string()]),
+        );
+        let drift_harnesses = vec![(HarnessKind::Antigravity, agy_drift)];
+        let drift_status = evaluate_convergence(&maga, &drift_harnesses);
+        assert!(matches!(
+            drift_status,
+            ConvergenceStatus::Drift {
+                imported_count: 1,
+                ..
+            }
+        ));
+
+        // 3. Conflict (definition drift between Agy and Claude)
+        let mut claude_conflict = BTreeMap::new();
+        let mut server_diff = server.clone();
+        server_diff.url = Some("https://other.context7.com/mcp".to_string());
+        claude_conflict.insert("context7".to_string(), server_diff);
+
+        let conflict_harnesses = vec![
+            (HarnessKind::Antigravity, agy),
+            (HarnessKind::Claude, claude_conflict),
+        ];
+        let conflict_status = evaluate_convergence(&maga, &conflict_harnesses);
+        assert!(matches!(
+            conflict_status,
+            ConvergenceStatus::Conflicted { .. }
+        ));
+    }
+
+    #[test]
+    fn reconciles_interpolated_secrets_and_windows_shims_without_false_conflicts() {
+        let mut maga = BTreeMap::new();
+        let canonical_server = McpServerConfig::new_stdio(
+            "dbhub",
+            vec![
+                "--transport".to_string(),
+                "stdio".to_string(),
+                "--dsn".to_string(),
+                "sqlserver://sa:${DB_PASS}@192.168.0.199:1433/App".to_string(),
+            ],
+        );
+        maga.insert("dbhub-server".to_string(), canonical_server.clone());
+
+        let mut env = BTreeMap::new();
+        env.insert("DB_PASS".to_string(), "SuperSecret123!".to_string());
+
+        // Harness on Windows has cmd /c and expanded password
+        let mut agy = BTreeMap::new();
+        let agy_server = McpServerConfig::new_stdio(
+            "cmd",
+            vec![
+                "/c".to_string(),
+                "dbhub".to_string(),
+                "--transport".to_string(),
+                "stdio".to_string(),
+                "--dsn".to_string(),
+                "sqlserver://sa:SuperSecret123!@192.168.0.199:1433/App".to_string(),
+            ],
+        );
+        agy.insert("dbhub-server".to_string(), agy_server);
+
+        let harnesses = vec![(HarnessKind::Antigravity, agy)];
+
+        // Reconcile with env
+        let outcome = reconcile_harnesses_with_env(&maga, &harnesses, Some(&env));
+        assert!(
+            outcome.conflicts.is_empty(),
+            "Should not report conflict for expanded secret"
+        );
+        assert_eq!(
+            outcome.canonical["dbhub-server"], canonical_server,
+            "Canonical template in mcp.toml should be preserved!"
+        );
+
+        let status = evaluate_convergence_with_env(&maga, &harnesses, Some(&env));
+        assert_eq!(status, ConvergenceStatus::Converged);
+    }
+
+    #[test]
+    fn diff_detects_real_secret_drift_when_value_differs() {
+        let mut maga = BTreeMap::new();
+        let canonical_server = McpServerConfig::new_stdio(
+            "dbhub",
+            vec![
+                "--dsn".to_string(),
+                "sqlserver://sa:${DB_PASS}@127.0.0.1/App".to_string(),
+            ],
+        );
+        maga.insert("dbhub".to_string(), canonical_server);
+
+        let mut env = BTreeMap::new();
+        env.insert("DB_PASS".to_string(), "ExpectedSecret".to_string());
+
+        // Harness has a DIFFERENT password
+        let mut claude = BTreeMap::new();
+        let claude_server = McpServerConfig::new_stdio(
+            "dbhub",
+            vec![
+                "--dsn".to_string(),
+                "sqlserver://sa:CompletelyDifferentSecret@127.0.0.1/App".to_string(),
+            ],
+        );
+        claude.insert("dbhub".to_string(), claude_server);
+
+        let harnesses = vec![(HarnessKind::Claude, claude)];
+        let outcome = reconcile_harnesses_with_env(&maga, &harnesses, Some(&env));
+        assert_eq!(outcome.conflicts.len(), 1);
+        assert_eq!(outcome.conflicts[0].name, "dbhub");
+        assert_eq!(outcome.conflicts[0].differing_fields(), vec!["args"]);
     }
 }

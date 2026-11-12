@@ -3,7 +3,7 @@
   <p><strong>Unified Terminal UI &amp; Canonical Registry for Model Context Protocol (MCP) Servers &amp; Agentic Harness Plugins</strong></p>
 
   <p>
-    <a href="#quick-start"><img src="https://img.shields.io/badge/version-0.1.0-e8998d?style=flat-square" alt="Version 0.1.0" /></a>
+    <a href="#quick-start"><img src="https://img.shields.io/badge/version-0.3.0-e8998d?style=flat-square" alt="Version 0.3.0" /></a>
     <a href="Cargo.toml"><img src="https://img.shields.io/badge/rust-2024_edition-f4b942?style=flat-square&logo=rust" alt="Rust 2024 Edition" /></a>
     <a href="#supported-harnesses"><img src="https://img.shields.io/badge/harnesses-5_supported-7b68ee?style=flat-square" alt="5 Supported Harnesses" /></a>
     <a href="#live-mcp-health-probing--plugin-management"><img src="https://img.shields.io/badge/workspace-MCPs_%2B_Plugins-4ecdc4?style=flat-square" alt="MCPs + Plugins" /></a>
@@ -61,6 +61,7 @@
 - **Live MCP Health Probing & Tool Inspection (`p` / `P` / `t`)**: Executes non-blocking, bounded-timeout (8s) JSON-RPC `initialize` + `tools/list` handshakes over `stdio` subprocesses and `http` / SSE endpoints, displaying live round-trip latency (`ms`) and exposed tool definitions.
 - **Lossless Schema Translation & Symlink-Safe Atomic Backups**: Writes `.bak` backups before every update via canonicalized same-directory atomic temp-file replacement—preserving symbolic links, non-MCP keys, OAuth/session state, `"plugin:*"` entries, and per-server harness options.
 - **Hybrid Editing & Live Auto-Refresh**: Add or edit servers via a guided in-TUI form (`a` / `e`) or directly as validated TOML in `$EDITOR` (`E`), while background disk polling reconciles external edits in real time.
+- **In-Place Self-Updates & Status Bar Alerts (`--update`)**: Non-blocking background release checks against GitHub Releases with an unobtrusive status bar alert, and verified in-place SHA-256 binary upgrades via `maga --update`.
 - **3-Tier Reactive Spellcaster UI**: Unicode Braille (`⠁..⣿`, `2×4` sub-cell dot matrix) artwork, keyboard-focus gaze tracking, action-reactive animations (`Idle`, `Casting`, `Scrying`, `Startled`, `Refreshing`), `tachyonfx` shader transitions, and three semantic palettes (`blush`, `indigo`, `elite`).
 
 ---
@@ -111,7 +112,7 @@ Download the archive for your platform (`x86_64-unknown-linux-gnu`, `aarch64-unk
 ```bash
 # Quick one-liner for Linux / macOS (adjust TARGET for your OS/arch)
 TARGET="x86_64-unknown-linux-gnu"
-curl -fsSL "https://github.com/akrista/maga/releases/latest/download/maga-v0.1.0-${TARGET}.tar.gz" \
+curl -fsSL "https://github.com/akrista/maga/releases/latest/download/maga-v0.3.0-${TARGET}.tar.gz" \
   | tar -xz -C ~/.local/bin maga
 
 # Or install prebuilt binary via cargo-binstall
@@ -150,6 +151,21 @@ maga \
 
 # Print reconciled MCP server status in plain text and exit without launching the TUI
 maga --dump
+
+# Check if harnesses are converged with mcp.toml (read-only, exit 0 = in sync, 1 = drift, 2 = conflict)
+maga --check
+
+# Synchronize canonical MCPs to all enabled harnesses non-interactively (fails fast on conflict)
+maga --sync
+
+# Authoritatively push mcp.toml to all harnesses, overriding conflicts
+maga --sync --force
+
+# Check if a newer version of maga is available on GitHub Releases
+maga --check-update
+
+# Automatically download, verify, and replace maga in-place with the latest release
+maga --update
 ```
 
 | Flag | Default / Behavior |
@@ -163,6 +179,11 @@ maga --dump
 | `--grok-config <GROK_CONFIG>` | Override Grok CLI config path (`~/.grok/config.toml`) |
 | `--opencode-config <OPENCODE_CONFIG>` | Override OpenCode config path (`~/.config/opencode/opencode.json`) |
 | `--dump` | Print reconciled MCP server status (`✓` enabled, `○` disabled, `!` conflict) in plain text and exit (also used automatically when `stdout` is piped/non-TTY) |
+| `--check` | Verify whether canonical state and harnesses are converged without writing any files (exit 0 = converged, 1 = drift, 2 = conflict) |
+| `--sync` | Reconcile and synchronize canonical MCPs to all enabled harnesses non-interactively, failing fast on conflicts (exit 0 = synced, 2 = conflict) |
+| `--force` | Combined with `--sync`: authoritatively push `mcp.toml` to all enabled harnesses, overriding conflicts |
+| `--check-update` | Query GitHub Releases for a newer version of `maga` and print status without modifying files |
+| `--update` | Download the matching release archive, verify its SHA-256 checksum, and upgrade the binary in-place |
 | `-h`, `--help` | Print CLI help information |
 | `-V`, `--version` | Print version information |
 

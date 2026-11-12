@@ -1,14 +1,14 @@
 use crate::domain::model::{
-    HarnessKind, MagaConfig, MascotMode, McpServerConfig, SingleServerSnippet, ThemeName,
-    Transport, normalize_mcp_description, validate_mcp_server_name,
+    HarnessKind, MagaConfig, MascotMode, McpServerConfig, ProjectPolicy, SingleServerSnippet,
+    ThemeName, Transport, normalize_mcp_description, validate_mcp_server_name,
 };
 use crate::domain::plugins::{
     HarnessPlugin, discover_all_harness_plugins, remove_harness_plugin, toggle_harness_plugin,
 };
 use crate::domain::probe::{ProbeEvent, ServerProbeState, spawn_probe_worker};
 use crate::domain::reconcile::{
-    ConflictResolution, McpConflict, ReconcileOutcome, harness_maps_match, reconcile_harnesses,
-    reconcile_live_reload_harnesses,
+    ConflictResolution, McpConflict, ReconcileOutcome, harness_maps_match_with_env,
+    reconcile_harnesses_with_env, reconcile_live_reload_harnesses_with_env,
 };
 use crate::domain::storage::{LoadedConfigs, StoragePaths};
 use crate::fx::{FxEngine, FxTrigger};
@@ -18,22 +18,26 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-/// Active workspace view tab (`MCPs` vs. `Plugins`).
+/// Active workspace view tab (`MCPs` vs. `Plugins` vs. `Guidelines` vs. `Refs`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WorkspaceSection {
     #[default]
     Mcps,
     Plugins,
+    Guidelines,
+    Refs,
 }
 
 impl WorkspaceSection {
     pub fn toggle(self) -> Self {
         match self {
             Self::Mcps => Self::Plugins,
-            Self::Plugins => Self::Mcps,
+            Self::Plugins => Self::Guidelines,
+            Self::Guidelines => Self::Refs,
+            Self::Refs => Self::Mcps,
         }
     }
 }
@@ -73,6 +77,17 @@ pub enum ActiveMode {
         id: String,
         display_name: String,
         install_path: Option<PathBuf>,
+    },
+    ProfilesModal {
+        selected: usize,
+        items: Vec<String>,
+    },
+    MatrixModal {
+        server_name: String,
+        selected: usize,
+    },
+    NewProfileModal {
+        input: String,
     },
     Help,
 }
@@ -573,6 +588,9 @@ pub struct App {
     pub plugin_scroll_offset: usize,
     pub plugin_filter_query: String,
     pub collapsed_plugin_groups: BTreeSet<HarnessKind>,
+    pub guidelines_statuses: Vec<crate::domain::guidelines::GuidelineStatus>,
+    pub guidelines_selected: usize,
+    pub refs_selected: usize,
     pub mode: ActiveMode,
     pub status_message: Option<(String, bool)>, // (message, is_error)
     pub pending_editor: Option<EditorRequest>,
@@ -594,6 +612,7 @@ pub struct App {
     pub details_focused: bool,
     pub details_scroll: usize,
     pub help_scroll: usize,
+    pub available_update: Arc<Mutex<Option<String>>>,
 }
 
 impl App {
@@ -603,8 +622,12 @@ impl App {
         width: u16,
         height: u16,
     ) -> Self {
+        let env_ctx = paths.as_ref().map_or_else(
+            crate::domain::model::load_default_env,
+            StoragePaths::load_env_context,
+        );
         let harnesses = loaded.enabled_harness_servers();
-        let outcome = reconcile_harnesses(&loaded.mcp.mcps, &harnesses);
+        let outcome = reconcile_harnesses_with_env(&loaded.mcp.mcps, &harnesses, Some(&env_ctx));
         let mut initial_fx = vec![FxTrigger::Startup];
         let initial_mode = if !outcome.conflicts.is_empty() {
             initial_fx.push(FxTrigger::ConflictAlert);
@@ -649,6 +672,18 @@ impl App {
 
         let (probe_tx, probe_rx) = mpsc::channel();
 
+        let available_update = Arc::new(Mutex::new(None));
+        let update_clone = Arc::clone(&available_update);
+        std::thread::spawn(move || {
+            if let Ok(info) = crate::domain::update::check_latest_release(crate::domain::update::DEFAULT_REPO) {
+                if info.is_newer {
+                    if let Ok(mut lock) = update_clone.lock() {
+                        *lock = Some(info.latest_version);
+                    }
+                }
+            }
+        });
+
         let mut app = Self {
             should_quit: false,
             width,
@@ -664,6 +699,9 @@ impl App {
             plugin_scroll_offset: 0,
             plugin_filter_query: String::new(),
             collapsed_plugin_groups: BTreeSet::new(),
+            guidelines_statuses: crate::domain::guidelines::check_guidelines_status().unwrap_or_default(),
+            guidelines_selected: 0,
+            refs_selected: 0,
             mode: initial_mode,
             status_message,
             pending_editor: None,
@@ -685,10 +723,15 @@ impl App {
             details_focused: false,
             details_scroll: 0,
             help_scroll: 0,
+            available_update,
         };
         app.recompute_focus_gaze_target();
         app.gaze_current = app.gaze_target;
         app
+    }
+
+    pub fn available_update(&self) -> Option<String> {
+        self.available_update.lock().ok().and_then(|g| g.clone())
     }
 
     pub fn emit_fx(&self, trigger: FxTrigger) {
@@ -797,6 +840,9 @@ impl App {
             ActiveMode::ConflictModal { .. }
             | ActiveMode::ConfirmDelete { .. }
             | ActiveMode::ConfirmDeletePlugin { .. }
+            | ActiveMode::ProfilesModal { .. }
+            | ActiveMode::MatrixModal { .. }
+            | ActiveMode::NewProfileModal { .. }
             | ActiveMode::Help => {
                 self.gaze_target = (0.0, 0.0);
             }
@@ -816,6 +862,16 @@ impl App {
                             self.visible_plugin_rows().len(),
                             self.plugin_selected,
                             self.plugin_scroll_offset,
+                        ),
+                        WorkspaceSection::Guidelines => (
+                            self.guidelines_statuses.len(),
+                            self.guidelines_selected,
+                            0,
+                        ),
+                        WorkspaceSection::Refs => (
+                            self.loaded.refs.refs.len(),
+                            self.refs_selected,
+                            0,
                         ),
                     };
                     if visible_len == 0 {
@@ -916,6 +972,13 @@ impl App {
         self.probe_states.get(name)
     }
 
+    fn current_env_context(&self) -> BTreeMap<String, String> {
+        self.paths.as_ref().map_or_else(
+            crate::domain::model::load_default_env,
+            StoragePaths::load_env_context,
+        )
+    }
+
     /// Launches a background MCP `initialize` + `tools/list` probe for the currently selected server (`p`).
     pub fn probe_selected(&mut self) {
         let Some((name, cfg, _)) = self.selected_server() else {
@@ -929,9 +992,11 @@ impl App {
             self.status_message = Some((format!("↻ Already probing '{name}'…"), false));
             return;
         }
+        let env_ctx = self.current_env_context();
+        let probe_cfg = cfg.interpolate(&env_ctx);
         self.probe_states
             .insert(name.clone(), ServerProbeState::Probing);
-        spawn_probe_worker(name.clone(), cfg, self.probe_tx.clone());
+        spawn_probe_worker(name.clone(), probe_cfg, self.probe_tx.clone());
         self.status_message = Some((
             format!("↻ Probing '{name}' (initialize + tools/list)…"),
             false,
@@ -955,6 +1020,7 @@ impl App {
             return;
         }
 
+        let env_ctx = self.current_env_context();
         let mut launched = 0usize;
         for (name, cfg) in targets {
             if matches!(
@@ -963,9 +1029,10 @@ impl App {
             ) {
                 continue;
             }
+            let probe_cfg = cfg.interpolate(&env_ctx);
             self.probe_states
                 .insert(name.clone(), ServerProbeState::Probing);
-            spawn_probe_worker(name, cfg, self.probe_tx.clone());
+            spawn_probe_worker(name, probe_cfg, self.probe_tx.clone());
             launched += 1;
         }
 
@@ -1376,6 +1443,53 @@ impl App {
         }
     }
 
+    /// Clones or updates the currently selected reference documentation repository.
+    pub fn clone_or_update_selected_ref(&mut self, _force_update: bool) {
+        let Some((alias, entry)) = self
+            .loaded
+            .refs
+            .refs
+            .iter()
+            .nth(self.refs_selected)
+            .map(|(a, e)| (a.clone(), e.clone()))
+        else {
+            self.status_message = Some(("No reference repository selected".to_string(), true));
+            return;
+        };
+
+        let cache_dir = self
+            .paths
+            .as_ref()
+            .map(|p| p.refs_cache_dir.clone())
+            .unwrap_or_else(|| std::path::PathBuf::from("refs"));
+        let target_path = self.loaded.refs.effective_path(&alias, &entry, &cache_dir);
+
+        match crate::domain::refs::clone_or_update_ref(&alias, &entry, &target_path) {
+            Ok(msg) => {
+                self.status_message = Some((format!("✓ {msg}"), false));
+                self.trigger_mascot_reaction(
+                    MascotReaction::Casting,
+                    Duration::from_millis(750),
+                );
+                self.emit_fx(FxTrigger::Synced);
+
+                // Auto update guidelines lookup index
+                let formatted = crate::domain::refs::format_reference_index(
+                    &self.loaded.refs,
+                    &cache_dir,
+                );
+                let _ = crate::domain::guidelines::update_canonical_refs(&formatted);
+            }
+            Err(e) => {
+                self.status_message = Some((format!("✗ Ref operation failed: {e}"), true));
+                self.trigger_mascot_reaction(
+                    MascotReaction::Startled,
+                    Duration::from_millis(800),
+                );
+            }
+        }
+    }
+
     /// Reloads `config.toml`, `mcp.toml`, and enabled harness configs from disk and reconciles
     /// external edits against the current canonical registry.
     pub fn refresh_from_disk(&mut self, silent_if_unchanged: bool) {
@@ -1422,13 +1536,21 @@ impl App {
             }
         }
 
-        let new_outcome =
-            reconcile_live_reload_harnesses(&prev_canonical, &fresh.mcp.mcps, &live_harnesses);
+        let env_ctx = paths.load_env_context();
+        let new_outcome = reconcile_live_reload_harnesses_with_env(
+            &prev_canonical,
+            &fresh.mcp.mcps,
+            &live_harnesses,
+            Some(&env_ctx),
+        );
 
         let any_harness_out_of_sync = HarnessKind::ALL.into_iter().any(|kind| {
             fresh.config.tools.is_enabled(kind)
-                && (!harness_maps_match(fresh.harness_servers(kind), &new_outcome.canonical)
-                    || fresh.harness_has_raw_spaced_keys(kind)
+                && (!harness_maps_match_with_env(
+                    fresh.harness_servers(kind),
+                    &new_outcome.canonical,
+                    Some(&env_ctx),
+                ) || fresh.harness_has_raw_spaced_keys(kind)
                     || !paths.effective_harness_path(kind, &fresh.config).exists())
         });
 
@@ -1563,6 +1685,15 @@ impl App {
                 &display_name,
                 install_path.as_deref(),
             ),
+            ActiveMode::ProfilesModal { selected, items } => {
+                self.handle_profiles_modal_key(key, selected, items);
+            }
+            ActiveMode::MatrixModal { server_name, selected } => {
+                self.handle_matrix_modal_key(key, server_name, selected);
+            }
+            ActiveMode::NewProfileModal { input } => {
+                self.handle_new_profile_key(key, input);
+            }
             ActiveMode::Help => match (key.modifiers, key.code) {
                 (_, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter) => {
                     self.mode = ActiveMode::Normal;
@@ -1597,6 +1728,8 @@ impl App {
         let len = match self.section {
             WorkspaceSection::Mcps => self.visible_servers().len(),
             WorkspaceSection::Plugins => self.visible_plugin_rows().len(),
+            WorkspaceSection::Guidelines => self.guidelines_statuses.len(),
+            WorkspaceSection::Refs => self.loaded.refs.refs.len(),
         };
         match action {
             Action::Quit => self.should_quit = true,
@@ -1619,6 +1752,20 @@ impl App {
                     self.emit_fx(FxTrigger::SelectionChanged);
                 }
             }
+            Action::SelectGuidelinesSection => {
+                if self.section != WorkspaceSection::Guidelines {
+                    self.section = WorkspaceSection::Guidelines;
+                    self.details_scroll = 0;
+                    self.emit_fx(FxTrigger::SelectionChanged);
+                }
+            }
+            Action::SelectRefsSection => {
+                if self.section != WorkspaceSection::Refs {
+                    self.section = WorkspaceSection::Refs;
+                    self.details_scroll = 0;
+                    self.emit_fx(FxTrigger::SelectionChanged);
+                }
+            }
             Action::Down => {
                 if self.details_focused {
                     self.details_scroll = self.details_scroll.saturating_add(1);
@@ -1631,6 +1778,12 @@ impl App {
                         WorkspaceSection::Plugins => {
                             self.plugin_selected = (self.plugin_selected + 1) % len;
                             self.sync_plugin_scroll_offset();
+                        }
+                        WorkspaceSection::Guidelines => {
+                            self.guidelines_selected = (self.guidelines_selected + 1) % len;
+                        }
+                        WorkspaceSection::Refs => {
+                            self.refs_selected = (self.refs_selected + 1) % len;
                         }
                     }
                     self.details_scroll = 0;
@@ -1658,6 +1811,20 @@ impl App {
                             };
                             self.sync_plugin_scroll_offset();
                         }
+                        WorkspaceSection::Guidelines => {
+                            self.guidelines_selected = if self.guidelines_selected == 0 {
+                                len - 1
+                            } else {
+                                self.guidelines_selected - 1
+                            };
+                        }
+                        WorkspaceSection::Refs => {
+                            self.refs_selected = if self.refs_selected == 0 {
+                                len - 1
+                            } else {
+                                self.refs_selected - 1
+                            };
+                        }
                     }
                     self.details_scroll = 0;
                     self.emit_fx(FxTrigger::SelectionChanged);
@@ -1675,6 +1842,12 @@ impl App {
                         WorkspaceSection::Plugins => {
                             self.plugin_selected = (self.plugin_selected + 10).min(len - 1);
                             self.sync_plugin_scroll_offset();
+                        }
+                        WorkspaceSection::Guidelines => {
+                            self.guidelines_selected = (self.guidelines_selected + 10).min(len - 1);
+                        }
+                        WorkspaceSection::Refs => {
+                            self.refs_selected = (self.refs_selected + 10).min(len - 1);
                         }
                     }
                     self.details_scroll = 0;
@@ -1694,6 +1867,12 @@ impl App {
                             self.plugin_selected = self.plugin_selected.saturating_sub(10);
                             self.sync_plugin_scroll_offset();
                         }
+                        WorkspaceSection::Guidelines => {
+                            self.guidelines_selected = self.guidelines_selected.saturating_sub(10);
+                        }
+                        WorkspaceSection::Refs => {
+                            self.refs_selected = self.refs_selected.saturating_sub(10);
+                        }
                     }
                     self.details_scroll = 0;
                     self.emit_fx(FxTrigger::SelectionChanged);
@@ -1712,6 +1891,12 @@ impl App {
                             self.plugin_selected = 0;
                             self.sync_plugin_scroll_offset();
                         }
+                        WorkspaceSection::Guidelines => {
+                            self.guidelines_selected = 0;
+                        }
+                        WorkspaceSection::Refs => {
+                            self.refs_selected = 0;
+                        }
                     }
                     self.details_scroll = 0;
                     self.emit_fx(FxTrigger::SelectionChanged);
@@ -1729,6 +1914,12 @@ impl App {
                         WorkspaceSection::Plugins => {
                             self.plugin_selected = len - 1;
                             self.sync_plugin_scroll_offset();
+                        }
+                        WorkspaceSection::Guidelines => {
+                            self.guidelines_selected = len - 1;
+                        }
+                        WorkspaceSection::Refs => {
+                            self.refs_selected = len - 1;
                         }
                     }
                     self.details_scroll = 0;
@@ -1754,9 +1945,33 @@ impl App {
                 WorkspaceSection::Plugins => {
                     self.toggle_selected_plugin_or_group();
                 }
+                WorkspaceSection::Guidelines => {
+                    if let Ok(canonical) = crate::domain::guidelines::canonical_guidelines_path() {
+                        self.pending_editor = Some(EditorRequest {
+                            original_name: None,
+                            conflict_index: None,
+                            initial_toml: String::new(),
+                            direct_file_path: Some(canonical),
+                        });
+                    }
+                }
+                WorkspaceSection::Refs => {
+                    self.clone_or_update_selected_ref(false);
+                }
             },
             Action::ConfirmOrFold => {
-                if self.section == WorkspaceSection::Plugins
+                if self.section == WorkspaceSection::Guidelines {
+                    if let Ok(canonical) = crate::domain::guidelines::canonical_guidelines_path() {
+                        self.pending_editor = Some(EditorRequest {
+                            original_name: None,
+                            conflict_index: None,
+                            initial_toml: String::new(),
+                            direct_file_path: Some(canonical),
+                        });
+                    }
+                } else if self.section == WorkspaceSection::Refs {
+                    self.clone_or_update_selected_ref(false);
+                } else if self.section == WorkspaceSection::Plugins
                     && let Some(PluginRow::HarnessHeader { harness, .. }) =
                         self.selected_plugin_row()
                 {
@@ -1810,9 +2025,37 @@ impl App {
                 self.mode = ActiveMode::Filtering;
                 self.trigger_mascot_reaction(MascotReaction::Scrying, Duration::from_millis(800));
             }
+            Action::UpdateSelectedRef if self.section == WorkspaceSection::Refs => {
+                self.clone_or_update_selected_ref(true);
+            }
+            Action::UpdateSelectedRef => {}
+            Action::EditForm | Action::OpenEditor
+                if self.section == WorkspaceSection::Refs =>
+            {
+                if let Some(ref paths) = self.paths {
+                    self.pending_editor = Some(EditorRequest {
+                        original_name: None,
+                        conflict_index: None,
+                        initial_toml: String::new(),
+                        direct_file_path: Some(paths.refs_toml.clone()),
+                    });
+                }
+            }
             Action::AddForm if self.section == WorkspaceSection::Mcps => {
                 self.mode = ActiveMode::Form(FormState::new_add());
                 self.emit_fx(FxTrigger::ModalOpened);
+            }
+            Action::EditForm | Action::OpenEditor
+                if self.section == WorkspaceSection::Guidelines =>
+            {
+                if let Ok(canonical) = crate::domain::guidelines::canonical_guidelines_path() {
+                    self.pending_editor = Some(EditorRequest {
+                        original_name: None,
+                        conflict_index: None,
+                        initial_toml: String::new(),
+                        direct_file_path: Some(canonical),
+                    });
+                }
             }
             Action::EditForm if self.section == WorkspaceSection::Mcps => {
                 if let Some((name, cfg, _)) = self.selected_server() {
@@ -1932,7 +2175,9 @@ impl App {
                 }
             }
             Action::OpenConflicts => {
-                if !self.outcome.conflicts.is_empty() {
+                if self.section == WorkspaceSection::Refs {
+                    self.clone_or_update_selected_ref(false);
+                } else if !self.outcome.conflicts.is_empty() {
                     self.mode = ActiveMode::ConflictModal { index: 0 };
                     self.trigger_mascot_reaction(
                         MascotReaction::Startled,
@@ -1952,6 +2197,25 @@ impl App {
                 self.mode = ActiveMode::Options(OptionsState::from_config(&self.loaded.config));
                 self.emit_fx(FxTrigger::ModalOpened);
             }
+            Action::OpenProfiles => {
+                let mut items = vec!["Default (All Servers)".to_string()];
+                items.extend(self.loaded.profiles.profiles.keys().cloned());
+                let current_active = self.loaded.config.active_profile.as_deref().unwrap_or("");
+                let selected = items.iter().position(|i| i == current_active).unwrap_or(0);
+                self.mode = ActiveMode::ProfilesModal { selected, items };
+                self.emit_fx(FxTrigger::ModalOpened);
+            }
+            Action::OpenMatrix => {
+                if let Some((name, _, _)) = self.selected_server() {
+                    self.mode = ActiveMode::MatrixModal {
+                        server_name: name,
+                        selected: 0,
+                    };
+                    self.emit_fx(FxTrigger::ModalOpened);
+                } else {
+                    self.status_message = Some(("Select an MCP server to edit matrix overrides".to_string(), true));
+                }
+            }
             Action::ToggleHeroMascot => {
                 if self.loaded.config.ui.hero_mascot {
                     self.show_hero_mascot = !self.show_hero_mascot;
@@ -1969,6 +2233,8 @@ impl App {
                         let inspector = match self.section {
                             WorkspaceSection::Mcps => "Server Inspector",
                             WorkspaceSection::Plugins => "Plugin Inspector",
+                            WorkspaceSection::Guidelines => "Guidelines Inspector",
+                            WorkspaceSection::Refs => "Reference Inspector",
                         };
                         self.status_message = Some((format!("✓ Returned to {inspector}"), false));
                     }
@@ -2012,10 +2278,71 @@ impl App {
                 self.emit_fx(FxTrigger::Synced);
             }
             Action::SyncNow => {
-                let targets = self.enabled_harnesses_label();
-                self.sync_to_disk(format!("Synchronized canonical registry to {targets}"));
-                self.trigger_mascot_reaction(MascotReaction::Casting, Duration::from_millis(750));
-                self.emit_fx(FxTrigger::Synced);
+                if self.section == WorkspaceSection::Guidelines || self.section == WorkspaceSection::Refs {
+                    let mut warning_suffix = String::new();
+                    if !self.loaded.refs.refs.is_empty() {
+                        let cache_dir = self
+                            .paths
+                            .as_ref()
+                            .map(|p| p.refs_cache_dir.clone())
+                            .unwrap_or_else(|| std::path::PathBuf::from("refs"));
+                        let formatted_index = crate::domain::refs::format_reference_index(
+                            &self.loaded.refs,
+                            &cache_dir,
+                        );
+                        if let Ok(metrics) =
+                            crate::domain::guidelines::update_canonical_refs(&formatted_index)
+                        {
+                            if metrics.exceeds_recommended_budget {
+                                warning_suffix = format!(
+                                    " (⚠ Sizing warning: {} lines, {} chars)",
+                                    metrics.line_count, metrics.char_count
+                                );
+                            }
+                        }
+                    } else if let Ok(Some(metrics)) =
+                        crate::domain::guidelines::canonical_guidelines_metrics()
+                    {
+                        if metrics.exceeds_recommended_budget {
+                            warning_suffix = format!(
+                                " (⚠ Sizing warning: {} lines, {} chars)",
+                                metrics.line_count, metrics.char_count
+                            );
+                        }
+                    }
+
+                    match crate::domain::guidelines::sync_guidelines() {
+                        Ok(results) => {
+                            let count = results.iter().filter(|r| r.success).count();
+                            self.guidelines_statuses =
+                                crate::domain::guidelines::check_guidelines_status().unwrap_or_default();
+                            self.status_message = Some((
+                                format!(
+                                    "✓ Synchronized guidelines across {count}/{} harnesses{warning_suffix}",
+                                    results.len()
+                                ),
+                                false,
+                            ));
+                        }
+                        Err(e) => {
+                            self.status_message =
+                                Some((format!("✗ Guidelines sync failed: {e}"), true));
+                        }
+                    }
+                    self.trigger_mascot_reaction(
+                        MascotReaction::Casting,
+                        Duration::from_millis(750),
+                    );
+                    self.emit_fx(FxTrigger::Synced);
+                } else {
+                    let targets = self.enabled_harnesses_label();
+                    self.sync_to_disk(format!("Synchronized canonical registry to {targets}"));
+                    self.trigger_mascot_reaction(
+                        MascotReaction::Casting,
+                        Duration::from_millis(750),
+                    );
+                    self.emit_fx(FxTrigger::Synced);
+                }
             }
             Action::ProbeSelected => {
                 self.probe_selected();
@@ -2029,6 +2356,8 @@ impl App {
                 let list_label = match self.section {
                     WorkspaceSection::Mcps => "SERVERS",
                     WorkspaceSection::Plugins => "PLUGINS",
+                    WorkspaceSection::Guidelines => "GUIDELINES",
+                    WorkspaceSection::Refs => "REFERENCES",
                 };
                 if self.details_focused {
                     self.status_message = Some((
@@ -2061,6 +2390,8 @@ impl App {
                 let list_label = match self.section {
                     WorkspaceSection::Mcps => "SERVERS",
                     WorkspaceSection::Plugins => "PLUGINS",
+                    WorkspaceSection::Guidelines => "GUIDELINES",
+                    WorkspaceSection::Refs => "REFERENCES",
                 };
                 self.status_message =
                     Some((format!("✓ Returned focus to {list_label} list"), false));
@@ -2098,6 +2429,7 @@ impl App {
                         self.plugin_filter_query.clear();
                         self.clamp_plugin_selection();
                     }
+                    WorkspaceSection::Guidelines | WorkspaceSection::Refs => {}
                 }
                 self.mode = ActiveMode::Normal;
             }
@@ -2124,6 +2456,7 @@ impl App {
                     self.plugin_selected = 0;
                     self.plugin_scroll_offset = 0;
                 }
+                WorkspaceSection::Guidelines | WorkspaceSection::Refs => {}
             },
             KeyCode::Char(c) => match self.section {
                 WorkspaceSection::Mcps => {
@@ -2136,6 +2469,7 @@ impl App {
                     self.plugin_selected = 0;
                     self.plugin_scroll_offset = 0;
                 }
+                WorkspaceSection::Guidelines | WorkspaceSection::Refs => {}
             },
             _ => {}
         }
@@ -2299,6 +2633,197 @@ impl App {
         }
     }
 
+    fn handle_profiles_modal_key(&mut self, key: KeyEvent, mut selected: usize, items: Vec<String>) {
+        match (key.modifiers, key.code) {
+            (_, KeyCode::Esc | KeyCode::Char('q')) => {
+                self.mode = ActiveMode::Normal;
+            }
+            (_, KeyCode::Char('a')) => {
+                self.mode = ActiveMode::NewProfileModal { input: String::new() };
+            }
+            (_, KeyCode::Char('e') | KeyCode::Char('E')) => {
+                if let Some(ref paths) = self.paths {
+                    if !paths.profiles_toml.exists() {
+                        let _ = self.loaded.save_profiles(paths);
+                    }
+                    self.pending_editor = Some(EditorRequest {
+                        original_name: None,
+                        conflict_index: None,
+                        initial_toml: String::new(),
+                        direct_file_path: Some(paths.profiles_toml.clone()),
+                    });
+                    self.mode = ActiveMode::Normal;
+                }
+            }
+            (_, KeyCode::Char('d')) => {
+                if let Some(choice) = items.get(selected) {
+                    if !choice.starts_with("Default") {
+                        let to_remove = choice.clone();
+                        self.loaded.profiles.profiles.remove(&to_remove);
+                        if self.loaded.config.active_profile.as_deref() == Some(&to_remove) {
+                            self.loaded.config.active_profile = None;
+                        }
+                        if let Some(ref paths) = self.paths {
+                            let _ = self.loaded.save_profiles(paths);
+                            let _ = self.loaded.save_config(paths);
+                        }
+                        self.status_message = Some((format!("✓ Deleted profile '{to_remove}'"), false));
+                        let mut new_items = vec!["Default (All Servers)".to_string()];
+                        new_items.extend(self.loaded.profiles.profiles.keys().cloned());
+                        self.mode = ActiveMode::ProfilesModal {
+                            selected: selected.min(new_items.len().saturating_sub(1)),
+                            items: new_items,
+                        };
+                    }
+                }
+            }
+            (_, KeyCode::Down | KeyCode::Char('j')) => {
+                if !items.is_empty() {
+                    selected = (selected + 1) % items.len();
+                    self.mode = ActiveMode::ProfilesModal { selected, items };
+                }
+            }
+            (_, KeyCode::Up | KeyCode::Char('k')) => {
+                if !items.is_empty() {
+                    selected = if selected == 0 { items.len() - 1 } else { selected - 1 };
+                    self.mode = ActiveMode::ProfilesModal { selected, items };
+                }
+            }
+            (_, KeyCode::Enter | KeyCode::Char(' ')) => {
+                if let Some(choice) = items.get(selected) {
+                    if choice.starts_with("Default") {
+                        self.loaded.config.active_profile = None;
+                        self.sync_to_disk("Active profile: Default (All servers)".to_string());
+                    } else {
+                        self.loaded.config.active_profile = Some(choice.clone());
+                        self.sync_to_disk(format!("Active profile: {choice}"));
+                    }
+                    if let Some(ref paths) = self.paths {
+                        let _ = self.loaded.save_config(paths);
+                    }
+                }
+                self.mode = ActiveMode::Normal;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_new_profile_key(&mut self, key: KeyEvent, mut input: String) {
+        match (key.modifiers, key.code) {
+            (_, KeyCode::Esc) => {
+                let mut items = vec!["Default (All Servers)".to_string()];
+                items.extend(self.loaded.profiles.profiles.keys().cloned());
+                self.mode = ActiveMode::ProfilesModal { selected: 0, items };
+            }
+            (_, KeyCode::Enter) => {
+                let name = input.trim().to_string();
+                if name.is_empty() {
+                    let mut items = vec!["Default (All Servers)".to_string()];
+                    items.extend(self.loaded.profiles.profiles.keys().cloned());
+                    self.mode = ActiveMode::ProfilesModal { selected: 0, items };
+                    return;
+                }
+                let active_servers: Vec<String> = self
+                    .outcome
+                    .canonical
+                    .iter()
+                    .filter(|(_, s)| s.enabled)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                self.loaded.profiles.profiles.insert(
+                    name.clone(),
+                    crate::domain::model::ProfileDefinition {
+                        description: Some(format!("Custom profile {name}")),
+                        include: active_servers,
+                        exclude: Vec::new(),
+                    },
+                );
+                self.loaded.config.active_profile = Some(name.clone());
+                if let Some(ref paths) = self.paths {
+                    let _ = self.loaded.save_profiles(paths);
+                    let _ = self.loaded.save_config(paths);
+                    let canonical = self.outcome.canonical.clone();
+                    let _ = self.loaded.save_all(paths, &canonical);
+                }
+                self.status_message =
+                    Some((format!("✓ Created and activated profile '{name}'"), false));
+                self.mode = ActiveMode::Normal;
+            }
+            (_, KeyCode::Backspace) => {
+                input.pop();
+                self.mode = ActiveMode::NewProfileModal { input };
+            }
+            (_, KeyCode::Char(c)) => {
+                if !c.is_control() && c != ' ' {
+                    input.push(c);
+                    self.mode = ActiveMode::NewProfileModal { input };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_matrix_modal_key(&mut self, key: KeyEvent, server_name: String, mut selected: usize) {
+        let projects = self.loaded.claude.project_paths();
+        let total_rows = 1 + HarnessKind::ALL.len() + projects.len();
+        match (key.modifiers, key.code) {
+            (_, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter) => {
+                self.sync_to_disk(format!("Updated matrix overrides for '{server_name}'"));
+                self.mode = ActiveMode::Normal;
+            }
+            (_, KeyCode::Down | KeyCode::Char('j')) => {
+                selected = (selected + 1) % total_rows;
+                self.mode = ActiveMode::MatrixModal { server_name, selected };
+            }
+            (_, KeyCode::Up | KeyCode::Char('k')) => {
+                selected = if selected == 0 { total_rows - 1 } else { selected - 1 };
+                self.mode = ActiveMode::MatrixModal { server_name, selected };
+            }
+            (_, KeyCode::Char(' ')) => {
+                let harness_end = 1 + HarnessKind::ALL.len();
+                if selected == 0 {
+                    if let Some(server) = self.outcome.canonical.get_mut(&server_name) {
+                        server.project_policy = match server.project_policy {
+                            ProjectPolicy::Mirror => ProjectPolicy::Preserve,
+                            ProjectPolicy::Preserve => ProjectPolicy::Mirror,
+                        };
+                    }
+                } else if selected < harness_end {
+                    let harness = HarnessKind::ALL[selected - 1];
+                    if let Some(server) = self.outcome.canonical.get_mut(&server_name) {
+                        match server.harnesses.get(&harness) {
+                            None => {
+                                server.harnesses.insert(harness, true);
+                            }
+                            Some(true) => {
+                                server.harnesses.insert(harness, false);
+                            }
+                            Some(false) => {
+                                server.harnesses.remove(&harness);
+                            }
+                        }
+                    }
+                } else {
+                    let proj_idx = selected - harness_end;
+                    if let Some(proj_path) = projects.get(proj_idx).cloned() {
+                        if let Some(server) = self.outcome.canonical.get_mut(&server_name) {
+                            server.project_policy = ProjectPolicy::Preserve;
+                        }
+                        self.loaded.claude.toggle_project_server(&proj_path, &server_name);
+                        if let Some(ref paths) = self.paths {
+                            let p = paths.effective_claude_path(&self.loaded.config);
+                            if let Ok(content) = self.loaded.claude.to_json_string(&self.outcome.canonical) {
+                                let _ = crate::domain::storage::write_atomic_with_backup(&p, &content);
+                            }
+                        }
+                    }
+                }
+                self.mode = ActiveMode::MatrixModal { server_name, selected };
+            }
+            _ => {}
+        }
+    }
+
     fn handle_delete_plugin_confirm_key(
         &mut self,
         key: KeyEvent,
@@ -2431,8 +2956,13 @@ impl App {
                     self.emit_fx(FxTrigger::Synced);
                 }
                 if tools_changed {
+                    let env_ctx = self.current_env_context();
                     let harnesses = self.loaded.enabled_harness_servers();
-                    self.outcome = reconcile_harnesses(&self.outcome.canonical, &harnesses);
+                    self.outcome = reconcile_harnesses_with_env(
+                        &self.outcome.canonical,
+                        &harnesses,
+                        Some(&env_ctx),
+                    );
                     if let Some(ref paths) = self.paths {
                         self.loaded.harness_plugins = discover_all_harness_plugins(
                             paths,
@@ -3151,12 +3681,16 @@ mod tests {
         assert_eq!(app.total_plugins_counts(), (2, 2));
         assert!(paths.plugins_toml.exists());
 
-        // Switch to Plugins section with '2' (and verify Tab / '1' also switch)
+        // Switch to Plugins section with '2' (and verify Tab cycles Mcps -> Plugins -> Guidelines -> Refs -> Mcps)
         app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
         assert_eq!(app.section, WorkspaceSection::Plugins);
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.section, WorkspaceSection::Mcps);
+        assert_eq!(app.section, WorkspaceSection::Guidelines);
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.section, WorkspaceSection::Refs);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.section, WorkspaceSection::Mcps);
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
         assert_eq!(app.section, WorkspaceSection::Plugins);
 
         // Visible rows: 5 harness headers + 2 plugins = 7 rows
@@ -3312,5 +3846,143 @@ mod tests {
         assert_eq!(app.mode, ActiveMode::Normal);
         assert!(!ponytail_dir.exists());
         assert_eq!(app.total_plugins_counts(), (0, 0));
+    }
+
+    #[test]
+    fn app_reconciles_and_probes_using_scoped_dotenv_context() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = StoragePaths::in_dir(dir.path());
+        std::fs::write(
+            dir.path().join(".env.local"),
+            "PROBE_PORT=65531\nDB_PASS=ScopedPass99\n",
+        )
+        .expect("write .env.local");
+
+        let mut loaded = LoadedConfigs::default();
+        let templated =
+            McpServerConfig::new_http("http://127.0.0.1:${PROBE_PORT}/mcp?p=${DB_PASS}");
+        loaded.mcp.mcps.insert("templated".to_string(), templated);
+        loaded
+            .save_all(&paths, &loaded.mcp.mcps.clone())
+            .expect("save_all");
+
+        let reloaded = LoadedConfigs::load(&paths).expect("reload");
+        let mut app = App::new(Some(paths), reloaded, 120, 40);
+        assert_eq!(app.mode, ActiveMode::Normal);
+        assert!(app.outcome.conflicts.is_empty());
+
+        app.probe_selected();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.has_active_probe() && std::time::Instant::now() < deadline {
+            app.poll_probe_results();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        match app.probe_state("templated") {
+            Some(ServerProbeState::Failed { error, .. }) => {
+                assert!(
+                    !error.contains("${PROBE_PORT}"),
+                    "probe URL should have been interpolated, got error: {error}"
+                );
+            }
+            other => panic!("expected connection failure to closed port, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn guidelines_tab_navigation_and_editor_trigger() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = StoragePaths {
+            config_toml: dir.path().join("config.toml"),
+            mcp_toml: dir.path().join("mcp.toml"),
+            plugins_toml: dir.path().join("plugins.toml"),
+            profiles_toml: dir.path().join("profiles.toml"),
+            refs_toml: dir.path().join("refs.toml"),
+            refs_cache_dir: dir.path().join("refs"),
+            agy_json: dir.path().join("mcp_config.json"),
+            claude_json: dir.path().join(".claude.json"),
+            copilot_json: dir.path().join("copilot-config.json"),
+            grok_toml: dir.path().join("grok.toml"),
+            opencode_json: dir.path().join("opencode.json"),
+            agy_overridden: true,
+            claude_overridden: true,
+            copilot_overridden: true,
+            grok_overridden: true,
+            opencode_overridden: true,
+            isolated: true,
+        };
+
+        let loaded = LoadedConfigs::load(&paths).expect("load");
+        let mut app = App::new(Some(paths), loaded, 100, 30);
+        assert_eq!(app.section, WorkspaceSection::Mcps);
+
+        // Switch to Guidelines view with '3'
+        app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        assert_eq!(app.section, WorkspaceSection::Guidelines);
+
+        // Navigation in guidelines view
+        let total = app.guidelines_statuses.len();
+        if total > 0 {
+            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+            assert_eq!(app.guidelines_selected, 1 % total);
+            app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+            assert_eq!(app.guidelines_selected, 0);
+        }
+
+        // Press 'e' to open editor
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert!(app.pending_editor.is_some());
+        let req = app.pending_editor.take().unwrap();
+        assert!(req.direct_file_path.is_some());
+    }
+
+    #[test]
+    fn refs_tab_navigation_and_actions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = StoragePaths::in_dir(dir.path());
+        let mut loaded = LoadedConfigs::load(&paths).expect("load");
+
+        loaded.refs.refs.insert(
+            "pangolin".to_string(),
+            crate::domain::refs::RefRepoEntry {
+                url: "https://github.com/fosrl/docs".to_string(),
+                branch: Some("main".to_string()),
+                description: Some("Pangolin documentation".to_string()),
+                path: None,
+            },
+        );
+        loaded.refs.refs.insert(
+            "react".to_string(),
+            crate::domain::refs::RefRepoEntry {
+                url: "https://github.com/reactjs/react.dev".to_string(),
+                branch: None,
+                description: Some("React documentation".to_string()),
+                path: None,
+            },
+        );
+
+        let mut app = App::new(Some(paths.clone()), loaded, 100, 30);
+        assert_eq!(app.section, WorkspaceSection::Mcps);
+
+        // Switch to Refs view with '4'
+        app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+        assert_eq!(app.section, WorkspaceSection::Refs);
+
+        // Navigation in refs view
+        assert_eq!(app.refs_selected, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.refs_selected, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.refs_selected, 0);
+
+        // Press 'e' to open refs.toml in editor
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert!(app.pending_editor.is_some());
+        let req = app.pending_editor.take().unwrap();
+        assert_eq!(req.direct_file_path, Some(paths.refs_toml));
+
+        // Tab cycling: Refs -> Mcps
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.section, WorkspaceSection::Mcps);
     }
 }

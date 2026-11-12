@@ -132,7 +132,7 @@ fn parse_grok_server(obj: &Table) -> Option<McpServerConfig> {
     let env = extract_toml_string_map(obj.get("env"));
     let headers = extract_toml_string_map(obj.get("headers"));
 
-    Some(McpServerConfig {
+    let mut server = McpServerConfig {
         enabled,
         description: None,
         transport,
@@ -141,7 +141,11 @@ fn parse_grok_server(obj: &Table) -> Option<McpServerConfig> {
         env,
         url,
         headers,
-    })
+        harnesses: std::collections::BTreeMap::new(),
+        project_policy: crate::domain::model::ProjectPolicy::Mirror,
+    };
+    server.unwrap_windows_shim();
+    Some(server)
 }
 
 fn serialize_grok_server(server: &McpServerConfig, existing: Option<&Table>) -> Value {

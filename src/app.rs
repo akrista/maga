@@ -675,12 +675,12 @@ impl App {
         let available_update = Arc::new(Mutex::new(None));
         let update_clone = Arc::clone(&available_update);
         std::thread::spawn(move || {
-            if let Ok(info) = crate::domain::update::check_latest_release(crate::domain::update::DEFAULT_REPO) {
-                if info.is_newer {
-                    if let Ok(mut lock) = update_clone.lock() {
-                        *lock = Some(info.latest_version);
-                    }
-                }
+            if let Ok(info) =
+                crate::domain::update::check_latest_release(crate::domain::update::DEFAULT_REPO)
+                && info.is_newer
+                && let Ok(mut lock) = update_clone.lock()
+            {
+                *lock = Some(info.latest_version);
             }
         });
 
@@ -699,7 +699,8 @@ impl App {
             plugin_scroll_offset: 0,
             plugin_filter_query: String::new(),
             collapsed_plugin_groups: BTreeSet::new(),
-            guidelines_statuses: crate::domain::guidelines::check_guidelines_status().unwrap_or_default(),
+            guidelines_statuses: crate::domain::guidelines::check_guidelines_status()
+                .unwrap_or_default(),
             guidelines_selected: 0,
             refs_selected: 0,
             mode: initial_mode,
@@ -863,16 +864,12 @@ impl App {
                             self.plugin_selected,
                             self.plugin_scroll_offset,
                         ),
-                        WorkspaceSection::Guidelines => (
-                            self.guidelines_statuses.len(),
-                            self.guidelines_selected,
-                            0,
-                        ),
-                        WorkspaceSection::Refs => (
-                            self.loaded.refs.refs.len(),
-                            self.refs_selected,
-                            0,
-                        ),
+                        WorkspaceSection::Guidelines => {
+                            (self.guidelines_statuses.len(), self.guidelines_selected, 0)
+                        }
+                        WorkspaceSection::Refs => {
+                            (self.loaded.refs.refs.len(), self.refs_selected, 0)
+                        }
                     };
                     if visible_len == 0 {
                         self.gaze_target = (-0.30, 0.0);
@@ -1467,25 +1464,17 @@ impl App {
         match crate::domain::refs::clone_or_update_ref(&alias, &entry, &target_path) {
             Ok(msg) => {
                 self.status_message = Some((format!("✓ {msg}"), false));
-                self.trigger_mascot_reaction(
-                    MascotReaction::Casting,
-                    Duration::from_millis(750),
-                );
+                self.trigger_mascot_reaction(MascotReaction::Casting, Duration::from_millis(750));
                 self.emit_fx(FxTrigger::Synced);
 
                 // Auto update guidelines lookup index
-                let formatted = crate::domain::refs::format_reference_index(
-                    &self.loaded.refs,
-                    &cache_dir,
-                );
+                let formatted =
+                    crate::domain::refs::format_reference_index(&self.loaded.refs, &cache_dir);
                 let _ = crate::domain::guidelines::update_canonical_refs(&formatted);
             }
             Err(e) => {
                 self.status_message = Some((format!("✗ Ref operation failed: {e}"), true));
-                self.trigger_mascot_reaction(
-                    MascotReaction::Startled,
-                    Duration::from_millis(800),
-                );
+                self.trigger_mascot_reaction(MascotReaction::Startled, Duration::from_millis(800));
             }
         }
     }
@@ -1688,7 +1677,10 @@ impl App {
             ActiveMode::ProfilesModal { selected, items } => {
                 self.handle_profiles_modal_key(key, selected, items);
             }
-            ActiveMode::MatrixModal { server_name, selected } => {
+            ActiveMode::MatrixModal {
+                server_name,
+                selected,
+            } => {
                 self.handle_matrix_modal_key(key, server_name, selected);
             }
             ActiveMode::NewProfileModal { input } => {
@@ -2029,9 +2021,7 @@ impl App {
                 self.clone_or_update_selected_ref(true);
             }
             Action::UpdateSelectedRef => {}
-            Action::EditForm | Action::OpenEditor
-                if self.section == WorkspaceSection::Refs =>
-            {
+            Action::EditForm | Action::OpenEditor if self.section == WorkspaceSection::Refs => {
                 if let Some(ref paths) = self.paths {
                     self.pending_editor = Some(EditorRequest {
                         original_name: None,
@@ -2213,7 +2203,10 @@ impl App {
                     };
                     self.emit_fx(FxTrigger::ModalOpened);
                 } else {
-                    self.status_message = Some(("Select an MCP server to edit matrix overrides".to_string(), true));
+                    self.status_message = Some((
+                        "Select an MCP server to edit matrix overrides".to_string(),
+                        true,
+                    ));
                 }
             }
             Action::ToggleHeroMascot => {
@@ -2278,7 +2271,9 @@ impl App {
                 self.emit_fx(FxTrigger::Synced);
             }
             Action::SyncNow => {
-                if self.section == WorkspaceSection::Guidelines || self.section == WorkspaceSection::Refs {
+                if self.section == WorkspaceSection::Guidelines
+                    || self.section == WorkspaceSection::Refs
+                {
                     let mut warning_suffix = String::new();
                     if !self.loaded.refs.refs.is_empty() {
                         let cache_dir = self
@@ -2292,30 +2287,29 @@ impl App {
                         );
                         if let Ok(metrics) =
                             crate::domain::guidelines::update_canonical_refs(&formatted_index)
+                            && metrics.exceeds_recommended_budget
                         {
-                            if metrics.exceeds_recommended_budget {
-                                warning_suffix = format!(
-                                    " (⚠ Sizing warning: {} lines, {} chars)",
-                                    metrics.line_count, metrics.char_count
-                                );
-                            }
-                        }
-                    } else if let Ok(Some(metrics)) =
-                        crate::domain::guidelines::canonical_guidelines_metrics()
-                    {
-                        if metrics.exceeds_recommended_budget {
                             warning_suffix = format!(
                                 " (⚠ Sizing warning: {} lines, {} chars)",
                                 metrics.line_count, metrics.char_count
                             );
                         }
+                    } else if let Ok(Some(metrics)) =
+                        crate::domain::guidelines::canonical_guidelines_metrics()
+                        && metrics.exceeds_recommended_budget
+                    {
+                        warning_suffix = format!(
+                            " (⚠ Sizing warning: {} lines, {} chars)",
+                            metrics.line_count, metrics.char_count
+                        );
                     }
 
                     match crate::domain::guidelines::sync_guidelines() {
                         Ok(results) => {
                             let count = results.iter().filter(|r| r.success).count();
                             self.guidelines_statuses =
-                                crate::domain::guidelines::check_guidelines_status().unwrap_or_default();
+                                crate::domain::guidelines::check_guidelines_status()
+                                    .unwrap_or_default();
                             self.status_message = Some((
                                 format!(
                                     "✓ Synchronized guidelines across {count}/{} harnesses{warning_suffix}",
@@ -2633,13 +2627,20 @@ impl App {
         }
     }
 
-    fn handle_profiles_modal_key(&mut self, key: KeyEvent, mut selected: usize, items: Vec<String>) {
+    fn handle_profiles_modal_key(
+        &mut self,
+        key: KeyEvent,
+        mut selected: usize,
+        items: Vec<String>,
+    ) {
         match (key.modifiers, key.code) {
             (_, KeyCode::Esc | KeyCode::Char('q')) => {
                 self.mode = ActiveMode::Normal;
             }
             (_, KeyCode::Char('a')) => {
-                self.mode = ActiveMode::NewProfileModal { input: String::new() };
+                self.mode = ActiveMode::NewProfileModal {
+                    input: String::new(),
+                };
             }
             (_, KeyCode::Char('e') | KeyCode::Char('E')) => {
                 if let Some(ref paths) = self.paths {
@@ -2656,25 +2657,25 @@ impl App {
                 }
             }
             (_, KeyCode::Char('d')) => {
-                if let Some(choice) = items.get(selected) {
-                    if !choice.starts_with("Default") {
-                        let to_remove = choice.clone();
-                        self.loaded.profiles.profiles.remove(&to_remove);
-                        if self.loaded.config.active_profile.as_deref() == Some(&to_remove) {
-                            self.loaded.config.active_profile = None;
-                        }
-                        if let Some(ref paths) = self.paths {
-                            let _ = self.loaded.save_profiles(paths);
-                            let _ = self.loaded.save_config(paths);
-                        }
-                        self.status_message = Some((format!("✓ Deleted profile '{to_remove}'"), false));
-                        let mut new_items = vec!["Default (All Servers)".to_string()];
-                        new_items.extend(self.loaded.profiles.profiles.keys().cloned());
-                        self.mode = ActiveMode::ProfilesModal {
-                            selected: selected.min(new_items.len().saturating_sub(1)),
-                            items: new_items,
-                        };
+                if let Some(choice) = items.get(selected)
+                    && !choice.starts_with("Default")
+                {
+                    let to_remove = choice.clone();
+                    self.loaded.profiles.profiles.remove(&to_remove);
+                    if self.loaded.config.active_profile.as_deref() == Some(&to_remove) {
+                        self.loaded.config.active_profile = None;
                     }
+                    if let Some(ref paths) = self.paths {
+                        let _ = self.loaded.save_profiles(paths);
+                        let _ = self.loaded.save_config(paths);
+                    }
+                    self.status_message = Some((format!("✓ Deleted profile '{to_remove}'"), false));
+                    let mut new_items = vec!["Default (All Servers)".to_string()];
+                    new_items.extend(self.loaded.profiles.profiles.keys().cloned());
+                    self.mode = ActiveMode::ProfilesModal {
+                        selected: selected.min(new_items.len().saturating_sub(1)),
+                        items: new_items,
+                    };
                 }
             }
             (_, KeyCode::Down | KeyCode::Char('j')) => {
@@ -2685,7 +2686,11 @@ impl App {
             }
             (_, KeyCode::Up | KeyCode::Char('k')) => {
                 if !items.is_empty() {
-                    selected = if selected == 0 { items.len() - 1 } else { selected - 1 };
+                    selected = if selected == 0 {
+                        items.len() - 1
+                    } else {
+                        selected - 1
+                    };
                     self.mode = ActiveMode::ProfilesModal { selected, items };
                 }
             }
@@ -2753,11 +2758,9 @@ impl App {
                 input.pop();
                 self.mode = ActiveMode::NewProfileModal { input };
             }
-            (_, KeyCode::Char(c)) => {
-                if !c.is_control() && c != ' ' {
-                    input.push(c);
-                    self.mode = ActiveMode::NewProfileModal { input };
-                }
+            (_, KeyCode::Char(c)) if !c.is_control() && c != ' ' => {
+                input.push(c);
+                self.mode = ActiveMode::NewProfileModal { input };
             }
             _ => {}
         }
@@ -2773,11 +2776,21 @@ impl App {
             }
             (_, KeyCode::Down | KeyCode::Char('j')) => {
                 selected = (selected + 1) % total_rows;
-                self.mode = ActiveMode::MatrixModal { server_name, selected };
+                self.mode = ActiveMode::MatrixModal {
+                    server_name,
+                    selected,
+                };
             }
             (_, KeyCode::Up | KeyCode::Char('k')) => {
-                selected = if selected == 0 { total_rows - 1 } else { selected - 1 };
-                self.mode = ActiveMode::MatrixModal { server_name, selected };
+                selected = if selected == 0 {
+                    total_rows - 1
+                } else {
+                    selected - 1
+                };
+                self.mode = ActiveMode::MatrixModal {
+                    server_name,
+                    selected,
+                };
             }
             (_, KeyCode::Char(' ')) => {
                 let harness_end = 1 + HarnessKind::ALL.len();
@@ -2809,16 +2822,24 @@ impl App {
                         if let Some(server) = self.outcome.canonical.get_mut(&server_name) {
                             server.project_policy = ProjectPolicy::Preserve;
                         }
-                        self.loaded.claude.toggle_project_server(&proj_path, &server_name);
+                        self.loaded
+                            .claude
+                            .toggle_project_server(&proj_path, &server_name);
                         if let Some(ref paths) = self.paths {
                             let p = paths.effective_claude_path(&self.loaded.config);
-                            if let Ok(content) = self.loaded.claude.to_json_string(&self.outcome.canonical) {
-                                let _ = crate::domain::storage::write_atomic_with_backup(&p, &content);
+                            if let Ok(content) =
+                                self.loaded.claude.to_json_string(&self.outcome.canonical)
+                            {
+                                let _ =
+                                    crate::domain::storage::write_atomic_with_backup(&p, &content);
                             }
                         }
                     }
                 }
-                self.mode = ActiveMode::MatrixModal { server_name, selected };
+                self.mode = ActiveMode::MatrixModal {
+                    server_name,
+                    selected,
+                };
             }
             _ => {}
         }

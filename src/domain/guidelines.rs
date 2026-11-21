@@ -186,8 +186,8 @@ impl GuidelineMetrics {
     pub fn compute(content: &str) -> Self {
         let line_count = content.lines().count();
         let char_count = content.chars().count();
-        let exceeds_recommended_budget = line_count > DEFAULT_MAX_GUIDELINE_LINES
-            || char_count > DEFAULT_MAX_GUIDELINE_CHARS;
+        let exceeds_recommended_budget =
+            line_count > DEFAULT_MAX_GUIDELINE_LINES || char_count > DEFAULT_MAX_GUIDELINE_CHARS;
 
         Self {
             line_count,
@@ -201,34 +201,34 @@ impl GuidelineMetrics {
 pub fn inject_or_replace_refs_block(existing_content: &str, refs_content: &str) -> String {
     let trimmed_refs = refs_content.trim();
     if trimmed_refs.is_empty() {
-        if let Some(start_idx) = existing_content.find(REFS_BLOCK_START) {
-            if let Some(end_rel) = existing_content[start_idx..].find(REFS_BLOCK_END) {
-                let end_idx = start_idx + end_rel + REFS_BLOCK_END.len();
-                let mut res = String::new();
-                res.push_str(&existing_content[..start_idx].trim_end());
-                let tail = existing_content[end_idx..].trim_start();
-                if !tail.is_empty() {
-                    res.push_str("\n\n");
-                    res.push_str(tail);
-                }
-                res.push('\n');
-                return res;
+        if let Some(start_idx) = existing_content.find(REFS_BLOCK_START)
+            && let Some(end_rel) = existing_content[start_idx..].find(REFS_BLOCK_END)
+        {
+            let end_idx = start_idx + end_rel + REFS_BLOCK_END.len();
+            let mut res = String::new();
+            res.push_str(existing_content[..start_idx].trim_end());
+            let tail = existing_content[end_idx..].trim_start();
+            if !tail.is_empty() {
+                res.push_str("\n\n");
+                res.push_str(tail);
             }
+            res.push('\n');
+            return res;
         }
         return existing_content.to_string();
     }
 
     let block = format!("{REFS_BLOCK_START}\n{trimmed_refs}\n{REFS_BLOCK_END}");
 
-    if let Some(start_idx) = existing_content.find(REFS_BLOCK_START) {
-        if let Some(end_rel) = existing_content[start_idx..].find(REFS_BLOCK_END) {
-            let end_idx = start_idx + end_rel + REFS_BLOCK_END.len();
-            let mut result = String::new();
-            result.push_str(&existing_content[..start_idx]);
-            result.push_str(&block);
-            result.push_str(&existing_content[end_idx..]);
-            return result;
-        }
+    if let Some(start_idx) = existing_content.find(REFS_BLOCK_START)
+        && let Some(end_rel) = existing_content[start_idx..].find(REFS_BLOCK_END)
+    {
+        let end_idx = start_idx + end_rel + REFS_BLOCK_END.len();
+        let mut result = String::new();
+        result.push_str(&existing_content[..start_idx]);
+        result.push_str(&block);
+        result.push_str(&existing_content[end_idx..]);
+        return result;
     }
 
     let mut result = existing_content.trim_end().to_string();
@@ -316,7 +316,9 @@ mod tests {
     #[test]
     fn test_canonical_path_ends_with_agents_md() {
         let canonical = canonical_guidelines_path().expect("canonical resolved");
-        assert!(canonical.ends_with(".agents/AGENTS.md") || canonical.ends_with(".agents\\AGENTS.md"));
+        assert!(
+            canonical.ends_with(".agents/AGENTS.md") || canonical.ends_with(".agents\\AGENTS.md")
+        );
     }
 
     #[test]

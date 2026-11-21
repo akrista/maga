@@ -136,23 +136,27 @@ pub fn draw(f: &mut Frame, app: &App, base_theme: &Theme) {
         }
         ActiveMode::ProfilesModal { selected, items } => {
             let modal_h = (items.len() + 8).clamp(10, 22) as u16;
-            fx_areas
-                .active_modal
-                .set(centered_rect(58, modal_h, area));
+            fx_areas.active_modal.set(centered_rect(58, modal_h, area));
             draw_profiles_modal(f, area, app, *selected, items, theme);
         }
         ActiveMode::NewProfileModal { input } => {
-            fx_areas
-                .active_modal
-                .set(centered_rect(52, 8, area));
+            fx_areas.active_modal.set(centered_rect(52, 8, area));
             draw_new_profile_modal(f, area, input, theme);
         }
-        ActiveMode::MatrixModal { server_name, selected } => {
+        ActiveMode::MatrixModal {
+            server_name,
+            selected,
+        } => {
             let project_count = app.loaded.claude.project_paths().len();
-            let modal_h = (9 + HarnessKind::ALL.len() + if project_count > 0 { 1 + project_count } else { 0 }).clamp(14, 26) as u16;
-            fx_areas
-                .active_modal
-                .set(centered_rect(68, modal_h, area));
+            let modal_h = (9
+                + HarnessKind::ALL.len()
+                + if project_count > 0 {
+                    1 + project_count
+                } else {
+                    0
+                })
+            .clamp(14, 26) as u16;
+            fx_areas.active_modal.set(centered_rect(68, modal_h, area));
             draw_matrix_modal(f, area, app, server_name, *selected, theme);
         }
         ActiveMode::Help => {
@@ -224,41 +228,47 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         })
         .count();
 
-    let (mcp_tab_style, plugin_tab_style, guidelines_tab_style, refs_tab_style, section_active, section_total) =
-        match app.section {
-            WorkspaceSection::Mcps => (
-                theme.highlight,
-                theme.muted,
-                theme.muted,
-                theme.muted,
-                active,
-                total,
-            ),
-            WorkspaceSection::Plugins => (
-                theme.muted,
-                theme.highlight,
-                theme.muted,
-                theme.muted,
-                active_plugins,
-                total_plugins,
-            ),
-            WorkspaceSection::Guidelines => (
-                theme.muted,
-                theme.muted,
-                theme.highlight,
-                theme.muted,
-                active_guidelines,
-                total_guidelines,
-            ),
-            WorkspaceSection::Refs => (
-                theme.muted,
-                theme.muted,
-                theme.muted,
-                theme.highlight,
-                active_refs,
-                total_refs,
-            ),
-        };
+    let (
+        mcp_tab_style,
+        plugin_tab_style,
+        guidelines_tab_style,
+        refs_tab_style,
+        section_active,
+        section_total,
+    ) = match app.section {
+        WorkspaceSection::Mcps => (
+            theme.highlight,
+            theme.muted,
+            theme.muted,
+            theme.muted,
+            active,
+            total,
+        ),
+        WorkspaceSection::Plugins => (
+            theme.muted,
+            theme.highlight,
+            theme.muted,
+            theme.muted,
+            active_plugins,
+            total_plugins,
+        ),
+        WorkspaceSection::Guidelines => (
+            theme.muted,
+            theme.muted,
+            theme.highlight,
+            theme.muted,
+            active_guidelines,
+            total_guidelines,
+        ),
+        WorkspaceSection::Refs => (
+            theme.muted,
+            theme.muted,
+            theme.muted,
+            theme.highlight,
+            active_refs,
+            total_refs,
+        ),
+    };
 
     let tab3_span = if area.width >= 105 {
         Some(Span::styled(
@@ -268,7 +278,10 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     } else if area.width >= 88 {
         Some(Span::styled("[3: Rules]".to_string(), guidelines_tab_style))
     } else if app.section == WorkspaceSection::Guidelines {
-        Some(Span::styled("[3: Guidelines]".to_string(), guidelines_tab_style))
+        Some(Span::styled(
+            "[3: Guidelines]".to_string(),
+            guidelines_tab_style,
+        ))
     } else {
         None
     };
@@ -278,9 +291,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             format!("[4: Refs ({active_refs}/{total_refs})]"),
             refs_tab_style,
         ))
-    } else if area.width >= 98 {
-        Some(Span::styled("[4: Refs]".to_string(), refs_tab_style))
-    } else if app.section == WorkspaceSection::Refs {
+    } else if area.width >= 98 || app.section == WorkspaceSection::Refs {
         Some(Span::styled("[4: Refs]".to_string(), refs_tab_style))
     } else {
         None
@@ -303,7 +314,10 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     }
     line1_spans.push(Span::styled("  ", theme.base));
     line1_spans.push(Span::styled(sync_badge, sync_style));
-    line1_spans.push(Span::styled(format!("  [{section_active}/{section_total}]"), theme.muted));
+    line1_spans.push(Span::styled(
+        format!("  [{section_active}/{section_total}]"),
+        theme.muted,
+    ));
     if let Some(ref prof) = app.loaded.config.active_profile {
         line1_spans.push(Span::styled("  ", theme.base));
         line1_spans.push(Span::styled(format!("[Profile: {prof}]"), theme.accent));
@@ -350,7 +364,9 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             " ↑/↓/j/k: Select · Enter: Apply · a: New · e: $EDITOR · d: Delete · Esc: Cancel"
         }
         ActiveMode::NewProfileModal { .. } => " Enter: Create & switch profile · Esc: Cancel",
-        ActiveMode::MatrixModal { .. } => " ↑/↓/j/k: Navigate · Space: Toggle override · Enter/Esc: Close & Save",
+        ActiveMode::MatrixModal { .. } => {
+            " ↑/↓/j/k: Navigate · Space: Toggle override · Enter/Esc: Close & Save"
+        }
         ActiveMode::Help => " j/k/↑/↓/PgUp/PgDn/g/G: Scroll shortcuts · Esc/q/?: Close help",
         ActiveMode::Normal if app.details_focused => {
             " j/k/PgUp/PgDn/g/G: scroll DETAILS  p: re-probe  t/Esc: return to list  ?: help  q: quit"
@@ -545,26 +561,47 @@ fn draw_matrix_modal(
     theme: &Theme,
 ) {
     let projects = app.loaded.claude.project_paths();
-    let modal_h = (9 + HarnessKind::ALL.len() + if projects.is_empty() { 0 } else { 1 + projects.len() }).clamp(14, 26) as u16;
+    let modal_h = (9
+        + HarnessKind::ALL.len()
+        + if projects.is_empty() {
+            0
+        } else {
+            1 + projects.len()
+        })
+    .clamp(14, 26) as u16;
     let modal = centered_rect(68, modal_h, area);
     f.render_widget(Clear, modal);
 
     let block = Block::default()
-        .title(Span::styled(format!(" ✦ HARNESS MATRIX: {server_name} ✦ "), theme.header))
+        .title(Span::styled(
+            format!(" ✦ HARNESS MATRIX: {server_name} ✦ "),
+            theme.header,
+        ))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(theme.accent)
         .padding(Padding::new(PADDING_SM, PADDING_SM, PADDING_XS, PADDING_XS));
 
-    let server_cfg = app.outcome.canonical.get(server_name).cloned().unwrap_or_else(|| {
-        crate::domain::model::McpServerConfig::new_http("http://localhost")
-    });
+    let server_cfg = app
+        .outcome
+        .canonical
+        .get(server_name)
+        .cloned()
+        .unwrap_or_else(|| crate::domain::model::McpServerConfig::new_http("http://localhost"));
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
         Span::styled("Global Base: ", theme.muted),
         Span::styled(
-            if server_cfg.enabled { "Enabled" } else { "Disabled" },
-            if server_cfg.enabled { theme.success } else { theme.error },
+            if server_cfg.enabled {
+                "Enabled"
+            } else {
+                "Disabled"
+            },
+            if server_cfg.enabled {
+                theme.success
+            } else {
+                theme.error
+            },
         ),
         Span::styled("  ·  Space: toggle  ·  Enter/Esc: done", theme.muted),
     ]));
@@ -579,7 +616,14 @@ fn draw_matrix_modal(
     };
     lines.push(Line::from(vec![
         Span::styled(r0_prefix, theme.accent),
-        Span::styled("Claude Project Policy: ", if is_row_0 { theme.highlight } else { theme.base }),
+        Span::styled(
+            "Claude Project Policy: ",
+            if is_row_0 {
+                theme.highlight
+            } else {
+                theme.base
+            },
+        ),
         Span::styled(policy_str, theme.accent),
     ]));
 
@@ -590,7 +634,14 @@ fn draw_matrix_modal(
         let prefix = if is_sel { "▶ " } else { "  " };
         let override_val = server_cfg.harnesses.get(kind);
         let status_str = match override_val {
-            None => format!("Inherit (Global: {})", if server_cfg.enabled { "Enabled" } else { "Disabled" }),
+            None => format!(
+                "Inherit (Global: {})",
+                if server_cfg.enabled {
+                    "Enabled"
+                } else {
+                    "Disabled"
+                }
+            ),
             Some(true) => "Explicit: Enabled".to_string(),
             Some(false) => "Explicit: Disabled".to_string(),
         };
@@ -601,7 +652,10 @@ fn draw_matrix_modal(
         };
         lines.push(Line::from(vec![
             Span::styled(prefix, theme.accent),
-            Span::styled(format!("{:<15}: ", kind.display_name()), if is_sel { theme.highlight } else { theme.base }),
+            Span::styled(
+                format!("{:<15}: ", kind.display_name()),
+                if is_sel { theme.highlight } else { theme.base },
+            ),
             Span::styled(status_str, status_style),
         ]));
     }
@@ -617,10 +671,20 @@ fn draw_matrix_modal(
             let row_idx = 1 + HarnessKind::ALL.len() + i;
             let is_sel = selected == row_idx;
             let prefix = if is_sel { "▶ " } else { "  " };
-            let state = app.loaded.claude.project_server_state(proj_path, server_name);
+            let state = app
+                .loaded
+                .claude
+                .project_server_state(proj_path, server_name);
             let (status_str, status_style) = match state {
                 None => (
-                    format!("Inherit ({})", if server_cfg.enabled { "Global On" } else { "Global Off" }),
+                    format!(
+                        "Inherit ({})",
+                        if server_cfg.enabled {
+                            "Global On"
+                        } else {
+                            "Global Off"
+                        }
+                    ),
                     theme.muted,
                 ),
                 Some(true) => ("[Project: Enabled]".to_string(), theme.success),
@@ -636,7 +700,10 @@ fn draw_matrix_modal(
 
             lines.push(Line::from(vec![
                 Span::styled(prefix, theme.accent),
-                Span::styled(format!("{:<30}: ", display_path), if is_sel { theme.highlight } else { theme.base }),
+                Span::styled(
+                    format!("{:<30}: ", display_path),
+                    if is_sel { theme.highlight } else { theme.base },
+                ),
                 Span::styled(status_str, status_style),
             ]));
         }
@@ -646,12 +713,7 @@ fn draw_matrix_modal(
     f.render_widget(p, modal);
 }
 
-fn draw_new_profile_modal(
-    f: &mut Frame,
-    area: Rect,
-    input: &str,
-    theme: &Theme,
-) {
+fn draw_new_profile_modal(f: &mut Frame, area: Rect, input: &str, theme: &Theme) {
     let modal = centered_rect(52, 8, area);
     f.render_widget(Clear, modal);
 
@@ -663,7 +725,10 @@ fn draw_new_profile_modal(
         .padding(Padding::new(PADDING_SM, PADDING_SM, PADDING_XS, PADDING_XS));
 
     let lines = vec![
-        Line::from(Span::styled("Profile name (e.g. work, personal, dev):", theme.muted)),
+        Line::from(Span::styled(
+            "Profile name (e.g. work, personal, dev):",
+            theme.muted,
+        )),
         Line::from(""),
         Line::from(vec![
             Span::styled("▶ ", theme.accent),
@@ -671,7 +736,10 @@ fn draw_new_profile_modal(
             Span::styled("█", theme.accent),
         ]),
         Line::from(""),
-        Line::from(Span::styled("[Enter: Create & Activate]  [Esc: Cancel]", theme.muted)),
+        Line::from(Span::styled(
+            "[Enter: Create & Activate]  [Esc: Cancel]",
+            theme.muted,
+        )),
     ];
 
     let p = Paragraph::new(lines).block(block);
@@ -1354,7 +1422,12 @@ mod tests {
 
     #[test]
     fn renders_profiles_modal_and_matrix_modal() {
-        let mut app = App::new(None, crate::domain::storage::LoadedConfigs::default(), 96, 24);
+        let mut app = App::new(
+            None,
+            crate::domain::storage::LoadedConfigs::default(),
+            96,
+            24,
+        );
         app.mode = ActiveMode::ProfilesModal {
             selected: 0,
             items: vec!["Default (All Servers)".to_string(), "work".to_string()],

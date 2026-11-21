@@ -106,7 +106,10 @@ impl McpServerConfig {
 
     /// Returns the effective enabled state for a specific harness.
     pub fn enabled_for_harness(&self, harness: HarnessKind) -> bool {
-        self.harnesses.get(&harness).copied().unwrap_or(self.enabled)
+        self.harnesses
+            .get(&harness)
+            .copied()
+            .unwrap_or(self.enabled)
     }
 
     /// Trims `self.description` in-place and sets it to `None` when blank.

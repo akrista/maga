@@ -35,10 +35,10 @@ impl RefsRegistry {
     /// Resolves the absolute path where the repository should be stored.
     pub fn effective_path(&self, alias: &str, entry: &RefRepoEntry, cache_root: &Path) -> PathBuf {
         if let Some(ref custom_path) = entry.path {
-            if custom_path.starts_with("~/") || custom_path.starts_with("~\\") {
-                if let Ok(home) = crate::domain::guidelines::home_dir() {
-                    return home.join(&custom_path[2..]);
-                }
+            if (custom_path.starts_with("~/") || custom_path.starts_with("~\\"))
+                && let Ok(home) = crate::domain::guidelines::home_dir()
+            {
+                return home.join(&custom_path[2..]);
             }
             PathBuf::from(custom_path)
         } else {
@@ -73,10 +73,7 @@ pub fn clone_or_update_ref(
             Ok(format!("Updated ref '{alias}'"))
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(format!(
-                "Failed to update ref '{alias}': {}",
-                stderr.trim()
-            ))
+            Err(format!("Failed to update ref '{alias}': {}", stderr.trim()))
         }
     } else {
         // Ensure parent directory exists

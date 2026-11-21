@@ -1,6 +1,4 @@
-use crate::domain::model::{
-    McpServerConfig, ProjectPolicy, Transport, normalize_mcp_server_name,
-};
+use crate::domain::model::{McpServerConfig, ProjectPolicy, Transport, normalize_mcp_server_name};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -109,23 +107,21 @@ impl ClaudeDocument {
         let projects = self.raw_root.get("projects")?.as_object()?;
         let proj = projects.get(project_path)?.as_object()?;
         let norm = normalize_mcp_server_name(server_name);
-        if let Some(Value::Array(disabled)) = proj.get("disabledMcpServers") {
-            if disabled
+        if let Some(Value::Array(disabled)) = proj.get("disabledMcpServers")
+            && disabled
                 .iter()
                 .filter_map(Value::as_str)
                 .any(|s| s == server_name || s == norm)
-            {
-                return Some(false);
-            }
+        {
+            return Some(false);
         }
-        if let Some(Value::Array(enabled)) = proj.get("enabledMcpServers") {
-            if enabled
+        if let Some(Value::Array(enabled)) = proj.get("enabledMcpServers")
+            && enabled
                 .iter()
                 .filter_map(Value::as_str)
                 .any(|s| s == server_name || s == norm)
-            {
-                return Some(true);
-            }
+        {
+            return Some(true);
         }
         None
     }
@@ -609,7 +605,9 @@ mod tests {
         // delete obsolete-mcp
         doc.servers.remove("obsolete-mcp");
 
-        let out = doc.to_json_string(&doc.servers).expect("serialize claude json");
+        let out = doc
+            .to_json_string(&doc.servers)
+            .expect("serialize claude json");
         let raw: Map<String, Value> = serde_json::from_str(&out).expect("parse raw json");
 
         let work_proj = raw["projects"]["/home/dev/work-repo"].as_object().unwrap();

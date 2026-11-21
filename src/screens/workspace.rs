@@ -74,9 +74,7 @@ pub fn draw_workspace(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             WorkspaceSection::Guidelines => {
                 draw_guidelines_detail_panel(f, right_rows[0], app, theme)
             }
-            WorkspaceSection::Refs => {
-                draw_refs_detail_panel(f, right_rows[0], app, theme)
-            }
+            WorkspaceSection::Refs => draw_refs_detail_panel(f, right_rows[0], app, theme),
         }
         draw_companion_panel(f, right_rows[1], app, theme, &fx_areas);
     } else {
@@ -84,12 +82,8 @@ pub fn draw_workspace(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         match app.section {
             WorkspaceSection::Mcps => draw_detail_panel(f, columns[1], app, theme),
             WorkspaceSection::Plugins => draw_plugin_detail_panel(f, columns[1], app, theme),
-            WorkspaceSection::Guidelines => {
-                draw_guidelines_detail_panel(f, columns[1], app, theme)
-            }
-            WorkspaceSection::Refs => {
-                draw_refs_detail_panel(f, columns[1], app, theme)
-            }
+            WorkspaceSection::Guidelines => draw_guidelines_detail_panel(f, columns[1], app, theme),
+            WorkspaceSection::Refs => draw_refs_detail_panel(f, columns[1], app, theme),
         }
     }
 
@@ -1190,7 +1184,10 @@ fn draw_guidelines_detail_panel(f: &mut Frame, area: Rect, app: &App, theme: &Th
         lines.push(Line::from(vec![
             Span::styled("Prompt Budget:    ", theme.muted),
             Span::styled(
-                format!("{} lines, {} chars ", metrics.line_count, metrics.char_count),
+                format!(
+                    "{} lines, {} chars ",
+                    metrics.line_count, metrics.char_count
+                ),
                 theme.base,
             ),
             Span::styled(budget_label, budget_style),
@@ -1200,10 +1197,7 @@ fn draw_guidelines_detail_panel(f: &mut Frame, area: Rect, app: &App, theme: &Th
     let refs_count = app.loaded.refs.refs.len();
     lines.push(Line::from(vec![
         Span::styled("Offline Refs:     ", theme.muted),
-        Span::styled(
-            format!("{refs_count} tracked in refs.toml"),
-            theme.base,
-        ),
+        Span::styled(format!("{refs_count} tracked in refs.toml"), theme.base),
     ]));
     lines.push(Line::from(""));
 
@@ -1248,7 +1242,10 @@ fn draw_guidelines_detail_panel(f: &mut Frame, area: Rect, app: &App, theme: &Th
     ]));
     lines.push(Line::from(vec![
         Span::styled("  s          ", theme.accent),
-        Span::styled("Re-synchronize & repair links to all 6 harnesses", theme.base),
+        Span::styled(
+            "Re-synchronize & repair links to all 6 harnesses",
+            theme.base,
+        ),
     ]));
     lines.push(Line::from(vec![
         Span::styled("  r          ", theme.accent),
@@ -1303,12 +1300,18 @@ fn draw_refs_list(
     if refs_map.is_empty() {
         let empty_lines = vec![
             Line::from(""),
-            Line::from(Span::styled("No references tracked in refs.toml", theme.muted)),
+            Line::from(Span::styled(
+                "No references tracked in refs.toml",
+                theme.muted,
+            )),
             Line::from(""),
             Line::from(vec![
                 Span::styled("Press ", theme.muted),
                 Span::styled("e", theme.accent),
-                Span::styled(" to open refs.toml in $EDITOR and add repositories.", theme.muted),
+                Span::styled(
+                    " to open refs.toml in $EDITOR and add repositories.",
+                    theme.muted,
+                ),
             ]),
         ];
         let p = Paragraph::new(empty_lines).block(block);
@@ -1377,12 +1380,7 @@ fn draw_refs_detail_panel(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .map(|p| p.refs_cache_dir.clone())
         .unwrap_or_else(|| std::path::PathBuf::from("refs"));
 
-    let selected_entry = app
-        .loaded
-        .refs
-        .refs
-        .iter()
-        .nth(app.refs_selected);
+    let selected_entry = app.loaded.refs.refs.iter().nth(app.refs_selected);
 
     let mut lines = Vec::new();
 
@@ -1407,10 +1405,7 @@ fn draw_refs_detail_panel(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ]));
         lines.push(Line::from(vec![
             Span::styled("Description:  ", theme.muted),
-            Span::styled(
-                entry.description.as_deref().unwrap_or("-"),
-                theme.base,
-            ),
+            Span::styled(entry.description.as_deref().unwrap_or("-"), theme.base),
         ]));
         lines.push(Line::from(vec![
             Span::styled("Local Path:   ", theme.muted),
@@ -1450,7 +1445,10 @@ fn draw_refs_detail_panel(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     ]));
     lines.push(Line::from(vec![
         Span::styled("  s          ", theme.accent),
-        Span::styled("Re-synchronize guidelines and update offline lookup index", theme.base),
+        Span::styled(
+            "Re-synchronize guidelines and update offline lookup index",
+            theme.base,
+        ),
     ]));
     lines.push(Line::from(vec![
         Span::styled("  r          ", theme.accent),

@@ -272,7 +272,10 @@ pub fn extract_binary(
             let mut file = zip
                 .by_index(i)
                 .map_err(|e| format!("Failed to read zip entry #{i}: {e}"))?;
-            let name = file.name().to_string();
+            let name = file
+                .name()
+                .map_err(|e| format!("Failed to read zip entry #{i}: {e}"))?
+                .into_owned();
             let base_name = std::path::Path::new(&name)
                 .file_name()
                 .and_then(|s| s.to_str())

@@ -5,6 +5,7 @@ pub mod fx;
 pub mod keybind;
 pub mod mascot;
 pub mod screens;
+pub mod serve;
 pub mod theme;
 pub mod ui;
 
@@ -88,6 +89,10 @@ struct Cli {
     /// Download and install the latest release of maga in-place.
     #[arg(long)]
     update: bool,
+
+    /// Run maga as an MCP server over stdio (JSON-RPC 2.0), letting agents manage MCPs conversationally.
+    #[arg(long)]
+    serve: bool,
 }
 
 /// RAII guard that ensures raw mode and alternate screen are always restored on exit or panic.
@@ -212,6 +217,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(opencode) = cli.opencode_config {
         paths.opencode_json = opencode;
         paths.opencode_overridden = true;
+    }
+
+    // MCP serve mode: stdout carries JSON-RPC frames only, so this must come before any print branch.
+    if cli.serve {
+        // D4: the mutation gate is read exactly once at process startup.
+        let mutations_enabled = std::env::var("MAGA_MCP_MUTATIONS").is_ok_and(|v| v == "1");
+        return serve::run(paths, mutations_enabled);
     }
 
     if cli.check_guidelines {

@@ -545,6 +545,13 @@ impl HarnessKind {
             Self::OpenCode => DEFAULT_OPENCODE_CONFIG_PATH,
         }
     }
+
+    /// D5: whether this harness reads MCP config only at startup (conservative default).
+    pub fn reads_mcp_at_startup(self) -> bool {
+        match self {
+            Self::Antigravity | Self::Claude | Self::Copilot | Self::Grok | Self::OpenCode => true,
+        }
+    }
 }
 
 /// Per-harness tool settings inside `[tools.<harness>]` in `~/.config/maga/config.toml`.

@@ -184,6 +184,24 @@ maga --update
 | `--force` | Combined with `--sync`: authoritatively push `mcp.toml` to all enabled harnesses, overriding conflicts |
 | `--check-update` | Query GitHub Releases for a newer version of `maga` and print status without modifying files |
 | `--update` | Download the matching release archive, verify its SHA-256 checksum, and upgrade the binary in-place |
+| `--serve` | Run maga as an MCP server over stdio (JSON-RPC 2.0): agents can list, probe, drift-check, toggle and sync MCP servers conversationally |
+
+### Using maga as an MCP server
+
+Register maga itself in any harness's MCP config. Read tools (`list_servers`, `probe_server`, `check_drift`) are always available; mutating tools (`toggle_server`, `sync`) require opt-in via `MAGA_MCP_MUTATIONS=1`:
+
+```json
+{
+  "mcpServers": {
+    "maga": {
+      "command": "maga",
+      "args": ["--serve"],
+      "env": { "MAGA_MCP_MUTATIONS": "1" }
+    }
+  }
+}
+```
+
 | `-h`, `--help` | Print CLI help information |
 | `-V`, `--version` | Print version information |
 

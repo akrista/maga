@@ -5,7 +5,6 @@ edition = "2024"
 rust-version = "1.88"
 description = "Unified TUI manager for global MCP servers across Antigravity, Claude Code, GitHub Copilot, Grok CLI, and OpenCode"
 repository = "https://github.com/akrista/maga"
-homepage = "https://github.com/akrista/maga"
 readme = "README.md"
 license = "MIT"
 keywords = ["mcp", "tui", "ratatui", "claude", "copilot"]

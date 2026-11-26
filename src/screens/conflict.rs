@@ -31,6 +31,13 @@ pub fn draw_conflict_modal(
                 alt_names.join("', '")
             )
         }
+        ConflictKind::UnresolvedEnv { vars } => {
+            format!(
+                "Unresolved Env Vars ({}: {})",
+                conflict.name,
+                vars.join(", ")
+            )
+        }
     };
 
     let title = format!(

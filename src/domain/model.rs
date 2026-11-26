@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 /// Transport mechanism used by an MCP server.
@@ -208,6 +208,29 @@ impl McpServerConfig {
         }
     }
 
+    /// Returns the sorted names of `${VAR}` / `$VAR` placeholders in this configuration
+    /// that have no value in `env`. Placeholders with `${VAR:-fallback}` defaults resolve
+    /// via the fallback and are never reported.
+    pub fn unresolved_env_vars(&self, env: &BTreeMap<String, String>) -> Vec<String> {
+        let mut names = BTreeSet::new();
+        if let Some(c) = &self.command {
+            extract_plain_placeholders(c, &mut names);
+        }
+        for a in &self.args {
+            extract_plain_placeholders(a, &mut names);
+        }
+        for v in self.env.values() {
+            extract_plain_placeholders(v, &mut names);
+        }
+        if let Some(u) = &self.url {
+            extract_plain_placeholders(u, &mut names);
+        }
+        for h in self.headers.values() {
+            extract_plain_placeholders(h, &mut names);
+        }
+        names.into_iter().filter(|n| !env.contains_key(n)).collect()
+    }
+
     /// Prepares this configuration for export to a target harness on the specified OS.
     /// Interpolates environment variables and wraps non-PE commands in `cmd /c` on Windows.
     pub fn for_harness_export(&self, is_windows: bool, env: &BTreeMap<String, String>) -> Self {
@@ -392,6 +415,46 @@ pub fn interpolate_string(input: &str, env: &BTreeMap<String, String>) -> String
     }
 
     out
+}
+
+/// Extracts variable names referenced by `${VAR}` or `$VAR` placeholders (no
+/// `${VAR:-fallback}` defaults, which resolve via the fallback and never go missing).
+fn extract_plain_placeholders(input: &str, out: &mut BTreeSet<String>) {
+    let chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    while i < len {
+        if chars[i] != '$' {
+            i += 1;
+            continue;
+        }
+        if i + 1 < len && chars[i + 1] == '{' {
+            if let Some(close_rel) = chars[i + 2..].iter().position(|&c| c == '}') {
+                let close_idx = i + 2 + close_rel;
+                let expr: String = chars[i + 2..close_idx].iter().collect();
+                if !expr.contains(":-") {
+                    let var = expr.trim();
+                    if !var.is_empty() {
+                        out.insert(var.to_string());
+                    }
+                }
+                i = close_idx + 1;
+                continue;
+            } else {
+                break;
+            }
+        }
+        if i + 1 < len && (chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == '_') {
+            let mut end = i + 1;
+            while end < len && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
+                end += 1;
+            }
+            out.insert(chars[i + 1..end].iter().collect());
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
 }
 
 /// Normalizes command and args by unwrapping Windows `cmd /c <command> ...` shims
@@ -1152,6 +1215,51 @@ impl ProfilesConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unresolved_env_vars_reports_missing_and_ignores_fallbacks() {
+        let mut env = BTreeMap::new();
+        env.insert("PRESENT".to_string(), "1".to_string());
+
+        let mut stdio = McpServerConfig::new_stdio(
+            "${MISSING_CMD}",
+            vec!["--dsn".to_string(), "${PRESENT}-${MISSING_DSN}".to_string()],
+        );
+        stdio
+            .env
+            .insert("TOKEN".to_string(), "${MISSING_TOKEN}".to_string());
+        let http = McpServerConfig::new_http("https://${MISSING_HOST}/mcp");
+
+        let mut combined = McpServerConfig::new_http("https://${PRESENT}/mcp");
+        combined.command = Some("${MISSING_CMD}".to_string());
+        combined.args = vec![
+            "${MISSING_DSN}".to_string(),
+            "${FALLBACK:-default}".to_string(),
+        ];
+
+        assert_eq!(
+            stdio.unresolved_env_vars(&env),
+            ["MISSING_CMD", "MISSING_DSN", "MISSING_TOKEN"]
+        );
+        assert_eq!(http.unresolved_env_vars(&env), ["MISSING_HOST"]);
+        // ${VAR:-fallback} resolves via the fallback and is never reported.
+        assert_eq!(
+            combined.unresolved_env_vars(&env),
+            ["MISSING_CMD", "MISSING_DSN"]
+        );
+        // Everything present -> empty.
+        let mut full_env = env.clone();
+        for v in [
+            "MISSING_CMD",
+            "MISSING_DSN",
+            "MISSING_TOKEN",
+            "MISSING_HOST",
+        ] {
+            full_env.insert(v.to_string(), "1".to_string());
+        }
+        assert!(stdio.unresolved_env_vars(&full_env).is_empty());
+        assert!(http.unresolved_env_vars(&full_env).is_empty());
+    }
 
     #[test]
     fn round_trip_mcp_registry_toml() {

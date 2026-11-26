@@ -5,7 +5,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -31,20 +31,26 @@ impl Server {
     }
 
     fn recv_response(&self, id: u64) -> Value {
-        let deadline_frame = loop {
+        loop {
             let line = self.rx.recv_timeout(TIMEOUT).expect("child response");
             let frame: Value = serde_json::from_str(&line).expect("valid JSON frame");
             if frame.get("id") == Some(&json!(id)) {
                 break frame;
             }
-        };
-        deadline_frame
+        }
     }
 
     /// Tool-call helper returning the frame and raw text content.
     fn call_tool(&mut self, id: u64, name: &str, arguments: Value) -> (Value, String) {
-        let frame = self.request(id, "tools/call", json!({ "name": name, "arguments": arguments }));
-        let text = frame["result"]["content"][0]["text"].as_str().expect("text content").to_string();
+        let frame = self.request(
+            id,
+            "tools/call",
+            json!({ "name": name, "arguments": arguments }),
+        );
+        let text = frame["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content")
+            .to_string();
         (frame, text)
     }
 }
@@ -85,7 +91,12 @@ fn spawn_server(mutations: bool) -> Server {
             }
         }
     });
-    Server { child, stdin, rx, _home: home }
+    Server {
+        child,
+        stdin,
+        rx,
+        _home: home,
+    }
 }
 
 /// Writes a canonical registry with one stdio server whose binary does not exist,
@@ -109,14 +120,21 @@ fn full_session_with_mutations() {
     let mut server = spawn_server(true);
     seed_registry(server._home.path());
 
-    let init = server.request(1, "initialize", json!({ "protocolVersion": "2024-11-05", "capabilities": {} }));
+    let init = server.request(
+        1,
+        "initialize",
+        json!({ "protocolVersion": "2024-11-05", "capabilities": {} }),
+    );
     assert_eq!(init["result"]["protocolVersion"], "2024-11-05");
     assert_eq!(init["result"]["serverInfo"]["name"], "maga");
 
     // The initialized notification must never be answered.
     server.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
     std::thread::sleep(Duration::from_millis(300));
-    assert!(matches!(server.rx.try_recv(), Err(TryRecvError::Empty)), "notification was answered");
+    assert!(
+        matches!(server.rx.try_recv(), Err(TryRecvError::Empty)),
+        "notification was answered"
+    );
 
     let ping = server.request(2, "ping", json!({}));
     assert_eq!(ping["result"], json!({}));
@@ -128,7 +146,16 @@ fn full_session_with_mutations() {
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    assert_eq!(names, ["list_servers", "probe_server", "check_drift", "toggle_server", "sync"]);
+    assert_eq!(
+        names,
+        [
+            "list_servers",
+            "probe_server",
+            "check_drift",
+            "toggle_server",
+            "sync"
+        ]
+    );
 
     let (_, text) = server.call_tool(4, "list_servers", json!({}));
     let list: Value = serde_json::from_str(&text).expect("JSON payload");
@@ -145,17 +172,34 @@ fn full_session_with_mutations() {
     let drift: Value = serde_json::from_str(&text).expect("JSON payload");
     assert_eq!(drift["status"], "drift");
 
-    let (frame, _) = server.call_tool(7, "toggle_server", json!({ "name": "nope", "enabled": true }));
+    let (frame, _) = server.call_tool(
+        7,
+        "toggle_server",
+        json!({ "name": "nope", "enabled": true }),
+    );
     assert_eq!(frame["result"]["isError"], true);
-    assert!(frame["result"]["content"][0]["text"].as_str().unwrap().contains("Unknown server 'nope'"));
+    assert!(
+        frame["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown server 'nope'")
+    );
 
-    let (frame, text) = server.call_tool(8, "toggle_server", json!({ "name": "ctx7", "enabled": false }));
+    let (frame, text) = server.call_tool(
+        8,
+        "toggle_server",
+        json!({ "name": "ctx7", "enabled": false }),
+    );
     assert_eq!(frame["result"]["isError"], false);
     let toggle: Value = serde_json::from_str(&text).expect("JSON payload");
     assert_eq!(toggle["ok"], true);
     assert!(!toggle["notes"].as_array().expect("notes").is_empty());
-    let mcp_toml = std::fs::read_to_string(server._home.path().join("config/maga/mcp.toml")).expect("read mcp.toml");
-    assert!(mcp_toml.contains("enabled = false"), "persisted toggle, got: {mcp_toml}");
+    let mcp_toml = std::fs::read_to_string(server._home.path().join("config/maga/mcp.toml"))
+        .expect("read mcp.toml");
+    assert!(
+        mcp_toml.contains("enabled = false"),
+        "persisted toggle, got: {mcp_toml}"
+    );
 
     let (_, text) = server.call_tool(9, "sync", json!({ "force": true }));
     let synced: Value = serde_json::from_str(&text).expect("JSON payload");
@@ -176,16 +220,31 @@ fn read_only_session() {
         .collect();
     assert_eq!(names, ["list_servers", "probe_server", "check_drift"]);
 
-    let (frame, _) = server.call_tool(2, "toggle_server", json!({ "name": "ctx7", "enabled": true }));
+    let (frame, _) = server.call_tool(
+        2,
+        "toggle_server",
+        json!({ "name": "ctx7", "enabled": true }),
+    );
     assert_eq!(frame["result"]["isError"], true);
-    assert!(frame["result"]["content"][0]["text"].as_str().unwrap().contains("read-only"));
-    assert!(!server._home.path().join("config/maga/mcp.toml").exists(), "read-only mode must not write mcp.toml");
+    assert!(
+        frame["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("read-only")
+    );
+    assert!(
+        !server._home.path().join("config/maga/mcp.toml").exists(),
+        "read-only mode must not write mcp.toml"
+    );
 
     let unknown = server.request(3, "nope/nope", json!({}));
     assert_eq!(unknown["error"]["code"], -32601);
 
     server.send_raw("{not json");
-    let frame = server.rx.recv_timeout(TIMEOUT).expect("parse error response");
+    let frame = server
+        .rx
+        .recv_timeout(TIMEOUT)
+        .expect("parse error response");
     let frame: Value = serde_json::from_str(&frame).expect("valid JSON frame");
     assert_eq!(frame["error"]["code"], -32700);
     assert_eq!(frame["id"], Value::Null);

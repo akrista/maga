@@ -574,7 +574,16 @@ impl LoadedConfigs {
                     let mut exported = v.for_harness_export(is_windows, env_ref);
                     let profile_active = self.profiles.is_server_active(active_prof, k);
                     let harness_enabled = v.enabled_for_harness(harness);
-                    exported.enabled = profile_active && harness_enabled;
+                    // A broken placeholder in an exported config is worse than a disabled
+                    // server: harnesses would read raw ${VAR} and fail to connect.
+                    let missing = exported.unresolved_env_vars(env_ref);
+                    if !missing.is_empty() {
+                        eprintln!(
+                            "maga: server {k}: unresolved env vars [{}], disabling export",
+                            missing.join(", ")
+                        );
+                    }
+                    exported.enabled = profile_active && harness_enabled && missing.is_empty();
                     (k.clone(), exported)
                 })
                 .collect()

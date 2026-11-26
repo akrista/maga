@@ -7,12 +7,12 @@
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::domain::model::{HarnessKind, MagaConfig, McpServerConfig};
-use crate::domain::probe::{probe_server, ServerProbeState, DEFAULT_PROBE_TIMEOUT};
+use crate::domain::probe::{DEFAULT_PROBE_TIMEOUT, ServerProbeState, probe_server};
 use crate::domain::reconcile::{
-    reconcile_harnesses_with_env, ConvergenceStatus, ConflictKind, McpConflict, ReconcileOutcome,
+    ConflictKind, ConvergenceStatus, McpConflict, ReconcileOutcome, reconcile_harnesses_with_env,
 };
 use crate::domain::storage::{HeadlessSyncError, LoadedConfigs, StoragePaths};
 
@@ -23,7 +23,11 @@ pub fn run(paths: StoragePaths, mutations_enabled: bool) -> Result<(), Box<dyn s
     eprintln!(
         "maga MCP server v{} listening on stdio (mutations: {})",
         env!("CARGO_PKG_VERSION"),
-        if mutations_enabled { "enabled" } else { "read-only" }
+        if mutations_enabled {
+            "enabled"
+        } else {
+            "read-only"
+        }
     );
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
@@ -43,7 +47,13 @@ pub fn run(paths: StoragePaths, mutations_enabled: bool) -> Result<(), Box<dyn s
 fn handle_frame(line: &str, mutations: bool, paths: &StoragePaths) -> Option<Value> {
     let frame: Value = match serde_json::from_str(line) {
         Ok(value) => value,
-        Err(e) => return Some(error_response(Value::Null, -32700, &format!("Parse error: {e}"))),
+        Err(e) => {
+            return Some(error_response(
+                Value::Null,
+                -32700,
+                &format!("Parse error: {e}"),
+            ));
+        }
     };
     if frame.is_array() {
         return Some(error_response(
@@ -59,14 +69,11 @@ fn handle_frame(line: &str, mutations: bool, paths: &StoragePaths) -> Option<Val
                 Value::Null,
                 -32600,
                 "Invalid request: expected a JSON object",
-            ))
+            ));
         }
     };
-    let method = match object.get("method").and_then(Value::as_str) {
-        // A frame without `method` is a client response; maga never sends server requests.
-        None => return None,
-        Some(method) => method.to_string(),
-    };
+    // A frame without `method` is a client response; maga never sends server requests.
+    let method = object.get("method").and_then(Value::as_str)?.to_string();
     let id = match object.get("id") {
         // Notifications are logged to stderr and never answered.
         None => {
@@ -180,7 +187,7 @@ fn tools_call(
             return Err(DispatchError::Rpc(
                 -32602,
                 "tools/call 'arguments' must be an object".into(),
-            ))
+            ));
         }
     };
     let outcome = match name {
@@ -190,10 +197,7 @@ fn tools_call(
         "toggle_server" | "sync" if !mutations => Err(DispatchError::Tool(read_only_error(name))),
         "toggle_server" => toggle_server(&args, paths),
         "sync" => sync(&args, paths),
-        other => Err(DispatchError::Rpc(
-            -32602,
-            format!("Unknown tool: {other}"),
-        )),
+        other => Err(DispatchError::Rpc(-32602, format!("Unknown tool: {other}"))),
     };
     match outcome {
         Ok(value) => Ok(tool_text(
@@ -354,9 +358,15 @@ fn toggle_server(args: &Value, paths: &StoragePaths) -> Result<Value, DispatchEr
         .ok_or_else(|| {
             DispatchError::Rpc(-32602, "toggle_server requires a 'name' argument".into())
         })?;
-    let enabled = args.get("enabled").and_then(Value::as_bool).ok_or_else(|| {
-        DispatchError::Rpc(-32602, "toggle_server requires a boolean 'enabled' argument".into())
-    })?;
+    let enabled = args
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            DispatchError::Rpc(
+                -32602,
+                "toggle_server requires a boolean 'enabled' argument".into(),
+            )
+        })?;
 
     let (mut loaded, outcome) = reconcile_from_disk(paths).map_err(DispatchError::Tool)?;
     if !outcome.conflicts.is_empty() {
@@ -376,7 +386,9 @@ fn toggle_server(args: &Value, paths: &StoragePaths) -> Result<Value, DispatchEr
     cfg.enabled = enabled;
     let mut canonical = outcome.canonical;
     canonical.insert(name.to_string(), cfg);
-    loaded.save_all(paths, &canonical).map_err(DispatchError::Tool)?;
+    loaded
+        .save_all(paths, &canonical)
+        .map_err(DispatchError::Tool)?;
 
     Ok(json!({
         "ok": true,
@@ -412,9 +424,7 @@ fn sync(args: &Value, paths: &StoragePaths) -> Result<Value, DispatchError> {
             conflicts.len(),
             conflict_brief(&conflicts),
         ))),
-        Err(HeadlessSyncError::Io(e)) => {
-            Err(DispatchError::Tool(format!("Sync failed: {e}")))
-        }
+        Err(HeadlessSyncError::Io(e)) => Err(DispatchError::Tool(format!("Sync failed: {e}"))),
     }
 }
 
@@ -425,6 +435,7 @@ fn summarize_conflicts(conflicts: &[McpConflict]) -> Vec<Value> {
             let kind = match c.kind {
                 ConflictKind::DefinitionDrift => "definition_drift",
                 ConflictKind::CaseCollision { .. } => "case_collision",
+                ConflictKind::UnresolvedEnv { .. } => "unresolved_env",
             };
             json!({
                 "name": c.name,

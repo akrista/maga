@@ -10,6 +10,9 @@ pub enum ConflictKind {
     DefinitionDrift,
     /// Two or more server names differ only by ASCII letter case (e.g., `"Context7"` vs `"context7"`).
     CaseCollision { alt_names: Vec<String> },
+    /// Config references `${VAR}` / `$VAR` placeholders with no value in the environment,
+    /// so harnesses would receive raw unexpanded placeholders that fail to connect.
+    UnresolvedEnv { vars: Vec<String> },
 }
 
 /// A deduplicated definition variant shared by one or more harnesses during a conflict.
@@ -44,6 +47,7 @@ impl McpConflict {
         match &self.kind {
             ConflictKind::CaseCollision { alt_names } => alt_names.as_slice(),
             ConflictKind::DefinitionDrift => &[],
+            ConflictKind::UnresolvedEnv { .. } => &[],
         }
     }
 
@@ -474,6 +478,18 @@ pub fn reconcile_harnesses_with_env(
                 if present.is_empty() {
                     continue;
                 }
+                // Surface missing env vars before drift: a raw ${VAR} template
+                // "matching" across harnesses is converged with broken configs.
+                let missing = m.unresolved_env_vars(env_ref);
+                if !missing.is_empty() {
+                    conflicts.push(McpConflict {
+                        name: name.clone(),
+                        kind: ConflictKind::UnresolvedEnv { vars: missing },
+                        variants: Vec::new(),
+                        maga: Some(m.clone()),
+                    });
+                    continue;
+                }
                 let all_match_m = present
                     .iter()
                     .all(|(_, c)| c.matches_canonical_or_interpolated(m, env_ref));
@@ -769,6 +785,52 @@ mod tests {
         assert!(outcome.canonical.contains_key("context7"));
         assert!(!outcome.canonical.contains_key("Context7"));
         assert!(outcome.conflicts.is_empty());
+    }
+
+    #[test]
+    fn flags_unresolved_env_when_all_harnesses_match_raw_template() {
+        // Regression: template "matching" across maga + harnesses converged silently
+        // with raw ${VAR} placeholders that break every exported config.
+        let mut maga = BTreeMap::new();
+        let mut claude = BTreeMap::new();
+        let dbhub = McpServerConfig::new_stdio(
+            "dbhub",
+            vec![
+                "--transport".to_string(),
+                "stdio".to_string(),
+                "--dsn".to_string(),
+                "postgresql://${PGSQL_USER}:${PGSQL_PASS}@${PGSQL_HOST}/postgres".to_string(),
+            ],
+        );
+        maga.insert("dbhub".to_string(), dbhub.clone());
+        claude.insert("dbhub".to_string(), dbhub.clone());
+
+        let empty = BTreeMap::new();
+        let harnesses = vec![(HarnessKind::Claude, claude)];
+        let outcome = reconcile_harnesses_with_env(&maga, &harnesses, Some(&empty));
+        assert_eq!(
+            outcome.conflicts.len(),
+            1,
+            "expected UnresolvedEnv conflict"
+        );
+        assert_eq!(outcome.conflicts[0].name, "dbhub");
+        match &outcome.conflicts[0].kind {
+            ConflictKind::UnresolvedEnv { vars } => {
+                assert_eq!(vars, &["PGSQL_HOST", "PGSQL_PASS", "PGSQL_USER"])
+            }
+            other => panic!("expected UnresolvedEnv, got {other:?}"),
+        }
+
+        // With vars present in env the same state converges cleanly.
+        let mut env = BTreeMap::new();
+        for v in ["PGSQL_USER", "PGSQL_PASS", "PGSQL_HOST"] {
+            env.insert(v.to_string(), "x".to_string());
+        }
+        let mut claude2 = BTreeMap::new();
+        claude2.insert("dbhub".to_string(), dbhub);
+        let harnesses2 = vec![(HarnessKind::Claude, claude2)];
+        let outcome2 = reconcile_harnesses_with_env(&maga, &harnesses2, Some(&env));
+        assert!(outcome2.conflicts.is_empty());
     }
 
     #[test]

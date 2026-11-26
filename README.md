@@ -56,7 +56,7 @@
 ```
 
 - **Canonical MCP Registry (`~/.config/maga/mcp.toml`)**: Define `stdio` (`command`, `args`, `env`, `description`) and `http` (`url`, `headers`, `description`) MCP servers once, cleanly separated from UI/tool preferences in `~/.config/maga/config.toml` and plugin state in `~/.config/maga/plugins.toml`.
-- **Two-Way Reconciliation & Conflict Detection**: Automatically imports untracked servers on startup and live reload, detects definition drift or case-insensitive name collisions (e.g., `"Context7"` vs `"context7"`), and groups identical definitions into numbered variants (`[1]`..`[N]`) for side-by-side resolution.
+- **Two-Way Reconciliation & Conflict Detection**: Automatically imports untracked servers on startup and live reload, detects definition drift, case-insensitive name collisions (e.g., `"Context7"` vs `"context7"`), and servers referencing `${VAR}` / `$VAR` placeholders with no value in the environment, and groups identical definitions into numbered variants (`[1]`..`[N]`) for side-by-side resolution.
 - **Per-Harness Plugin Management (`Tab` / `1` / `2`)**: Discovers installed and configured plugins across all 5 harnesses, extracts bundled `skills`, `hooks`, and `MCPs` counts/identifiers, toggles plugins in each harness's native config file, retains disabled OpenCode npm specifiers in `plugins.toml`, and supports complete native uninstall (`d`).
 - **Live MCP Health Probing & Tool Inspection (`p` / `P` / `t`)**: Executes non-blocking, bounded-timeout (8s) JSON-RPC `initialize` + `tools/list` handshakes over `stdio` subprocesses and `http` / SSE endpoints, displaying live round-trip latency (`ms`) and exposed tool definitions.
 - **Lossless Schema Translation & Symlink-Safe Atomic Backups**: Writes `.bak` backups before every update via canonicalized same-directory atomic temp-file replacement—preserving symbolic links, non-MCP keys, OAuth/session state, `"plugin:*"` entries, and per-server harness options.
@@ -240,7 +240,7 @@ Register maga itself in any harness's MCP config. Read tools (`list_servers`, `p
 | Modal | Keys |
 | :--- | :--- |
 | **Add / Edit Form (`a` / `e`)** | <kbd>Tab</kbd> / <kbd>Shift+Tab</kbd> navigate fields · <kbd>Space</kbd> / <kbd>←</kbd> / <kbd>→</kbd> toggle `stdio` vs `http` or `enabled` · <kbd>Ctrl+e</kbd> edit in `$EDITOR` · <kbd>Enter</kbd> save & sync · <kbd>Esc</kbd> cancel |
-| **Conflict Resolution (`c`)** | <kbd>1</kbd>..<kbd>9</kbd> keep numbered variant & sync all enabled harnesses · <kbd>E</kbd> merge in `$EDITOR` · <kbd>s</kbd> / <kbd>Esc</kbd> skip for now |
+| **Conflict Resolution (`c`)** | <kbd>1</kbd>..<kbd>9</kbd> keep numbered variant & sync all enabled harnesses · <kbd>E</kbd> merge in `$EDITOR` · <kbd>s</kbd> / <kbd>Esc</kbd> skip for now · unresolved-env conflicts have no variants: set the missing env vars (or <kbd>E</kbd> to inline a literal) and they clear on reload |
 | **Options (`o`)** | <kbd>j</kbd> / <kbd>k</kbd> / <kbd>Tab</kbd> select setting · <kbd>Space</kbd> / <kbd>←</kbd> / <kbd>→</kbd> (or <kbd>-</kbd> / <kbd>+</kbd> on interval) cycle value · <kbd>Enter</kbd> save to `config.toml` · <kbd>Esc</kbd> cancel |
 
 ---

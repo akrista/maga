@@ -107,12 +107,6 @@ enum Command {
     CheckUpdate,
     /// Print the installed maga version (same as `--version`).
     Version,
-    /// Make `settings.toml` a symlink to FILE (or DIR/settings.toml), e.g. inside a dotfiles repo.
-    /// `settings.local.toml`, `.env.local` and `secrets/` stay in the maga config dir.
-    LinkSettings {
-        /// Destination file, or a directory that will hold `settings.toml`.
-        path: PathBuf,
-    },
 }
 
 /// RAII guard that ensures raw mode and alternate screen are always restored on exit or panic.
@@ -144,10 +138,8 @@ fn install_panic_hook() {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cli = Cli::parse();
-    let mut link_target = None;
     match cli.command.take() {
         Some(Command::Update) => cli.update = true,
-        Some(Command::LinkSettings { path }) => link_target = Some(path),
         Some(Command::CheckUpdate) => cli.check_update = true,
         Some(Command::Version) => {
             println!("maga {}", env!("CARGO_PKG_VERSION"));
@@ -248,34 +240,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(opencode) = cli.opencode_config {
         paths.opencode_json = opencode;
         paths.opencode_overridden = true;
-    }
-
-    if let Some(target) = link_target {
-        match crate::domain::storage::link_settings(&paths, &target) {
-            Ok(crate::domain::storage::LinkOutcome::AlreadyLinked) => {
-                println!("settings.toml is already linked to {}", target.display());
-            }
-            Ok(crate::domain::storage::LinkOutcome::Linked { target, adopted }) => {
-                println!(
-                    "{} -> {}{}",
-                    paths.settings_toml.display(),
-                    target.display(),
-                    if adopted {
-                        " (existing file kept; previous local file saved as settings.toml.bak)"
-                    } else {
-                        " (created from the previous local settings)"
-                    }
-                );
-                println!(
-                    "Keep settings.local.toml, .env.local, secrets/ and *.bak out of that repository."
-                );
-            }
-            Err(e) => {
-                eprintln!("[1;31m✗[0m {e}");
-                std::process::exit(1);
-            }
-        }
-        return Ok(());
     }
 
     // MCP serve mode: stdout carries JSON-RPC frames only, so this must come before any print branch.

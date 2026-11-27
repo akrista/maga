@@ -365,8 +365,6 @@ version = "1.6.0"
 Press <kbd>o</kbd> inside the TUI to modify and persist these settings interactively, or edit `~/.config/maga/settings.toml` directly. Missing standard keys are auto-populated on startup while preserving custom user keys:
 Machine-specific values (harness `config_path` overrides that differ from the default, and the external `editor`) are written to `~/.config/maga/settings.local.toml` instead, which is layered over `settings.toml` and listed in a `.gitignore` that `maga` keeps next to it (together with `.env.local` and `*.bak`). A pre-split `config.toml` is migrated automatically and kept as `config.toml.bak`.
 
-**Keeping `settings.toml` in a dotfiles repository** (even a public one): run `maga link-settings <FILE-or-DIR>` once. It moves the portable settings to that location (or adopts the file already there), keeps the previous local file as `settings.toml.bak`, and makes `~/.config/maga/settings.toml` a symlink to it. `maga` writes through the link, so UI changes land in the repository, while `settings.local.toml`, `.env.local`, `secrets/` and the `.bak` files stay in `~/.config/maga`. Only a real symlink is created (on Windows that needs Developer Mode or an elevated shell); a copy would silently diverge. If the target disappears (the dotfiles are not checked out on another machine), `maga` falls back to a regular local `~/.config/maga/settings.toml`. Nothing in your shell or profile is modified. Add `settings.local.toml`, `.env.local`, `secrets/` and `*.bak` to that repository's `.gitignore`.
-
 ```toml
 # [ui] Visual theme, 3-tier mascot layers, and micro-animations
 [ui]

@@ -10,6 +10,7 @@ use crate::domain::reconcile::{
     ConflictResolution, McpConflict, ReconcileOutcome, harness_maps_match_with_env,
     reconcile_harnesses_with_env, reconcile_live_reload_harnesses_with_env,
 };
+use crate::domain::refs::RepoInfo;
 use crate::domain::skills::{self, InstalledSkill, SearchHit, SkillScope};
 use crate::domain::storage::{LoadedConfigs, StoragePaths};
 use crate::fx::{FxEngine, FxTrigger};
@@ -94,6 +95,28 @@ pub enum PluginRow {
         index: usize,
         plugin: HarnessPlugin,
     },
+}
+
+/// Outcome of the last update of one reference repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefStatus {
+    pub ok: bool,
+    pub message: String,
+    /// Local wall-clock time, `HH:MM`.
+    pub time: String,
+}
+
+/// Result of background git work on reference repositories.
+#[derive(Debug)]
+pub enum RefsEvent {
+    Updated {
+        alias: String,
+        result: Result<String, String>,
+        time: String,
+        info: Option<RepoInfo>,
+    },
+    Info(BTreeMap<String, RepoInfo>),
+    Finished,
 }
 
 /// Severity of a status-bar message.
@@ -698,6 +721,17 @@ pub struct App {
     pub skills_cwd: PathBuf,
     pub skills_tx: mpsc::Sender<SkillsEvent>,
     pub skills_rx: mpsc::Receiver<SkillsEvent>,
+    /// Last update outcome per ref alias.
+    pub refs_status: BTreeMap<String, RefStatus>,
+    /// Cached state of each clone (refreshed on entering the view, `r` and after updates).
+    pub refs_info: BTreeMap<String, RepoInfo>,
+    pub refs_info_loaded: bool,
+    pub refs_busy: bool,
+    /// `(finished, total)` of the running update.
+    pub refs_progress: (usize, usize),
+    refs_failures: Vec<String>,
+    refs_tx: mpsc::Sender<RefsEvent>,
+    refs_rx: mpsc::Receiver<RefsEvent>,
     pub mode: ActiveMode,
     pub status_message: Option<(String, bool)>, // (message, is_error)
     /// Every status message shown this session, oldest first.
@@ -790,6 +824,7 @@ impl App {
 
         let (probe_tx, probe_rx) = mpsc::channel();
         let (skills_tx, skills_rx) = mpsc::channel();
+        let (refs_tx, refs_rx) = mpsc::channel();
 
         let available_update = Arc::new(Mutex::new(None));
         let update_clone = Arc::clone(&available_update);
@@ -831,6 +866,14 @@ impl App {
             skills_cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             skills_tx,
             skills_rx,
+            refs_status: BTreeMap::new(),
+            refs_info: BTreeMap::new(),
+            refs_info_loaded: false,
+            refs_busy: false,
+            refs_progress: (0, 0),
+            refs_failures: Vec::new(),
+            refs_tx,
+            refs_rx,
             mode: initial_mode,
             status_message,
             status_log: Vec::new(),
@@ -1838,38 +1881,29 @@ impl App {
         }
     }
 
+    // ── Refs (git work runs on a worker thread, results arrive as events) ──
+
+    fn refs_cache_dir(&self) -> std::path::PathBuf {
+        self.paths
+            .as_ref()
+            .map(|p| p.refs_cache_dir.clone())
+            .unwrap_or_else(|| std::path::PathBuf::from("refs"))
+    }
+
     /// Clones or updates the currently selected reference documentation repository.
     pub fn clone_or_update_selected_ref(&mut self, _force_update: bool) {
-        let Some((alias, entry)) = self
+        let Some(alias) = self
             .loaded
             .refs
             .refs
-            .iter()
+            .keys()
             .nth(self.refs_selected)
-            .map(|(a, e)| (a.clone(), e.clone()))
+            .cloned()
         else {
             self.status_message = Some(("No reference repository selected".to_string(), true));
             return;
         };
-
-        let cache_dir = self
-            .paths
-            .as_ref()
-            .map(|p| p.refs_cache_dir.clone())
-            .unwrap_or_else(|| std::path::PathBuf::from("refs"));
-        let target_path = self.loaded.refs.effective_path(&alias, &entry, &cache_dir);
-
-        match crate::domain::refs::clone_or_update_ref(&alias, &entry, &target_path) {
-            Ok(msg) => {
-                self.status_message = Some((format!("✓ {msg}"), false));
-                self.trigger_mascot_reaction(MascotReaction::Casting, Duration::from_millis(750));
-                self.emit_fx(FxTrigger::Synced);
-            }
-            Err(e) => {
-                self.status_message = Some((format!("✗ Ref operation failed: {e}"), true));
-                self.trigger_mascot_reaction(MascotReaction::Startled, Duration::from_millis(800));
-            }
-        }
+        self.spawn_refs_job(vec![alias]);
     }
 
     /// Clones or updates every registered reference repository (Refs view, `s`).
@@ -1878,39 +1912,153 @@ impl App {
             self.status_message = Some(("No reference repositories registered".to_string(), true));
             return;
         }
+        let aliases = self.loaded.refs.refs.keys().cloned().collect();
+        self.spawn_refs_job(aliases);
+    }
 
-        let cache_dir = self
-            .paths
-            .as_ref()
-            .map(|p| p.refs_cache_dir.clone())
-            .unwrap_or_else(|| std::path::PathBuf::from("refs"));
-
-        let total = self.loaded.refs.refs.len();
-        let mut failures = Vec::new();
-        for (alias, entry) in &self.loaded.refs.refs {
-            let target_path = self.loaded.refs.effective_path(alias, entry, &cache_dir);
-            if let Err(e) = crate::domain::refs::clone_or_update_ref(alias, entry, &target_path) {
-                failures.push(e);
-            }
+    fn spawn_refs_job(&mut self, aliases: Vec<String>) {
+        if self.refs_busy {
+            self.status_message = Some(("A refs update is already running".to_string(), true));
+            return;
+        }
+        let cache_dir = self.refs_cache_dir();
+        let work: Vec<_> = aliases
+            .iter()
+            .filter_map(|alias| {
+                let entry = self.loaded.refs.refs.get(alias)?;
+                let path = self.loaded.refs.effective_path(alias, entry, &cache_dir);
+                Some((alias.clone(), entry.clone(), path))
+            })
+            .collect();
+        if work.is_empty() {
+            return;
         }
 
-        if failures.is_empty() {
-            self.status_message = Some((format!("✓ Updated {total}/{total} refs"), false));
-            self.trigger_mascot_reaction(MascotReaction::Casting, Duration::from_millis(750));
-            self.emit_fx(FxTrigger::Synced);
-        } else {
-            self.status_message = Some((
-                format!(
-                    "✗ Updated {}/{total} refs: {}",
-                    total - failures.len(),
-                    failures.join("; ")
-                ),
-                true,
-            ));
-            self.trigger_mascot_reaction(MascotReaction::Startled, Duration::from_millis(800));
+        self.refs_busy = true;
+        self.refs_progress = (0, work.len());
+        self.refs_failures.clear();
+        self.status_message = Some((format!("… Updating {} ref(s)", work.len()), false));
+        let tx = self.refs_tx.clone();
+        std::thread::spawn(move || {
+            for (alias, entry, path) in work {
+                let result = crate::domain::refs::clone_or_update_ref(&alias, &entry, &path);
+                let info = crate::domain::refs::repo_info(&path);
+                let time = chrono::Local::now().format("%H:%M").to_string();
+                let event = RefsEvent::Updated {
+                    alias,
+                    result,
+                    time,
+                    info,
+                };
+                if tx.send(event).is_err() {
+                    return;
+                }
+            }
+            let _ = tx.send(RefsEvent::Finished);
+        });
+    }
+
+    /// Re-reads the state (branch, commit, dirty, shallow) of every clone in the background.
+    pub fn refresh_refs_info(&mut self) {
+        self.refs_info_loaded = true;
+        let cache_dir = self.refs_cache_dir();
+        let paths: Vec<(String, std::path::PathBuf)> = self
+            .loaded
+            .refs
+            .refs
+            .iter()
+            .map(|(alias, entry)| {
+                (
+                    alias.clone(),
+                    self.loaded.refs.effective_path(alias, entry, &cache_dir),
+                )
+            })
+            .collect();
+        let tx = self.refs_tx.clone();
+        std::thread::spawn(move || {
+            let info = paths
+                .into_iter()
+                .filter_map(|(alias, path)| Some((alias, crate::domain::refs::repo_info(&path)?)))
+                .collect();
+            let _ = tx.send(RefsEvent::Info(info));
+        });
+    }
+
+    fn ensure_refs_info_loaded(&mut self) {
+        if self.section == WorkspaceSection::Refs && !self.refs_info_loaded {
+            self.refresh_refs_info();
         }
     }
 
+    /// Drains finished refs work; returns true when state changed.
+    pub fn poll_refs_events(&mut self) -> bool {
+        let mut any = false;
+        while let Ok(event) = self.refs_rx.try_recv() {
+            any = true;
+            match event {
+                RefsEvent::Updated {
+                    alias,
+                    result,
+                    time,
+                    info,
+                } => {
+                    self.refs_progress.0 += 1;
+                    let (ok, message) = match result {
+                        Ok(message) => (true, message),
+                        Err(error) => {
+                            self.refs_failures.push(error.clone());
+                            (false, error)
+                        }
+                    };
+                    self.refs_status
+                        .insert(alias.clone(), RefStatus { ok, message, time });
+                    match info {
+                        Some(info) => {
+                            self.refs_info.insert(alias, info);
+                        }
+                        None => {
+                            self.refs_info.remove(&alias);
+                        }
+                    }
+                    self.status_message = Some((
+                        format!(
+                            "… Updating refs ({}/{})",
+                            self.refs_progress.0, self.refs_progress.1
+                        ),
+                        false,
+                    ));
+                }
+                RefsEvent::Info(info) => self.refs_info = info,
+                RefsEvent::Finished => {
+                    self.refs_busy = false;
+                    let total = self.refs_progress.1;
+                    if self.refs_failures.is_empty() {
+                        self.status_message =
+                            Some((format!("✓ Updated {total}/{total} refs"), false));
+                        self.trigger_mascot_reaction(
+                            MascotReaction::Casting,
+                            Duration::from_millis(750),
+                        );
+                        self.emit_fx(FxTrigger::Synced);
+                    } else {
+                        self.status_message = Some((
+                            format!(
+                                "✗ Updated {}/{total} refs: {}",
+                                total - self.refs_failures.len(),
+                                self.refs_failures.join("; ")
+                            ),
+                            true,
+                        ));
+                        self.trigger_mascot_reaction(
+                            MascotReaction::Startled,
+                            Duration::from_millis(800),
+                        );
+                    }
+                }
+            }
+        }
+        any
+    }
     /// Reloads `config.toml`, `mcp.toml`, and enabled harness configs from disk and reconciles
     /// external edits against the current canonical registry.
     pub fn refresh_from_disk(&mut self, silent_if_unchanged: bool) {
@@ -2295,6 +2443,7 @@ impl App {
         }
         self.details_scroll = 0;
         self.ensure_skills_loaded();
+        self.ensure_refs_info_loaded();
         self.emit_fx(FxTrigger::SelectionChanged);
     }
 
@@ -2364,6 +2513,7 @@ impl App {
             Action::ToggleWorkspaceSection => {
                 self.section = self.section.toggle();
                 self.ensure_skills_loaded();
+                self.ensure_refs_info_loaded();
                 self.details_scroll = 0;
                 self.emit_fx(FxTrigger::SelectionChanged);
             }
@@ -2392,6 +2542,7 @@ impl App {
                 if self.section != WorkspaceSection::Refs {
                     self.section = WorkspaceSection::Refs;
                     self.details_scroll = 0;
+                    self.ensure_refs_info_loaded();
                     self.emit_fx(FxTrigger::SelectionChanged);
                 }
             }
@@ -2989,6 +3140,10 @@ impl App {
             }
             Action::RefreshFromDisk if self.section == WorkspaceSection::Skills => {
                 self.refresh_skills();
+            }
+            Action::RefreshFromDisk if self.section == WorkspaceSection::Refs => {
+                self.refresh_from_disk(false);
+                self.refresh_refs_info();
             }
             Action::RefreshFromDisk => {
                 self.refresh_from_disk(false);
@@ -4758,6 +4913,12 @@ mod tests {
         let mut app = App::new(Some(paths), loaded, 100, 30);
         app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(app.refs_busy, "the update runs in the background");
+        wait_for_refs(&mut app);
+        assert!(
+            app.refs_status.values().all(|s| !s.ok),
+            "each failure is recorded per repo"
+        );
 
         let (msg, is_error) = app.status_message.clone().expect("status after s");
         assert!(is_error, "failed refs must be reported: {msg}");
@@ -5071,5 +5232,98 @@ mod tests {
         }
         assert_eq!(app.status_log.len(), STATUS_LOG_CAP);
         assert_eq!(app.status_log[0].text, "message 20");
+    }
+
+    /// Polls the refs worker until it finishes (jobs only complete when polled, like the event loop).
+    fn wait_for_refs(app: &mut App) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while app.refs_busy {
+            app.poll_refs_events();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "refs update timed out"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        app.poll_refs_events();
+    }
+
+    #[test]
+    fn refs_update_all_runs_in_background_with_per_repo_results_and_clone_info() {
+        use crate::domain::refs::test_support::{file_url, make_origin};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = StoragePaths::in_dir(dir.path());
+        let mut loaded = LoadedConfigs::load(&paths).expect("load");
+        for name in ["alpha", "beta"] {
+            make_origin(
+                &dir.path().join(format!("origin-{name}")),
+                &format!("{name} docs"),
+            );
+            loaded.refs.refs.insert(
+                name.to_string(),
+                crate::domain::refs::RefRepoEntry {
+                    url: file_url(&dir.path().join(format!("origin-{name}"))),
+                    branch: None,
+                    description: None,
+                    path: None,
+                },
+            );
+        }
+        loaded.refs.refs.insert(
+            "broken".to_string(),
+            crate::domain::refs::RefRepoEntry {
+                url: "file:///maga-test-nonexistent/broken".to_string(),
+                branch: None,
+                description: None,
+                path: None,
+            },
+        );
+
+        std::fs::write(
+            &paths.refs_toml,
+            loaded.refs.to_toml().expect("serialize refs"),
+        )
+        .unwrap();
+        let mut app = App::new(Some(paths.clone()), loaded, 120, 30);
+        let press = |app: &mut App, c: char| {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        };
+        press(&mut app, '4');
+        press(&mut app, 's');
+        assert!(app.refs_busy);
+        press(&mut app, 's');
+        let (msg, is_error) = app.status_message.clone().expect("status");
+        assert!(is_error && msg.contains("already running"), "{msg}");
+
+        wait_for_refs(&mut app);
+        assert!(!app.refs_busy);
+        assert!(app.refs_status["alpha"].ok && app.refs_status["beta"].ok);
+        assert!(
+            !app.refs_status["broken"].ok,
+            "the failing repo is reported on its own"
+        );
+        assert_eq!(app.refs_status["alpha"].time.len(), 5, "HH:MM");
+        let (msg, is_error) = app.status_message.clone().expect("final status");
+        assert!(is_error && msg.contains("Updated 2/3 refs"), "{msg}");
+
+        let info = &app.refs_info["alpha"];
+        assert_eq!(info.subject, "alpha docs");
+        assert_eq!(info.branch.as_deref(), Some("main"));
+        assert!(info.shallow && info.dirty == 0);
+        assert!(!app.refs_info.contains_key("broken"));
+
+        // `r` re-reads the clones: a local edit shows up as a dirty work tree.
+        std::fs::write(paths.refs_cache_dir.join("alpha").join("doc.md"), "edited").unwrap();
+        press(&mut app, 'r');
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while app.refs_info.get("alpha").is_none_or(|i| i.dirty == 0) {
+            app.poll_refs_events();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "info refresh timed out"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }

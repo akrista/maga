@@ -1958,4 +1958,54 @@ mod tests {
         );
         assert!(frame.contains("not drift"));
     }
+
+    #[test]
+    fn refs_view_shows_per_repo_result_and_clone_state() {
+        use crate::app::RefStatus;
+        use crate::domain::refs::{RefRepoEntry, RepoInfo};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = build_test_app(130, 40);
+        app.loaded.refs.refs.insert(
+            "pangolin".to_string(),
+            RefRepoEntry {
+                url: "https://github.com/fosrl/docs-v2".to_string(),
+                branch: None,
+                description: None,
+                path: None,
+            },
+        );
+        app.refs_status.insert(
+            "pangolin".to_string(),
+            RefStatus {
+                ok: true,
+                message: "Updated ref 'pangolin'".to_string(),
+                time: "19:22".to_string(),
+            },
+        );
+        app.refs_info.insert(
+            "pangolin".to_string(),
+            RepoInfo {
+                branch: Some("main".to_string()),
+                commit: "6f0d15b".to_string(),
+                date: "2026-11-27".to_string(),
+                subject: "Merge pull request #153".to_string(),
+                dirty: 3,
+                shallow: true,
+            },
+        );
+        app.refs_info_loaded = true;
+        app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+
+        let frame = render_to_string(130, 40, &app, false);
+        assert!(frame.contains("✓ 19:22"), "per-repo result column");
+        assert!(frame.contains("main · 6f0d15b · 2026-11-27"));
+        assert!(frame.contains("Merge pull request #153"));
+        assert!(frame.contains("3 modified or untracked path(s)"));
+        assert!(frame.contains("shallow (depth 1)"));
+
+        app.refs_busy = true;
+        app.refs_progress = (1, 4);
+        assert!(render_to_string(130, 40, &app, false).contains("updating 1/4"));
+    }
 }

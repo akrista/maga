@@ -1282,7 +1282,19 @@ fn draw_refs_list(
         })
         .count();
 
-    let title = format!(" OFFLINE REFERENCES ({cloned_count}/{total} Cloned) ");
+    let progress = if app.refs_busy {
+        format!(
+            " · updating {}/{}…",
+            app.refs_progress.0, app.refs_progress.1
+        )
+    } else {
+        String::new()
+    };
+    let title = if app.refs_busy {
+        format!(" OFFLINE REFERENCES{progress} ")
+    } else {
+        format!(" OFFLINE REFERENCES ({cloned_count}/{total} Cloned) ")
+    };
     let border_style = if matches!(app.mode, ActiveMode::Normal) && !app.details_focused {
         theme.active_border
     } else {
@@ -1342,14 +1354,20 @@ fn draw_refs_list(
                 theme.base
             };
 
+            let (result_text, result_style) = match app.refs_status.get(alias) {
+                Some(s) if s.ok => (format!("✓ {}", s.time), theme.success),
+                Some(s) => (format!("✗ {}", s.time), theme.error),
+                None => (String::new(), theme.muted),
+            };
             let path_str = target_path.display().to_string();
-            let path_avail_width = inner.width.saturating_sub(35) as usize;
+            let path_avail_width = inner.width.saturating_sub(45) as usize;
             let truncated_path = truncate_display_width(&path_str, path_avail_width.max(10));
 
             let line = Line::from(vec![
                 Span::styled(cursor, theme.accent),
                 Span::styled(format!("{:<16} ", alias), row_style),
                 Span::styled(format!("{:<15} ", badge), badge_style),
+                Span::styled(format!("{result_text:<9} "), result_style),
                 Span::styled(truncated_path, theme.muted),
             ]);
 
@@ -1423,6 +1441,62 @@ fn draw_refs_detail_panel(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             Span::styled("Clone State:  ", theme.muted),
             Span::styled(status_text, status_style),
         ]));
+
+        if let Some(info) = app.refs_info.get(alias) {
+            lines.push(Line::from(vec![
+                Span::styled("Branch:       ", theme.muted),
+                Span::styled(
+                    format!(
+                        "{} · {} · {}",
+                        info.branch.as_deref().unwrap_or("detached HEAD"),
+                        info.commit,
+                        info.date
+                    ),
+                    theme.base,
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Last commit:  ", theme.muted),
+                Span::styled(info.subject.clone(), theme.base),
+            ]));
+            let (tree_text, tree_style) = if info.dirty == 0 {
+                ("clean".to_string(), theme.success)
+            } else {
+                (
+                    format!(
+                        "{} modified or untracked path(s): an update discards them",
+                        info.dirty
+                    ),
+                    theme.warning,
+                )
+            };
+            lines.push(Line::from(vec![
+                Span::styled("Work tree:    ", theme.muted),
+                Span::styled(tree_text, tree_style),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("History:      ", theme.muted),
+                Span::styled(
+                    if info.shallow {
+                        "shallow (depth 1)"
+                    } else {
+                        "full clone"
+                    },
+                    theme.base,
+                ),
+            ]));
+        }
+        if let Some(last) = app.refs_status.get(alias) {
+            let (mark, style) = if last.ok {
+                ("✓", theme.success)
+            } else {
+                ("✗", theme.error)
+            };
+            lines.push(Line::from(vec![
+                Span::styled("Last update:  ", theme.muted),
+                Span::styled(format!("{mark} {} · {}", last.time, last.message), style),
+            ]));
+        }
     } else {
         lines.push(Line::from(Span::styled(
             "No reference selected.",
@@ -1449,7 +1523,7 @@ fn draw_refs_detail_panel(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     ]));
     lines.push(Line::from(vec![
         Span::styled("  s          ", theme.accent),
-        Span::styled("Update all references", theme.base),
+        Span::styled("Update all references (in the background)", theme.base),
     ]));
     lines.push(Line::from(vec![
         Span::styled("  r          ", theme.accent),

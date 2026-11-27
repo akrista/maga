@@ -25,6 +25,7 @@ where
 
     loop {
         app.poll_probe_results();
+        app.poll_skills_events();
 
         if app.auto_refresh_enabled()
             && app.mode == ActiveMode::Normal

@@ -9,5 +9,6 @@ pub mod plugins;
 pub mod probe;
 pub mod reconcile;
 pub mod refs;
+pub mod skills;
 pub mod storage;
 pub mod update;

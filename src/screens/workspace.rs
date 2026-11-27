@@ -36,6 +36,7 @@ pub fn draw_workspace(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             WorkspaceSection::Plugins => draw_plugin_list(f, area, app, theme, &fx_areas),
             WorkspaceSection::Guidelines => draw_guidelines_list(f, area, app, theme, &fx_areas),
             WorkspaceSection::Refs => draw_refs_list(f, area, app, theme, &fx_areas),
+            WorkspaceSection::Skills => draw_skills_list(f, area, app, theme, &fx_areas),
         }
         return;
     }
@@ -51,6 +52,7 @@ pub fn draw_workspace(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         WorkspaceSection::Plugins => draw_plugin_list(f, columns[0], app, theme, &fx_areas),
         WorkspaceSection::Guidelines => draw_guidelines_list(f, columns[0], app, theme, &fx_areas),
         WorkspaceSection::Refs => draw_refs_list(f, columns[0], app, theme, &fx_areas),
+        WorkspaceSection::Skills => draw_skills_list(f, columns[0], app, theme, &fx_areas),
     }
 
     let show_hero_showcase = hero_mascot_enabled
@@ -75,6 +77,7 @@ pub fn draw_workspace(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 draw_guidelines_detail_panel(f, right_rows[0], app, theme)
             }
             WorkspaceSection::Refs => draw_refs_detail_panel(f, right_rows[0], app, theme),
+            WorkspaceSection::Skills => draw_skills_detail_panel(f, right_rows[0], app, theme),
         }
         draw_companion_panel(f, right_rows[1], app, theme, &fx_areas);
     } else {
@@ -84,6 +87,7 @@ pub fn draw_workspace(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             WorkspaceSection::Plugins => draw_plugin_detail_panel(f, columns[1], app, theme),
             WorkspaceSection::Guidelines => draw_guidelines_detail_panel(f, columns[1], app, theme),
             WorkspaceSection::Refs => draw_refs_detail_panel(f, columns[1], app, theme),
+            WorkspaceSection::Skills => draw_skills_detail_panel(f, columns[1], app, theme),
         }
     }
 
@@ -1437,7 +1441,10 @@ fn draw_refs_detail_panel(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     ]));
     lines.push(Line::from(vec![
         Span::styled("  u          ", theme.accent),
-        Span::styled("Pull latest commits (git pull --depth 1)", theme.base),
+        Span::styled(
+            "Fetch and reset to origin (survives history rewrites)",
+            theme.base,
+        ),
     ]));
     lines.push(Line::from(vec![
         Span::styled("  e / E      ", theme.accent),
@@ -1445,10 +1452,7 @@ fn draw_refs_detail_panel(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     ]));
     lines.push(Line::from(vec![
         Span::styled("  s          ", theme.accent),
-        Span::styled(
-            "Re-synchronize guidelines and update offline lookup index",
-            theme.base,
-        ),
+        Span::styled("Update all references", theme.base),
     ]));
     lines.push(Line::from(vec![
         Span::styled("  r          ", theme.accent),
@@ -1457,6 +1461,221 @@ fn draw_refs_detail_panel(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
     let p = Paragraph::new(lines).block(block);
     f.render_widget(p, area);
+}
+
+fn skills_harness_tag(kind: HarnessKind) -> &'static str {
+    match kind {
+        HarnessKind::Antigravity => "AGY",
+        HarnessKind::Claude => "CLD",
+        HarnessKind::Copilot => "GHC",
+        HarnessKind::Grok => "GRK",
+        HarnessKind::OpenCode => "OPC",
+    }
+}
+
+fn draw_skills_list(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+    _fx_areas: &crate::fx::FxAreas,
+) {
+    let total = app.skills.len();
+    let selected_idx = app.skills_selected.min(total.saturating_sub(1));
+    let busy = app
+        .skills_busy
+        .as_deref()
+        .map(|b| format!(" · {b}…"))
+        .unwrap_or_default();
+    let border_style = if matches!(app.mode, ActiveMode::Normal) && !app.details_focused {
+        theme.active_border
+    } else {
+        theme.border
+    };
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" SKILLS ({total}){busy} "),
+            theme.header,
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .padding(Padding::new(PADDING_SM, PADDING_SM, PADDING_XS, PADDING_XS));
+
+    if app.skills.is_empty() {
+        let text = if app.skills_loaded {
+            "No skills installed."
+        } else {
+            "Loading skills…"
+        };
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(text, theme.muted)),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Press ", theme.muted),
+                Span::styled("f", theme.accent),
+                Span::styled(" to search skills.sh or ", theme.muted),
+                Span::styled("a", theme.accent),
+                Span::styled(" to install by name.", theme.muted),
+            ]),
+        ];
+        f.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
+
+    let inner = block.inner(area);
+    let name_width = (inner.width as usize)
+        .saturating_sub(4 + 4 + HarnessKind::ALL.len() * 4)
+        .clamp(10, 40);
+
+    let mut header = vec![Span::styled(
+        format!("{:<w$}", "", w = 2 + 4 + name_width),
+        theme.muted,
+    )];
+    for (col, kind) in HarnessKind::ALL.into_iter().enumerate() {
+        let style = if col == app.skills_col {
+            theme.accent
+        } else {
+            theme.muted
+        };
+        header.push(Span::styled(
+            format!("{} ", skills_harness_tag(kind)),
+            style,
+        ));
+    }
+    let mut items: Vec<ListItem> = Vec::new();
+    items.extend(app.skills.iter().enumerate().map(|(idx, skill)| {
+        let is_selected = idx == selected_idx;
+        let row_style = if is_selected {
+            theme.highlight
+        } else {
+            theme.base
+        };
+        let tag = if skill.scope() == crate::domain::skills::SkillScope::Project {
+            "[P] "
+        } else {
+            "[G] "
+        };
+        let mut spans = vec![
+            Span::styled(if is_selected { "▸ " } else { "  " }, theme.accent),
+            Span::styled(tag, theme.muted),
+            Span::styled(
+                format!(
+                    "{:<w$}",
+                    truncate_display_width(&skill.name, name_width),
+                    w = name_width
+                ),
+                row_style,
+            ),
+        ];
+        for (col, kind) in HarnessKind::ALL.into_iter().enumerate() {
+            let (mark, style) = if skill.enabled_for(kind) {
+                ("●", theme.success)
+            } else {
+                ("·", theme.muted)
+            };
+            let style = if is_selected && col == app.skills_col {
+                theme.highlight
+            } else {
+                style
+            };
+            spans.push(Span::styled(format!(" {mark}  "), style));
+        }
+        ListItem::new(Line::from(spans))
+    }));
+
+    f.render_widget(block, area);
+    let [header_area, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+    f.render_widget(Paragraph::new(Line::from(header)), header_area);
+    let mut state = ListState::default().with_selected(Some(selected_idx));
+    f.render_stateful_widget(List::new(items), list_area, &mut state);
+}
+
+fn draw_skills_detail_panel(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let border_style = if app.details_focused {
+        theme.active_border
+    } else {
+        theme.border
+    };
+    let block = Block::default()
+        .title(Span::styled(" SKILL INSPECTOR ", theme.header))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .padding(Padding::new(PADDING_SM, PADDING_SM, PADDING_XS, PADDING_XS));
+
+    let mut lines = Vec::new();
+    if let Some(skill) = app.skills.get(app.skills_selected) {
+        let scope = if skill.scope() == crate::domain::skills::SkillScope::Project {
+            "project (current directory)"
+        } else {
+            "global (~/.agents/skills)"
+        };
+        lines.push(Line::from(vec![
+            Span::styled("Name:     ", theme.header),
+            Span::styled(skill.name.clone(), theme.accent),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Scope:    ", theme.muted),
+            Span::styled(scope, theme.base),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Source:   ", theme.muted),
+            Span::styled(
+                skill
+                    .source
+                    .clone()
+                    .unwrap_or_else(|| "- (untracked)".into()),
+                theme.base,
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Path:     ", theme.muted),
+            Span::styled(skill.path.clone(), theme.base),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Harnesses:", theme.header)));
+        for (col, kind) in HarnessKind::ALL.into_iter().enumerate() {
+            let (mark, style) = if skill.enabled_for(kind) {
+                ("● active  ", theme.success)
+            } else {
+                ("· inactive", theme.muted)
+            };
+            let cursor = if col == app.skills_col { "▸ " } else { "  " };
+            lines.push(Line::from(vec![
+                Span::styled(cursor, theme.accent),
+                Span::styled(format!("{:<10}", kind.short_name()), theme.base),
+                Span::styled(mark, style),
+            ]));
+        }
+    } else {
+        lines.push(Line::from(Span::styled("No skill selected.", theme.muted)));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("Actions:", theme.header)));
+    for (keys, text) in [
+        ("  h / l      ", "Focus previous / next harness column"),
+        ("  Space      ", "Enable / disable for the focused harness"),
+        ("  f          ", "Search skills.sh and install"),
+        ("  a          ", "Install by name (owner/repo[@skill])"),
+        ("  Tab        ", "In the install dialog: global ⇄ project"),
+        ("  r          ", "Reload installed skills"),
+    ] {
+        lines.push(Line::from(vec![
+            Span::styled(keys, theme.accent),
+            Span::styled(text, theme.base),
+        ]));
+    }
+
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 pub fn truncate_display_width(text: &str, max_width: usize) -> String {

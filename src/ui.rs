@@ -1,5 +1,6 @@
-use crate::app::{ActiveMode, App, WorkspaceSection};
+use crate::app::{ActiveMode, App, SkillsInputPurpose, WorkspaceSection};
 use crate::domain::model::{HarnessKind, ProjectPolicy};
+use crate::domain::skills::SearchHit;
 use crate::mascot::{
     build_ascii_splash_lines, render_fullscreen_background_canvas_with_state, sparkle_glyph,
 };
@@ -143,6 +144,24 @@ pub fn draw(f: &mut Frame, app: &App, base_theme: &Theme) {
             fx_areas.active_modal.set(centered_rect(52, 8, area));
             draw_new_profile_modal(f, area, input, theme);
         }
+        ActiveMode::SkillsInput {
+            purpose,
+            input,
+            project,
+        } => {
+            fx_areas.active_modal.set(centered_rect(72, 10, area));
+            draw_skills_input_modal(f, area, *purpose, input, *project, theme);
+        }
+        ActiveMode::SkillsResults {
+            query,
+            hits,
+            selected,
+            project,
+        } => {
+            let height = (hits.len() + 7).clamp(10, 24) as u16;
+            fx_areas.active_modal.set(centered_rect(86, height, area));
+            draw_skills_results_modal(f, area, query, hits, *selected, *project, theme);
+        }
         ActiveMode::MatrixModal {
             server_name,
             selected,
@@ -268,6 +287,14 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             active_refs,
             total_refs,
         ),
+        WorkspaceSection::Skills => (
+            theme.muted,
+            theme.muted,
+            theme.muted,
+            theme.muted,
+            app.skills.len(),
+            app.skills.len(),
+        ),
     };
 
     let tab3_span = if area.width >= 105 {
@@ -297,6 +324,22 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         None
     };
 
+    let skills_tab_style = if app.section == WorkspaceSection::Skills {
+        theme.highlight
+    } else {
+        theme.muted
+    };
+    let tab5_span = if area.width >= 128 {
+        Some(Span::styled(
+            format!("[5: Skills ({})]", app.skills.len()),
+            skills_tab_style,
+        ))
+    } else if area.width >= 110 || app.section == WorkspaceSection::Skills {
+        Some(Span::styled("[5: Skills]".to_string(), skills_tab_style))
+    } else {
+        None
+    };
+
     let mut line1_spans = vec![
         Span::styled(format!(" {sp} maga "), theme.highlight),
         Span::styled(" · ", theme.header),
@@ -309,6 +352,10 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         line1_spans.push(s);
     }
     if let Some(s) = tab4_span {
+        line1_spans.push(Span::styled("  ", theme.base));
+        line1_spans.push(s);
+    }
+    if let Some(s) = tab5_span {
         line1_spans.push(Span::styled("  ", theme.base));
         line1_spans.push(s);
     }
@@ -344,7 +391,7 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             WorkspaceSection::Plugins => {
                 " Filter Plugins (name, desc, harness, skill/hook/mcp, is:/harness:/type:/desc:/skill:/hook:/mcp:) · Enter: keep · Esc: clear"
             }
-            WorkspaceSection::Guidelines | WorkspaceSection::Refs => {
+            WorkspaceSection::Guidelines | WorkspaceSection::Refs | WorkspaceSection::Skills => {
                 " Guidelines View · Esc: back to normal"
             }
         },
@@ -364,6 +411,10 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             " ↑/↓/j/k: Select · Enter: Apply · a: New · e: $EDITOR · d: Delete · Esc: Cancel"
         }
         ActiveMode::NewProfileModal { .. } => " Enter: Create & switch profile · Esc: Cancel",
+        ActiveMode::SkillsInput { .. } => " Enter: Run · Tab: global ⇄ project · Esc: Cancel",
+        ActiveMode::SkillsResults { .. } => {
+            " j/k: Move · Enter: Install · Tab: global ⇄ project · Esc: Close"
+        }
         ActiveMode::MatrixModal { .. } => {
             " ↑/↓/j/k: Navigate · Space: Toggle override · Enter/Esc: Close & Save"
         }
@@ -373,16 +424,19 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         }
         ActiveMode::Normal => match app.section {
             WorkspaceSection::Mcps => {
-                " Tab/1/2/3/4: view  j/k: nav  Space: toggle  w: profile  x: matrix  p/P: probe  t: tools  m: mascot  o: options  r/R: refresh  /: filter  a/e/E: edit  d: del  c: conflicts  ?: help  q: quit"
+                " Tab/1-5: view  j/k: nav  Space: toggle  w: profile  x: matrix  p/P: probe  t: tools  m: mascot  o: options  r/R: refresh  /: filter  a/e/E: edit  d: del  c: conflicts  ?: help  q: quit"
             }
             WorkspaceSection::Plugins => {
-                " Tab/1/2/3/4: view  j/k: nav  h/l: fold  Space/Enter: toggle/fold  E: edit config  d: del  t: details  m: mascot  o: options  r/R: refresh  /: filter  ?: help  q: quit"
+                " Tab/1-5: view  j/k: nav  h/l: fold  Space/Enter: toggle/fold  E: edit config  d: del  t: details  m: mascot  o: options  r/R: refresh  /: filter  ?: help  q: quit"
             }
             WorkspaceSection::Guidelines => {
-                " Tab/1/2/3/4: view  j/k: nav  e/Enter: edit AGENTS.md  s: resync links  t: details  r/R: refresh  ?: help  q: quit"
+                " Tab/1-5: view  j/k: nav  e/Enter: edit AGENTS.md  s: resync links  t: details  r/R: refresh  ?: help  q: quit"
             }
             WorkspaceSection::Refs => {
-                " Tab/1/2/3/4: view  j/k: nav  Enter: sync ref  r/R: refresh  ?: help  q: quit"
+                " Tab/1-5: view  j/k: nav  Enter: sync ref  u: update ref  s: update all  e: edit refs.toml  r/R: refresh  ?: help  q: quit"
+            }
+            WorkspaceSection::Skills => {
+                " Tab/1-5: view  j/k: nav  h/l: harness  Space: enable/disable  f: search  a: install by name  r: reload  ?: help  q: quit"
             }
         },
     };
@@ -746,6 +800,125 @@ fn draw_new_profile_modal(f: &mut Frame, area: Rect, input: &str, theme: &Theme)
     f.render_widget(p, modal);
 }
 
+fn skills_scope_line(project: bool, theme: &Theme) -> Line<'static> {
+    let (global, project_style) = if project {
+        (theme.muted, theme.highlight)
+    } else {
+        (theme.highlight, theme.muted)
+    };
+    Line::from(vec![
+        Span::styled("Scope: ", theme.muted),
+        Span::styled("[Global: ~/.agents/skills]", global),
+        Span::styled("  ", theme.base),
+        Span::styled("[Project: this directory]", project_style),
+        Span::styled("  (Tab)", theme.muted),
+    ])
+}
+
+fn draw_skills_input_modal(
+    f: &mut Frame,
+    area: Rect,
+    purpose: SkillsInputPurpose,
+    input: &str,
+    project: bool,
+    theme: &Theme,
+) {
+    let modal = centered_rect(72, 10, area);
+    f.render_widget(Clear, modal);
+    let (title, prompt, enter) = match purpose {
+        SkillsInputPurpose::Search => (
+            " ✦ SEARCH SKILLS.SH ✦ ",
+            "Search (e.g. react, tui, laravel):",
+            "[Enter: Search]",
+        ),
+        SkillsInputPurpose::Add => (
+            " ✦ INSTALL SKILL ✦ ",
+            "Package (owner/repo or owner/repo@skill):",
+            "[Enter: Install]",
+        ),
+    };
+    let block = Block::default()
+        .title(Span::styled(title, theme.header))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.accent)
+        .padding(Padding::new(PADDING_SM, PADDING_SM, PADDING_XS, PADDING_XS));
+    let mut lines = vec![
+        Line::from(Span::styled(prompt, theme.muted)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("▶ ", theme.accent),
+            Span::styled(input.to_string(), theme.highlight),
+            Span::styled("█", theme.accent),
+        ]),
+        Line::from(""),
+    ];
+    if purpose == SkillsInputPurpose::Add {
+        lines.push(skills_scope_line(project, theme));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("{enter}  [Esc: Cancel]"),
+        theme.muted,
+    )));
+    f.render_widget(Paragraph::new(lines).block(block), modal);
+}
+
+fn draw_skills_results_modal(
+    f: &mut Frame,
+    area: Rect,
+    query: &str,
+    hits: &[SearchHit],
+    selected: usize,
+    project: bool,
+    theme: &Theme,
+) {
+    let height = (hits.len() + 7).clamp(10, 24) as u16;
+    let modal = centered_rect(86, height, area);
+    f.render_widget(Clear, modal);
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" ✦ SKILLS FOR '{query}' ({}) ✦ ", hits.len()),
+            theme.header,
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.accent)
+        .padding(Padding::new(PADDING_SM, PADDING_SM, PADDING_XS, PADDING_XS));
+
+    let visible = (height as usize).saturating_sub(7).max(1);
+    let start = selected
+        .saturating_sub(visible / 2)
+        .min(hits.len().saturating_sub(visible));
+    let mut lines: Vec<Line> = hits
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(idx, hit)| {
+            let is_selected = idx == selected;
+            Line::from(vec![
+                Span::styled(if is_selected { "▸ " } else { "  " }, theme.accent),
+                Span::styled(
+                    format!("{:<52}", hit.package),
+                    if is_selected {
+                        theme.highlight
+                    } else {
+                        theme.base
+                    },
+                ),
+                Span::styled(format!("{} installs", hit.installs), theme.muted),
+            ])
+        })
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(skills_scope_line(project, theme));
+    lines.push(Line::from(Span::styled(
+        "[Enter: Install for enabled harnesses]  [j/k: Move]  [Esc: Close]",
+        theme.muted,
+    )));
+    f.render_widget(Paragraph::new(lines).block(block), modal);
+}
+
 fn help_modal_dimensions(area: Rect) -> (u16, u16) {
     let width = area.width.saturating_sub(4).clamp(68, 96);
     let height = area.height.saturating_sub(2).clamp(16, 36);
@@ -778,9 +951,9 @@ fn draw_help_modal(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             theme.header,
         )),
         Line::from(vec![
-            Span::styled("Tab / 1 / 2     ", theme.accent),
+            Span::styled("Tab / 1..5       ", theme.accent),
             Span::styled(
-                "Switch workspace view between 1: MCPs and 2: Plugins",
+                "Switch workspace view (1: MCPs · 2: Plugins · 3: Guidelines · 4: Refs · 5: Skills)",
                 theme.base,
             ),
         ]),
@@ -917,6 +1090,27 @@ fn draw_help_modal(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 "is:on|off  harness:<name>  type:plugin|npm|local  desc:  skill:  hook:  mcp:",
                 theme.muted,
             ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "── 5: SKILLS VIEW ([5: Skills]) ────────────────────────────────",
+            theme.header,
+        )),
+        Line::from(vec![
+            Span::styled("h / l           ", theme.accent),
+            Span::styled("Focus previous / next harness column", theme.base),
+        ]),
+        Line::from(vec![
+            Span::styled("Space / Enter   ", theme.accent),
+            Span::styled("Enable / disable the skill for that harness", theme.base),
+        ]),
+        Line::from(vec![
+            Span::styled("f               ", theme.accent),
+            Span::styled("Search skills.sh, Enter installs the result", theme.base),
+        ]),
+        Line::from(vec![
+            Span::styled("a               ", theme.accent),
+            Span::styled("Install by name; Tab: global ⇄ project", theme.base),
         ]),
         Line::from(""),
         Line::from(Span::styled(

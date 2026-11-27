@@ -101,6 +101,14 @@ Switch between the **MCP Servers (`1`)** and **Plugins (`2`)** workspace section
 - **Complete Native Uninstall (<kbd>d</kbd>)**: Pressing <kbd>d</kbd> (with <kbd>y</kbd>/<kbd>n</kbd> confirmation) removes the plugin from the harness's native config/registry files (including Claude's `settings.json` and `installed_plugins.json`), deletes its installed directory on disk, and prunes it from `~/.config/maga/plugins.toml`.
 
 ---
+### 3. Skills (<kbd>5</kbd>)
+
+A thin wrapper over the [`skills`](https://skills.sh) CLI (`bunx skills`, falling back to `npx -y skills`; override the launcher with `MAGA_SKILLS_CMD`). The CLI keeps ownership of the canonical copy in `~/.agents/skills` and of the per-agent links (`~/.claude/skills`, `~/.gemini/config/skills`, ...); maga never writes those paths itself.
+
+- **Search & install**: <kbd>f</kbd> runs `skills find`, <kbd>Enter</kbd> installs the highlighted result for every harness enabled in `config.toml`. <kbd>a</kbd> installs a package by name (`owner/repo` or `owner/repo@skill`). <kbd>Tab</kbd> in either dialog switches between **global** (`-g`) and **project** (the directory `maga` was started in).
+- **Per-harness activation**: the list shows one column per harness (`AGY CLD GHC GRK OPC`); <kbd>h</kbd>/<kbd>l</kbd> pick a column and <kbd>Space</kbd> unlinks (`skills remove -a`) or relinks (`skills add <source> -a`) the skill for that harness. Relinking needs the source recorded by the CLI, so hand-made skills can be unlinked but not relinked.
+- All CLI calls run on a worker thread; the title shows the running operation.
+
 
 ## Quick Start
 
@@ -226,7 +234,7 @@ Register maga itself in any harness's MCP config. Read tools (`list_servers`, `p
 
 | Key | Action |
 | :--- | :--- |
-| <kbd>Tab</kbd> / <kbd>Shift+Tab</kbd> · <kbd>1</kbd> / <kbd>2</kbd> | Switch active workspace section between **MCPs (`1`)** and **Plugins (`2`)** |
+| <kbd>Tab</kbd> / <kbd>Shift+Tab</kbd> · <kbd>1</kbd>..<kbd>5</kbd> | Switch workspace section: **MCPs (`1`)**, **Plugins (`2`)**, **Guidelines (`3`)**, **Refs (`4`)**, **Skills (`5`)** |
 | <kbd>j</kbd> / <kbd>k</kbd> / <kbd>↑</kbd> / <kbd>↓</kbd> | Navigate active list (or scroll `DETAILS` tools when `t` focus is active) |
 | <kbd>PgUp</kbd> / <kbd>PgDn</kbd> / <kbd>Ctrl+u</kbd> / <kbd>Ctrl+d</kbd> | Jump 10 rows up / down |
 | <kbd>g</kbd> / <kbd>G</kbd> / <kbd>Home</kbd> / <kbd>End</kbd> | Jump to first / last row |
@@ -245,6 +253,7 @@ Register maga itself in any harness's MCP config. Read tools (`list_servers`, `p
 | <kbd>o</kbd> | Open the interactive **Options (`config.toml`)** modal |
 | <kbd>r</kbd> / <kbd>R</kbd> | Reload & reconcile configs from disk now / Toggle periodic auto-refresh on or off |
 | <kbd>s</kbd> | Force push in-memory canonical registry to disk now (Guidelines: sync links · Refs: update all refs) |
+| <kbd>h</kbd> / <kbd>l</kbd> · <kbd>Space</kbd> · <kbd>f</kbd> · <kbd>a</kbd> | **Skills** view: focus harness column · enable / disable the skill for it · search skills.sh and install · install by name (<kbd>Tab</kbd> in the dialog: global ⇄ project) |
 | <kbd>?</kbd> | Open Keyboard Shortcuts & ASCII Witch splash modal |
 | <kbd>q</kbd> / <kbd>Ctrl+C</kbd> | Quit `maga` |
 

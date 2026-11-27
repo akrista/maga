@@ -10,6 +10,7 @@ use crate::domain::reconcile::{
     ConflictResolution, McpConflict, ReconcileOutcome, harness_maps_match_with_env,
     reconcile_harnesses_with_env, reconcile_live_reload_harnesses_with_env,
 };
+use crate::domain::skills::{self, InstalledSkill, SearchHit, SkillScope};
 use crate::domain::storage::{LoadedConfigs, StoragePaths};
 use crate::fx::{FxEngine, FxTrigger};
 use crate::keybind::{Action, map_workspace_key};
@@ -21,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-/// Active workspace view tab (`MCPs` vs. `Plugins` vs. `Guidelines` vs. `Refs`).
+/// Active workspace view tab (`MCPs` vs. `Plugins` vs. `Guidelines` vs. `Refs` vs. `Skills`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WorkspaceSection {
     #[default]
@@ -29,6 +30,7 @@ pub enum WorkspaceSection {
     Plugins,
     Guidelines,
     Refs,
+    Skills,
 }
 
 impl WorkspaceSection {
@@ -37,7 +39,8 @@ impl WorkspaceSection {
             Self::Mcps => Self::Plugins,
             Self::Plugins => Self::Guidelines,
             Self::Guidelines => Self::Refs,
-            Self::Refs => Self::Mcps,
+            Self::Refs => Self::Skills,
+            Self::Skills => Self::Mcps,
         }
     }
 }
@@ -56,6 +59,30 @@ pub enum PluginRow {
         harness: HarnessKind,
         index: usize,
         plugin: HarnessPlugin,
+    },
+}
+
+/// What the Skills text-input modal does with its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillsInputPurpose {
+    /// Search skills.sh (`skills find`).
+    Search,
+    /// Install a package given by name (`owner/repo` or `owner/repo@skill`).
+    Add,
+}
+
+/// Result of a background `skills` CLI job.
+#[derive(Debug)]
+pub enum SkillsEvent {
+    Listed(Result<Vec<InstalledSkill>, String>),
+    Searched {
+        query: String,
+        project: bool,
+        result: Result<Vec<SearchHit>, String>,
+    },
+    Finished {
+        message: String,
+        ok: bool,
     },
 }
 
@@ -88,6 +115,17 @@ pub enum ActiveMode {
     },
     NewProfileModal {
         input: String,
+    },
+    SkillsInput {
+        purpose: SkillsInputPurpose,
+        input: String,
+        project: bool,
+    },
+    SkillsResults {
+        query: String,
+        hits: Vec<SearchHit>,
+        selected: usize,
+        project: bool,
     },
     Help,
 }
@@ -591,6 +629,17 @@ pub struct App {
     pub guidelines_statuses: Vec<crate::domain::guidelines::GuidelineStatus>,
     pub guidelines_selected: usize,
     pub refs_selected: usize,
+    pub skills: Vec<InstalledSkill>,
+    pub skills_selected: usize,
+    /// Focused harness column (index into `HarnessKind::ALL`) for the Skills view.
+    pub skills_col: usize,
+    pub skills_loaded: bool,
+    /// Spawn `skills` CLI jobs on their own (tests turn this off).
+    pub skills_autoload: bool,
+    pub skills_busy: Option<String>,
+    pub skills_cwd: PathBuf,
+    pub skills_tx: mpsc::Sender<SkillsEvent>,
+    pub skills_rx: mpsc::Receiver<SkillsEvent>,
     pub mode: ActiveMode,
     pub status_message: Option<(String, bool)>, // (message, is_error)
     pub pending_editor: Option<EditorRequest>,
@@ -673,6 +722,7 @@ impl App {
         };
 
         let (probe_tx, probe_rx) = mpsc::channel();
+        let (skills_tx, skills_rx) = mpsc::channel();
 
         let available_update = Arc::new(Mutex::new(None));
         let update_clone = Arc::clone(&available_update);
@@ -705,6 +755,15 @@ impl App {
                 .unwrap_or_default(),
             guidelines_selected: 0,
             refs_selected: 0,
+            skills: Vec::new(),
+            skills_selected: 0,
+            skills_col: 1,
+            skills_loaded: false,
+            skills_autoload: !cfg!(test),
+            skills_busy: None,
+            skills_cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            skills_tx,
+            skills_rx,
             mode: initial_mode,
             status_message,
             pending_editor: None,
@@ -846,6 +905,8 @@ impl App {
             | ActiveMode::ProfilesModal { .. }
             | ActiveMode::MatrixModal { .. }
             | ActiveMode::NewProfileModal { .. }
+            | ActiveMode::SkillsInput { .. }
+            | ActiveMode::SkillsResults { .. }
             | ActiveMode::Help => {
                 self.gaze_target = (0.0, 0.0);
             }
@@ -872,6 +933,7 @@ impl App {
                         WorkspaceSection::Refs => {
                             (self.loaded.refs.refs.len(), self.refs_selected, 0)
                         }
+                        WorkspaceSection::Skills => (self.skills.len(), self.skills_selected, 0),
                     };
                     if visible_len == 0 {
                         self.gaze_target = (-0.30, 0.0);
@@ -1048,6 +1110,230 @@ impl App {
                 false,
             ));
         }
+    }
+
+    // ── Skills (wraps the `skills` CLI; every call runs on a worker thread) ──
+
+    fn skills_scope(project: bool) -> SkillScope {
+        if project {
+            SkillScope::Project
+        } else {
+            SkillScope::Global
+        }
+    }
+
+    fn spawn_skills_job(
+        &mut self,
+        label: &str,
+        job: impl FnOnce() -> SkillsEvent + Send + 'static,
+    ) {
+        if !self.skills_autoload {
+            return;
+        }
+        if self.skills_busy.is_some() {
+            self.status_message = Some(("A skills operation is already running".to_string(), true));
+            return;
+        }
+        self.skills_busy = Some(label.to_string());
+        self.status_message = Some((format!("… {label}"), false));
+        let tx = self.skills_tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(job());
+        });
+    }
+
+    /// Reloads global + project skills from the CLI.
+    pub fn refresh_skills(&mut self) {
+        let cwd = self.skills_cwd.clone();
+        self.spawn_skills_job("Loading skills", move || {
+            SkillsEvent::Listed(skills::list_installed(&cwd))
+        });
+    }
+
+    fn ensure_skills_loaded(&mut self) {
+        if self.section == WorkspaceSection::Skills && !self.skills_loaded {
+            self.refresh_skills();
+        }
+    }
+
+    /// Drains finished `skills` CLI jobs; returns true when state changed.
+    pub fn poll_skills_events(&mut self) -> bool {
+        let mut any = false;
+        while let Ok(ev) = self.skills_rx.try_recv() {
+            any = true;
+            self.skills_busy = None;
+            match ev {
+                SkillsEvent::Listed(Ok(list)) => {
+                    self.skills = list;
+                    self.skills_loaded = true;
+                    self.skills_selected = self
+                        .skills_selected
+                        .min(self.skills.len().saturating_sub(1));
+                    self.status_message = Some((format!("✓ {} skills", self.skills.len()), false));
+                }
+                SkillsEvent::Listed(Err(e)) => {
+                    self.status_message = Some((format!("✗ {e}"), true));
+                }
+                SkillsEvent::Searched {
+                    query,
+                    project,
+                    result,
+                } => match result {
+                    Ok(hits) if hits.is_empty() => {
+                        self.status_message =
+                            Some((format!("No skills found for '{query}'"), true));
+                    }
+                    Ok(hits) => {
+                        self.status_message = None;
+                        self.mode = ActiveMode::SkillsResults {
+                            query,
+                            hits,
+                            selected: 0,
+                            project,
+                        };
+                    }
+                    Err(e) => self.status_message = Some((format!("✗ {e}"), true)),
+                },
+                SkillsEvent::Finished { message, ok } => {
+                    self.status_message = Some((message, !ok));
+                    if ok {
+                        self.refresh_skills();
+                    }
+                }
+            }
+        }
+        any
+    }
+
+    fn enabled_skill_harnesses(&self) -> Vec<HarnessKind> {
+        HarnessKind::ALL
+            .into_iter()
+            .filter(|k| self.loaded.config.tools.is_enabled(*k))
+            .collect()
+    }
+
+    fn run_skills_task(&mut self, label: String, args: Vec<String>, done: String) {
+        let cwd = self.skills_cwd.clone();
+        self.spawn_skills_job(&label, move || match skills::run_skills(&args, &cwd) {
+            Ok(_) => SkillsEvent::Finished {
+                message: format!("✓ {done}"),
+                ok: true,
+            },
+            Err(e) => SkillsEvent::Finished {
+                message: format!("✗ {e}"),
+                ok: false,
+            },
+        });
+    }
+
+    /// Installs `package` for every enabled harness, globally or in the current project.
+    fn install_skill(&mut self, package: &str, project: bool) {
+        let scope = Self::skills_scope(project);
+        let args = skills::install_args(package, scope, &self.enabled_skill_harnesses());
+        let place = if project { "project" } else { "global" };
+        self.run_skills_task(
+            format!("Installing {package} ({place})"),
+            args,
+            format!("Installed {package} ({place})"),
+        );
+    }
+
+    /// Links/unlinks the selected skill for the focused harness column.
+    fn toggle_selected_skill_harness(&mut self) {
+        let Some(skill) = self.skills.get(self.skills_selected).cloned() else {
+            return;
+        };
+        let kind = HarnessKind::ALL[self.skills_col.min(HarnessKind::ALL.len() - 1)];
+        let enable = !skill.enabled_for(kind);
+        match skills::set_enabled_args(&skill, kind, enable) {
+            Ok(args) => {
+                let verb = if enable { "Enabled" } else { "Disabled" };
+                let text = format!("{verb} {} for {}", skill.name, kind.short_name());
+                self.run_skills_task(text.clone(), args, text);
+            }
+            Err(e) => self.status_message = Some((format!("✗ {e}"), true)),
+        }
+    }
+
+    fn handle_skills_input_key(
+        &mut self,
+        key: KeyEvent,
+        purpose: SkillsInputPurpose,
+        mut input: String,
+        mut project: bool,
+    ) {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = ActiveMode::Normal;
+                return;
+            }
+            KeyCode::Tab | KeyCode::BackTab => project = !project,
+            KeyCode::Enter => {
+                let text = input.trim().to_string();
+                if text.is_empty() {
+                    return;
+                }
+                self.mode = ActiveMode::Normal;
+                match purpose {
+                    SkillsInputPurpose::Add => self.install_skill(&text, project),
+                    SkillsInputPurpose::Search => {
+                        let cwd = self.skills_cwd.clone();
+                        self.spawn_skills_job(&format!("Searching '{text}'"), move || {
+                            SkillsEvent::Searched {
+                                result: skills::search(&text, &cwd),
+                                query: text,
+                                project,
+                            }
+                        });
+                    }
+                }
+                return;
+            }
+            KeyCode::Backspace => {
+                input.pop();
+            }
+            KeyCode::Char(c) if !c.is_control() => input.push(c),
+            _ => {}
+        }
+        self.mode = ActiveMode::SkillsInput {
+            purpose,
+            input,
+            project,
+        };
+    }
+
+    fn handle_skills_results_key(
+        &mut self,
+        key: KeyEvent,
+        query: String,
+        hits: Vec<SearchHit>,
+        mut selected: usize,
+        mut project: bool,
+    ) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = ActiveMode::Normal;
+                return;
+            }
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1) % hits.len(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                selected = selected.checked_sub(1).unwrap_or(hits.len() - 1);
+            }
+            KeyCode::Tab | KeyCode::BackTab => project = !project,
+            KeyCode::Enter => {
+                let package = hits[selected].package.clone();
+                self.mode = ActiveMode::Normal;
+                self.install_skill(&package, project);
+                return;
+            }
+            _ => {}
+        }
+        self.mode = ActiveMode::SkillsResults {
+            query,
+            hits,
+            selected,
+            project,
+        };
     }
 
     /// Drains completed `ProbeEvent` messages from background probe worker threads.
@@ -1731,6 +2017,17 @@ impl App {
             ActiveMode::NewProfileModal { input } => {
                 self.handle_new_profile_key(key, input);
             }
+            ActiveMode::SkillsInput {
+                purpose,
+                input,
+                project,
+            } => self.handle_skills_input_key(key, purpose, input, project),
+            ActiveMode::SkillsResults {
+                query,
+                hits,
+                selected,
+                project,
+            } => self.handle_skills_results_key(key, query, hits, selected, project),
             ActiveMode::Help => match (key.modifiers, key.code) {
                 (_, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter) => {
                     self.mode = ActiveMode::Normal;
@@ -1767,11 +2064,13 @@ impl App {
             WorkspaceSection::Plugins => self.visible_plugin_rows().len(),
             WorkspaceSection::Guidelines => self.guidelines_statuses.len(),
             WorkspaceSection::Refs => self.loaded.refs.refs.len(),
+            WorkspaceSection::Skills => self.skills.len(),
         };
         match action {
             Action::Quit => self.should_quit = true,
             Action::ToggleWorkspaceSection => {
                 self.section = self.section.toggle();
+                self.ensure_skills_loaded();
                 self.details_scroll = 0;
                 self.emit_fx(FxTrigger::SelectionChanged);
             }
@@ -1803,6 +2102,14 @@ impl App {
                     self.emit_fx(FxTrigger::SelectionChanged);
                 }
             }
+            Action::SelectSkillsSection => {
+                if self.section != WorkspaceSection::Skills {
+                    self.section = WorkspaceSection::Skills;
+                    self.details_scroll = 0;
+                    self.ensure_skills_loaded();
+                    self.emit_fx(FxTrigger::SelectionChanged);
+                }
+            }
             Action::Down => {
                 if self.details_focused {
                     self.details_scroll = self.details_scroll.saturating_add(1);
@@ -1821,6 +2128,9 @@ impl App {
                         }
                         WorkspaceSection::Refs => {
                             self.refs_selected = (self.refs_selected + 1) % len;
+                        }
+                        WorkspaceSection::Skills => {
+                            self.skills_selected = (self.skills_selected + 1) % len;
                         }
                     }
                     self.details_scroll = 0;
@@ -1862,6 +2172,10 @@ impl App {
                                 self.refs_selected - 1
                             };
                         }
+                        WorkspaceSection::Skills => {
+                            self.skills_selected =
+                                self.skills_selected.checked_sub(1).unwrap_or(len - 1);
+                        }
                     }
                     self.details_scroll = 0;
                     self.emit_fx(FxTrigger::SelectionChanged);
@@ -1885,6 +2199,9 @@ impl App {
                         }
                         WorkspaceSection::Refs => {
                             self.refs_selected = (self.refs_selected + 10).min(len - 1);
+                        }
+                        WorkspaceSection::Skills => {
+                            self.skills_selected = (self.skills_selected + 10).min(len - 1);
                         }
                     }
                     self.details_scroll = 0;
@@ -1910,6 +2227,9 @@ impl App {
                         WorkspaceSection::Refs => {
                             self.refs_selected = self.refs_selected.saturating_sub(10);
                         }
+                        WorkspaceSection::Skills => {
+                            self.skills_selected = self.skills_selected.saturating_sub(10);
+                        }
                     }
                     self.details_scroll = 0;
                     self.emit_fx(FxTrigger::SelectionChanged);
@@ -1934,6 +2254,9 @@ impl App {
                         WorkspaceSection::Refs => {
                             self.refs_selected = 0;
                         }
+                        WorkspaceSection::Skills => {
+                            self.skills_selected = 0;
+                        }
                     }
                     self.details_scroll = 0;
                     self.emit_fx(FxTrigger::SelectionChanged);
@@ -1957,6 +2280,9 @@ impl App {
                         }
                         WorkspaceSection::Refs => {
                             self.refs_selected = len - 1;
+                        }
+                        WorkspaceSection::Skills => {
+                            self.skills_selected = len - 1;
                         }
                     }
                     self.details_scroll = 0;
@@ -1995,6 +2321,7 @@ impl App {
                 WorkspaceSection::Refs => {
                     self.clone_or_update_selected_ref(false);
                 }
+                WorkspaceSection::Skills => self.toggle_selected_skill_harness(),
             },
             Action::ConfirmOrFold => {
                 if self.section == WorkspaceSection::Guidelines {
@@ -2008,6 +2335,8 @@ impl App {
                     }
                 } else if self.section == WorkspaceSection::Refs {
                     self.clone_or_update_selected_ref(false);
+                } else if self.section == WorkspaceSection::Skills {
+                    self.toggle_selected_skill_harness();
                 } else if self.section == WorkspaceSection::Plugins
                     && let Some(PluginRow::HarnessHeader { harness, .. }) =
                         self.selected_plugin_row()
@@ -2020,6 +2349,12 @@ impl App {
                     self.clamp_plugin_selection();
                     self.emit_fx(FxTrigger::SelectionChanged);
                 }
+            }
+            Action::FoldLeft if self.section == WorkspaceSection::Skills => {
+                self.skills_col = self.skills_col.saturating_sub(1);
+            }
+            Action::FoldRight if self.section == WorkspaceSection::Skills => {
+                self.skills_col = (self.skills_col + 1).min(HarnessKind::ALL.len() - 1);
             }
             Action::FoldLeft
                 if self.section == WorkspaceSection::Plugins && !self.details_focused =>
@@ -2078,6 +2413,19 @@ impl App {
             }
             Action::AddForm if self.section == WorkspaceSection::Mcps => {
                 self.mode = ActiveMode::Form(FormState::new_add());
+                self.emit_fx(FxTrigger::ModalOpened);
+            }
+            Action::AddForm | Action::SkillsSearch if self.section == WorkspaceSection::Skills => {
+                let purpose = if action == Action::AddForm {
+                    SkillsInputPurpose::Add
+                } else {
+                    SkillsInputPurpose::Search
+                };
+                self.mode = ActiveMode::SkillsInput {
+                    purpose,
+                    input: String::new(),
+                    project: false,
+                };
                 self.emit_fx(FxTrigger::ModalOpened);
             }
             Action::EditForm | Action::OpenEditor
@@ -2273,6 +2621,7 @@ impl App {
                             WorkspaceSection::Plugins => "Plugin Inspector",
                             WorkspaceSection::Guidelines => "Guidelines Inspector",
                             WorkspaceSection::Refs => "Reference Inspector",
+                            WorkspaceSection::Skills => "Skill Inspector",
                         };
                         self.status_message = Some((format!("✓ Returned to {inspector}"), false));
                     }
@@ -2303,6 +2652,9 @@ impl App {
                 if let Some(ref paths) = self.paths {
                     let _ = self.loaded.save_config(paths);
                 }
+            }
+            Action::RefreshFromDisk if self.section == WorkspaceSection::Skills => {
+                self.refresh_skills();
             }
             Action::RefreshFromDisk => {
                 self.refresh_from_disk(false);
@@ -2378,6 +2730,7 @@ impl App {
                     WorkspaceSection::Plugins => "PLUGINS",
                     WorkspaceSection::Guidelines => "GUIDELINES",
                     WorkspaceSection::Refs => "REFERENCES",
+                    WorkspaceSection::Skills => "SKILLS",
                 };
                 if self.details_focused {
                     self.status_message = Some((
@@ -2412,6 +2765,7 @@ impl App {
                     WorkspaceSection::Plugins => "PLUGINS",
                     WorkspaceSection::Guidelines => "GUIDELINES",
                     WorkspaceSection::Refs => "REFERENCES",
+                    WorkspaceSection::Skills => "SKILLS",
                 };
                 self.status_message =
                     Some((format!("✓ Returned focus to {list_label} list"), false));
@@ -2449,7 +2803,9 @@ impl App {
                         self.plugin_filter_query.clear();
                         self.clamp_plugin_selection();
                     }
-                    WorkspaceSection::Guidelines | WorkspaceSection::Refs => {}
+                    WorkspaceSection::Guidelines
+                    | WorkspaceSection::Refs
+                    | WorkspaceSection::Skills => {}
                 }
                 self.mode = ActiveMode::Normal;
             }
@@ -2476,7 +2832,9 @@ impl App {
                     self.plugin_selected = 0;
                     self.plugin_scroll_offset = 0;
                 }
-                WorkspaceSection::Guidelines | WorkspaceSection::Refs => {}
+                WorkspaceSection::Guidelines
+                | WorkspaceSection::Refs
+                | WorkspaceSection::Skills => {}
             },
             KeyCode::Char(c) => match self.section {
                 WorkspaceSection::Mcps => {
@@ -2489,7 +2847,9 @@ impl App {
                     self.plugin_selected = 0;
                     self.plugin_scroll_offset = 0;
                 }
-                WorkspaceSection::Guidelines | WorkspaceSection::Refs => {}
+                WorkspaceSection::Guidelines
+                | WorkspaceSection::Refs
+                | WorkspaceSection::Skills => {}
             },
             _ => {}
         }
@@ -3736,6 +4096,8 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.section, WorkspaceSection::Refs);
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.section, WorkspaceSection::Skills);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.section, WorkspaceSection::Mcps);
         app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
         assert_eq!(app.section, WorkspaceSection::Plugins);
@@ -4027,7 +4389,9 @@ mod tests {
         assert!(app.pending_editor.is_some());
         let req = app.pending_editor.take().unwrap();
         assert_eq!(req.direct_file_path, Some(paths.refs_toml));
-        // Tab cycling: Refs -> Mcps
+        // Tab cycling: Refs -> Skills -> Mcps
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.section, WorkspaceSection::Skills);
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.section, WorkspaceSection::Mcps);
     }
@@ -4056,5 +4420,124 @@ mod tests {
         let (msg, is_error) = app.status_message.clone().expect("status after s");
         assert!(is_error, "failed refs must be reported: {msg}");
         assert!(msg.contains("Updated 0/2 refs"), "{msg}");
+    }
+
+    fn skill(name: &str, source: Option<&str>, agents: &[&str]) -> InstalledSkill {
+        InstalledSkill {
+            name: name.to_string(),
+            path: format!("/skills/{name}"),
+            scope: "global".to_string(),
+            agents: agents.iter().map(|a| a.to_string()).collect(),
+            source: source.map(String::from),
+        }
+    }
+
+    #[test]
+    fn skills_view_navigates_selects_harness_column_and_opens_dialogs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = StoragePaths::in_dir(dir.path());
+        let loaded = LoadedConfigs::load(&paths).expect("load");
+        let mut app = App::new(Some(paths), loaded, 120, 30);
+        app.skills = vec![
+            skill("a", Some("o/r"), &["Claude Code"]),
+            skill("b", None, &[]),
+        ];
+
+        let press = |app: &mut App, code| app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        press(&mut app, KeyCode::Char('5'));
+        assert_eq!(app.section, WorkspaceSection::Skills);
+
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.skills_selected, 1);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.skills_selected, 0, "selection wraps");
+
+        // Column starts on Claude (index 1); h/l clamp at the ends.
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.skills_col, 0);
+        for _ in 0..9 {
+            press(&mut app, KeyCode::Char('l'));
+        }
+        assert_eq!(app.skills_col, HarnessKind::ALL.len() - 1);
+
+        // Enabling an untracked skill reports why instead of running the CLI.
+        app.skills_selected = 1;
+        app.skills_autoload = true;
+        press(&mut app, KeyCode::Char(' '));
+        let (msg, is_error) = app.status_message.clone().expect("status");
+        assert!(is_error && msg.contains("no recorded source"), "{msg}");
+        assert!(app.skills_busy.is_none());
+        app.skills_autoload = false;
+
+        // `f` opens search, typing builds the query, Tab flips scope on the add dialog.
+        press(&mut app, KeyCode::Char('f'));
+        press(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::Char('x'));
+        assert!(matches!(
+            &app.mode,
+            ActiveMode::SkillsInput { purpose: SkillsInputPurpose::Search, input, .. } if input == "rx"
+        ));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, ActiveMode::Normal);
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Tab);
+        assert!(matches!(
+            &app.mode,
+            ActiveMode::SkillsInput {
+                purpose: SkillsInputPurpose::Add,
+                project: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn skills_events_update_list_and_open_results_dialog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = StoragePaths::in_dir(dir.path());
+        let loaded = LoadedConfigs::load(&paths).expect("load");
+        let mut app = App::new(Some(paths), loaded, 120, 30);
+
+        app.skills_tx
+            .send(SkillsEvent::Listed(Ok(vec![skill("a", None, &[])])))
+            .unwrap();
+        assert!(app.poll_skills_events());
+        assert_eq!(app.skills.len(), 1);
+        assert!(app.skills_loaded);
+
+        app.skills_tx
+            .send(SkillsEvent::Searched {
+                query: "tui".into(),
+                project: true,
+                result: Ok(vec![SearchHit {
+                    package: "o/r@tui".into(),
+                    installs: "1K".into(),
+                    url: String::new(),
+                }]),
+            })
+            .unwrap();
+        app.poll_skills_events();
+        assert!(matches!(
+            &app.mode,
+            ActiveMode::SkillsResults { selected: 0, project: true, hits, .. } if hits.len() == 1
+        ));
+
+        // Esc closes it; an empty search is reported instead of opening a dialog.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.skills_tx
+            .send(SkillsEvent::Searched {
+                query: "zzz".into(),
+                project: false,
+                result: Ok(Vec::new()),
+            })
+            .unwrap();
+        app.poll_skills_events();
+        assert_eq!(app.mode, ActiveMode::Normal);
+        assert!(
+            app.status_message
+                .as_ref()
+                .is_some_and(|(m, e)| *e && m.contains("zzz"))
+        );
     }
 }

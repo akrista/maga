@@ -18,6 +18,8 @@ pub enum Action {
     SelectPluginsSection,
     SelectGuidelinesSection,
     SelectRefsSection,
+    SelectSkillsSection,
+    SkillsSearch,
     UpdateSelectedRef,
     StartFilter,
     AddForm,
@@ -88,6 +90,8 @@ pub fn map_workspace_key(key: KeyEvent) -> Option<Action> {
         (KeyModifiers::NONE, KeyCode::Char('2')) => Some(Action::SelectPluginsSection),
         (KeyModifiers::NONE, KeyCode::Char('3')) => Some(Action::SelectGuidelinesSection),
         (KeyModifiers::NONE, KeyCode::Char('4')) => Some(Action::SelectRefsSection),
+        (KeyModifiers::NONE, KeyCode::Char('5')) => Some(Action::SelectSkillsSection),
+        (KeyModifiers::NONE, KeyCode::Char('f')) => Some(Action::SkillsSearch),
         (KeyModifiers::NONE, KeyCode::Char('u')) => Some(Action::UpdateSelectedRef),
         (KeyModifiers::NONE, KeyCode::Char('/')) | (KeyModifiers::SHIFT, KeyCode::Char('/')) => {
             Some(Action::StartFilter)

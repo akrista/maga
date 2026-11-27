@@ -1466,16 +1466,50 @@ impl App {
                 self.status_message = Some((format!("✓ {msg}"), false));
                 self.trigger_mascot_reaction(MascotReaction::Casting, Duration::from_millis(750));
                 self.emit_fx(FxTrigger::Synced);
-
-                // Auto update guidelines lookup index
-                let formatted =
-                    crate::domain::refs::format_reference_index(&self.loaded.refs, &cache_dir);
-                let _ = crate::domain::guidelines::update_canonical_refs(&formatted);
             }
             Err(e) => {
                 self.status_message = Some((format!("✗ Ref operation failed: {e}"), true));
                 self.trigger_mascot_reaction(MascotReaction::Startled, Duration::from_millis(800));
             }
+        }
+    }
+
+    /// Clones or updates every registered reference repository (Refs view, `s`).
+    pub fn update_all_refs(&mut self) {
+        if self.loaded.refs.refs.is_empty() {
+            self.status_message = Some(("No reference repositories registered".to_string(), true));
+            return;
+        }
+
+        let cache_dir = self
+            .paths
+            .as_ref()
+            .map(|p| p.refs_cache_dir.clone())
+            .unwrap_or_else(|| std::path::PathBuf::from("refs"));
+
+        let total = self.loaded.refs.refs.len();
+        let mut failures = Vec::new();
+        for (alias, entry) in &self.loaded.refs.refs {
+            let target_path = self.loaded.refs.effective_path(alias, entry, &cache_dir);
+            if let Err(e) = crate::domain::refs::clone_or_update_ref(alias, entry, &target_path) {
+                failures.push(e);
+            }
+        }
+
+        if failures.is_empty() {
+            self.status_message = Some((format!("✓ Updated {total}/{total} refs"), false));
+            self.trigger_mascot_reaction(MascotReaction::Casting, Duration::from_millis(750));
+            self.emit_fx(FxTrigger::Synced);
+        } else {
+            self.status_message = Some((
+                format!(
+                    "✗ Updated {}/{total} refs: {}",
+                    total - failures.len(),
+                    failures.join("; ")
+                ),
+                true,
+            ));
+            self.trigger_mascot_reaction(MascotReaction::Startled, Duration::from_millis(800));
         }
     }
 
@@ -2271,30 +2305,11 @@ impl App {
                 self.emit_fx(FxTrigger::Synced);
             }
             Action::SyncNow => {
-                if self.section == WorkspaceSection::Guidelines
-                    || self.section == WorkspaceSection::Refs
-                {
+                if self.section == WorkspaceSection::Refs {
+                    self.update_all_refs();
+                } else if self.section == WorkspaceSection::Guidelines {
                     let mut warning_suffix = String::new();
-                    if !self.loaded.refs.refs.is_empty() {
-                        let cache_dir = self
-                            .paths
-                            .as_ref()
-                            .map(|p| p.refs_cache_dir.clone())
-                            .unwrap_or_else(|| std::path::PathBuf::from("refs"));
-                        let formatted_index = crate::domain::refs::format_reference_index(
-                            &self.loaded.refs,
-                            &cache_dir,
-                        );
-                        if let Ok(metrics) =
-                            crate::domain::guidelines::update_canonical_refs(&formatted_index)
-                            && metrics.exceeds_recommended_budget
-                        {
-                            warning_suffix = format!(
-                                " (⚠ Sizing warning: {} lines, {} chars)",
-                                metrics.line_count, metrics.char_count
-                            );
-                        }
-                    } else if let Ok(Some(metrics)) =
+                    if let Ok(Some(metrics)) =
                         crate::domain::guidelines::canonical_guidelines_metrics()
                         && metrics.exceeds_recommended_budget
                     {
@@ -4001,9 +4016,34 @@ mod tests {
         assert!(app.pending_editor.is_some());
         let req = app.pending_editor.take().unwrap();
         assert_eq!(req.direct_file_path, Some(paths.refs_toml));
-
         // Tab cycling: Refs -> Mcps
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.section, WorkspaceSection::Mcps);
+    }
+
+    #[test]
+    fn refs_s_key_updates_all_refs_and_reports_failures() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = StoragePaths::in_dir(dir.path());
+        let mut loaded = LoadedConfigs::load(&paths).expect("load");
+        for alias in ["a", "b"] {
+            loaded.refs.refs.insert(
+                alias.to_string(),
+                crate::domain::refs::RefRepoEntry {
+                    url: format!("file:///maga-test-nonexistent/{alias}"),
+                    branch: None,
+                    description: None,
+                    path: None,
+                },
+            );
+        }
+
+        let mut app = App::new(Some(paths), loaded, 100, 30);
+        app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+
+        let (msg, is_error) = app.status_message.clone().expect("status after s");
+        assert!(is_error, "failed refs must be reported: {msg}");
+        assert!(msg.contains("Updated 0/2 refs"), "{msg}");
     }
 }

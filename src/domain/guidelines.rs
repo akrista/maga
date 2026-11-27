@@ -171,8 +171,6 @@ pub fn create_link(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
 
 pub const DEFAULT_MAX_GUIDELINE_LINES: usize = 300;
 pub const DEFAULT_MAX_GUIDELINE_CHARS: usize = 15_000;
-pub const REFS_BLOCK_START: &str = "<!-- maga:refs:start -->";
-pub const REFS_BLOCK_END: &str = "<!-- maga:refs:end -->";
 
 /// Metrics describing the length and prompt-budget health of an AI guidelines file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,49 +195,6 @@ impl GuidelineMetrics {
     }
 }
 
-/// Injects or idempotently updates a delimited reference block in the guidelines content.
-pub fn inject_or_replace_refs_block(existing_content: &str, refs_content: &str) -> String {
-    let trimmed_refs = refs_content.trim();
-    if trimmed_refs.is_empty() {
-        if let Some(start_idx) = existing_content.find(REFS_BLOCK_START)
-            && let Some(end_rel) = existing_content[start_idx..].find(REFS_BLOCK_END)
-        {
-            let end_idx = start_idx + end_rel + REFS_BLOCK_END.len();
-            let mut res = String::new();
-            res.push_str(existing_content[..start_idx].trim_end());
-            let tail = existing_content[end_idx..].trim_start();
-            if !tail.is_empty() {
-                res.push_str("\n\n");
-                res.push_str(tail);
-            }
-            res.push('\n');
-            return res;
-        }
-        return existing_content.to_string();
-    }
-
-    let block = format!("{REFS_BLOCK_START}\n{trimmed_refs}\n{REFS_BLOCK_END}");
-
-    if let Some(start_idx) = existing_content.find(REFS_BLOCK_START)
-        && let Some(end_rel) = existing_content[start_idx..].find(REFS_BLOCK_END)
-    {
-        let end_idx = start_idx + end_rel + REFS_BLOCK_END.len();
-        let mut result = String::new();
-        result.push_str(&existing_content[..start_idx]);
-        result.push_str(&block);
-        result.push_str(&existing_content[end_idx..]);
-        return result;
-    }
-
-    let mut result = existing_content.trim_end().to_string();
-    if !result.is_empty() {
-        result.push_str("\n\n");
-    }
-    result.push_str(&block);
-    result.push('\n');
-    result
-}
-
 /// Computes metrics for the canonical guidelines file if it exists.
 pub fn canonical_guidelines_metrics() -> Result<Option<GuidelineMetrics>, String> {
     let canonical = canonical_guidelines_path()?;
@@ -250,25 +205,6 @@ pub fn canonical_guidelines_metrics() -> Result<Option<GuidelineMetrics>, String
     } else {
         Ok(None)
     }
-}
-
-/// Safely updates the canonical guidelines file with an updated references block.
-pub fn update_canonical_refs(refs_content: &str) -> Result<GuidelineMetrics, String> {
-    let canonical = canonical_guidelines_path()?;
-    let existing = if canonical.exists() {
-        fs::read_to_string(&canonical)
-            .map_err(|e| format!("Failed to read canonical guidelines: {e}"))?
-    } else {
-        if let Some(parent) = canonical.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create directory {}: {e}", parent.display()))?;
-        }
-        String::new()
-    };
-
-    let updated = inject_or_replace_refs_block(&existing, refs_content);
-    crate::domain::storage::write_atomic_with_backup(&canonical, &updated)?;
-    Ok(GuidelineMetrics::compute(&updated))
 }
 
 pub fn sync_guidelines() -> Result<Vec<GuidelineSyncResult>, String> {
@@ -339,42 +275,5 @@ mod tests {
         let long_chars = "x".repeat(15_001);
         let metrics_chars = GuidelineMetrics::compute(&long_chars);
         assert!(metrics_chars.exceeds_recommended_budget);
-    }
-
-    #[test]
-    fn test_inject_or_replace_refs_block_fresh() {
-        let initial = "# User Guidelines\n\nRule 1: Always test.";
-        let refs = "- **pangolin**: `~/.local/share/maga/refs/pangolin`";
-
-        let injected = inject_or_replace_refs_block(initial, refs);
-        assert!(injected.contains(REFS_BLOCK_START));
-        assert!(injected.contains(REFS_BLOCK_END));
-        assert!(injected.contains("Rule 1: Always test."));
-        assert!(injected.contains("- **pangolin**"));
-    }
-
-    #[test]
-    fn test_inject_or_replace_refs_block_idempotent() {
-        let initial = "# User Guidelines\n\nRule 1: Always test.";
-        let refs1 = "- **v1**: path1";
-        let injected1 = inject_or_replace_refs_block(initial, refs1);
-
-        let refs2 = "- **v2**: path2";
-        let injected2 = inject_or_replace_refs_block(&injected1, refs2);
-
-        assert_eq!(injected2.matches(REFS_BLOCK_START).count(), 1);
-        assert_eq!(injected2.matches(REFS_BLOCK_END).count(), 1);
-        assert!(!injected2.contains("- **v1**"));
-        assert!(injected2.contains("- **v2**"));
-        assert!(injected2.contains("Rule 1: Always test."));
-    }
-
-    #[test]
-    fn test_remove_refs_block_when_empty() {
-        let initial = "# User Guidelines\n\n<!-- maga:refs:start -->\n- **v1**: path1\n<!-- maga:refs:end -->\n\nRule 2: Don't panic.";
-        let stripped = inject_or_replace_refs_block(initial, "");
-        assert!(!stripped.contains(REFS_BLOCK_START));
-        assert!(!stripped.contains(REFS_BLOCK_END));
-        assert!(stripped.contains("Rule 2: Don't panic."));
     }
 }

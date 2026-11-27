@@ -243,7 +243,7 @@ Register maga itself in any harness's MCP config. Read tools (`list_servers`, `p
 | <kbd>b</kbd> | Toggle **Background-Only (`hide_ui`)** mode (hide foreground UI to view full-screen Riverflow art) |
 | <kbd>o</kbd> | Open the interactive **Options (`config.toml`)** modal |
 | <kbd>r</kbd> / <kbd>R</kbd> | Reload & reconcile configs from disk now / Toggle periodic auto-refresh on or off |
-| <kbd>s</kbd> | Force push in-memory canonical registry to disk now |
+| <kbd>s</kbd> | Force push in-memory canonical registry to disk now (Guidelines: sync links · Refs: update all refs) |
 | <kbd>?</kbd> | Open Keyboard Shortcuts & ASCII Witch splash modal |
 | <kbd>q</kbd> / <kbd>Ctrl+C</kbd> | Quit `maga` |
 

@@ -47,6 +47,10 @@ impl RefsRegistry {
     }
 }
 
+fn run_git(dir: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    Command::new("git").current_dir(dir).args(args).output()
+}
+
 /// Clones or updates a reference repository using shallow git operations.
 pub fn clone_or_update_ref(
     alias: &str,
@@ -60,19 +64,23 @@ pub fn clone_or_update_ref(
     }
 
     if target_dir.exists() && target_dir.join(".git").exists() {
-        // Repository already exists, pull / fetch shallowly
-        let mut cmd = Command::new("git");
-        cmd.current_dir(target_dir);
-        cmd.args(["pull", "--ff-only", "--depth", "1"]);
-
-        let output = cmd
-            .output()
+        // Follow the origin even if its history was rewritten (force-push, amend, orphan
+        // branch): shallow fetch the tracked ref and hard-reset to it. `pull --ff-only`
+        // would fail permanently once the remote history diverges from the clone.
+        let remote_ref = entry.branch.as_deref().unwrap_or("HEAD");
+        let fetch = run_git(target_dir, &["fetch", "--depth", "1", "origin", remote_ref])
             .map_err(|e| format!("Failed to update ref '{alias}': {e}"))?;
+        if !fetch.status.success() {
+            let stderr = String::from_utf8_lossy(&fetch.stderr);
+            return Err(format!("Failed to update ref '{alias}': {}", stderr.trim()));
+        }
 
-        if output.status.success() {
+        let reset = run_git(target_dir, &["reset", "--hard", "FETCH_HEAD"])
+            .map_err(|e| format!("Failed to update ref '{alias}': {e}"))?;
+        if reset.status.success() {
             Ok(format!("Updated ref '{alias}'"))
         } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = String::from_utf8_lossy(&reset.stderr);
             Err(format!("Failed to update ref '{alias}': {}", stderr.trim()))
         }
     } else {
@@ -103,41 +111,6 @@ pub fn clone_or_update_ref(
             Err(format!("Failed to clone ref '{alias}': {}", stderr.trim()))
         }
     }
-}
-
-/// Formats the compact markdown reference index block, including ONLY cloned repositories.
-pub fn format_reference_index(registry: &RefsRegistry, cache_root: &Path) -> String {
-    let cloned_refs: Vec<(&String, &RefRepoEntry, PathBuf)> = registry
-        .refs
-        .iter()
-        .filter_map(|(alias, entry)| {
-            let path = registry.effective_path(alias, entry, cache_root);
-            if path.exists() && path.join(".git").exists() {
-                Some((alias, entry, path))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if cloned_refs.is_empty() {
-        return String::new();
-    }
-
-    let mut out = String::new();
-    out.push_str("### Offline Documentation References\n");
-    out.push_str("When researching frameworks, libraries, or APIs listed below, ALWAYS inspect and read from these local paths before searching the web:\n\n");
-
-    for (alias, entry, path) in cloned_refs {
-        let path_str = path.display().to_string();
-        if let Some(ref desc) = entry.description {
-            out.push_str(&format!("- **{alias}** (`{path_str}`): {desc}\n"));
-        } else {
-            out.push_str(&format!("- **{alias}** (`{path_str}`)\n"));
-        }
-    }
-
-    out
 }
 
 #[cfg(test)]
@@ -174,39 +147,6 @@ description = "React docs"
     }
 
     #[test]
-    fn test_format_reference_index() {
-        let mut registry = RefsRegistry::default();
-        registry.refs.insert(
-            "pangolin".to_string(),
-            RefRepoEntry {
-                url: "https://github.com/fosrl/docs".to_string(),
-                branch: Some("main".to_string()),
-                description: Some("Pangolin documentation".to_string()),
-                path: None,
-            },
-        );
-
-        let temp = tempfile::tempdir().expect("tempdir");
-        let cache_root = temp.path();
-
-        // 1. Not cloned yet -> index must be empty
-        let formatted_empty = format_reference_index(&registry, cache_root);
-        assert!(formatted_empty.is_empty());
-
-        // 2. Mock clone (create directory and .git folder)
-        let repo_dir = cache_root.join("pangolin");
-        fs::create_dir_all(repo_dir.join(".git")).expect("create mock .git");
-
-        // 3. Now cloned -> index is formatted with offline instructions
-        let formatted = format_reference_index(&registry, cache_root);
-        assert!(formatted.contains("### Offline Documentation References"));
-        assert!(formatted.contains("**pangolin**"));
-        let expected_path = repo_dir.display().to_string();
-        assert!(formatted.contains(&expected_path));
-        assert!(formatted.contains("Pangolin documentation"));
-    }
-
-    #[test]
     fn test_clone_ref_invalid_url_returns_error() {
         let entry = RefRepoEntry {
             url: "https://127.0.0.1:9/invalid/no-such-repo-maga-test".to_string(),
@@ -218,5 +158,65 @@ description = "React docs"
         let target = temp.path().join("invalid_repo");
         let result = clone_or_update_ref("invalid", &entry, &target);
         assert!(result.is_err());
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args([
+                "-c",
+                "user.name=maga-test",
+                "-c",
+                "user.email=maga-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn file_url(path: &Path) -> String {
+        let p = path
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        format!("file:///{}", p.trim_start_matches('/'))
+    }
+
+    #[test]
+    fn test_update_ref_follows_rewritten_remote_history() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let origin = temp.path().join("origin");
+        fs::create_dir_all(&origin).expect("origin dir");
+        git_ok(&origin, &["init", "-b", "main"]);
+        fs::write(origin.join("doc.md"), "v1").expect("write v1");
+        git_ok(&origin, &["add", "."]);
+        git_ok(&origin, &["commit", "-m", "v1"]);
+
+        let entry = RefRepoEntry {
+            url: file_url(&origin),
+            branch: Some("main".to_string()),
+            description: None,
+            path: None,
+        };
+        let target = temp.path().join("clone");
+        clone_or_update_ref("docs", &entry, &target).expect("initial clone");
+        assert_eq!(fs::read_to_string(target.join("doc.md")).unwrap(), "v1");
+
+        // Rewrite origin history: the new tip is unrelated to the cloned commit.
+        git_ok(&origin, &["checkout", "--orphan", "rewritten"]);
+        fs::write(origin.join("doc.md"), "v2").expect("write v2");
+        git_ok(&origin, &["add", "."]);
+        git_ok(&origin, &["commit", "-m", "rewritten history"]);
+        git_ok(&origin, &["branch", "-M", "main"]);
+
+        let msg = clone_or_update_ref("docs", &entry, &target).expect("update after rewrite");
+        assert_eq!(msg, "Updated ref 'docs'");
+        assert_eq!(fs::read_to_string(target.join("doc.md")).unwrap(), "v2");
     }
 }

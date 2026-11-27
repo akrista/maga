@@ -316,7 +316,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let active_guidelines = app
         .guidelines_statuses
         .iter()
-        .filter(|s| s.exists && s.matches_canonical)
+        .filter(|s| s.health() == crate::domain::guidelines::GuidelineHealth::InSync)
         .count();
     let total_guidelines = app.guidelines_statuses.len();
 
@@ -1929,5 +1929,33 @@ mod tests {
         assert!(log.contains("MESSAGE LOG (1)"));
         assert!(log.contains("TAILMARK"), "the popup shows the full message");
         assert!(log.contains("WARN"));
+    }
+
+    #[test]
+    fn guidelines_view_says_unverifiable_when_the_canonical_file_is_missing() {
+        use crate::domain::guidelines::{GuidelineStatus, target_guidelines};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = build_test_app(130, 30);
+        app.guidelines_statuses = target_guidelines()
+            .expect("targets")
+            .into_iter()
+            .map(|t| GuidelineStatus {
+                harness: t.harness,
+                path: t.path,
+                exists: true,
+                is_symlink: true,
+                matches_canonical: false,
+                canonical_present: false,
+            })
+            .collect();
+        app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        let frame = render_to_string(130, 30, &app, false);
+        assert!(frame.contains("[? No canonical]"), "{frame}");
+        assert!(
+            !frame.contains("[! Drift]"),
+            "a missing canonical is not drift"
+        );
+        assert!(frame.contains("not drift"));
     }
 }

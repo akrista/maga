@@ -1,4 +1,5 @@
 use crate::app::{ActiveMode, App, PluginRow, WorkspaceSection};
+use crate::domain::guidelines::GuidelineHealth;
 use crate::domain::model::{HarnessKind, MascotMode, McpServerConfig, Transport};
 use crate::domain::plugins::HarnessPlugin;
 use crate::domain::probe::ServerProbeState;
@@ -1077,7 +1078,7 @@ fn draw_guidelines_list(
     let selected_idx = app.guidelines_selected.min(total.saturating_sub(1));
     let synced = statuses
         .iter()
-        .filter(|s| s.exists && s.matches_canonical)
+        .filter(|s| s.health() == crate::domain::guidelines::GuidelineHealth::InSync)
         .count();
 
     let title = format!(" HARNESS GUIDELINES ({synced}/{total} Synced) ");
@@ -1103,17 +1104,12 @@ fn draw_guidelines_list(
             let is_selected = idx == selected_idx;
             let cursor = if is_selected { "▸ " } else { "  " };
 
-            let (badge, badge_style) = if s.exists && s.matches_canonical {
-                let sym_tag = if s.is_symlink {
-                    "[✓ Symlink]"
-                } else {
-                    "[✓ Link]"
-                };
-                (sym_tag, theme.success)
-            } else if s.exists {
-                ("[! Drift]", theme.warning)
-            } else {
-                ("[✗ Missing]", theme.error)
+            let (badge, badge_style) = match s.health() {
+                GuidelineHealth::InSync if s.is_symlink => ("[✓ Symlink]", theme.success),
+                GuidelineHealth::InSync => ("[✓ Link]", theme.success),
+                GuidelineHealth::Drift => ("[! Drift]", theme.warning),
+                GuidelineHealth::CanonicalMissing => ("[? No canonical]", theme.warning),
+                GuidelineHealth::Missing => ("[✗ Missing]", theme.error),
             };
 
             let row_style = if is_selected {
@@ -1219,17 +1215,14 @@ fn draw_guidelines_detail_panel(f: &mut Frame, area: Rect, app: &App, theme: &Th
             Span::styled(s.path.display().to_string(), theme.base),
         ]));
 
-        let (status_text, status_style) = if s.exists && s.matches_canonical {
-            let link_desc = if s.is_symlink {
-                "Valid Symbolic Link (In Sync)"
-            } else {
-                "Valid Hard Link (In Sync)"
-            };
-            (link_desc, theme.success)
-        } else if s.exists {
-            ("Content Differs from Canonical (Drift)", theme.warning)
-        } else {
-            ("Target File Missing", theme.error)
+        let (status_text, status_style) = match s.health() {
+            GuidelineHealth::InSync if s.is_symlink => {
+                ("Valid Symbolic Link (In Sync)", theme.success)
+            }
+            GuidelineHealth::InSync => ("Valid Hard Link (In Sync)", theme.success),
+            GuidelineHealth::Drift => ("Content Differs from Canonical (Drift)", theme.warning),
+            GuidelineHealth::CanonicalMissing => ("Canonical missing (not drift)", theme.warning),
+            GuidelineHealth::Missing => ("Target File Missing", theme.error),
         };
 
         lines.push(Line::from(vec![

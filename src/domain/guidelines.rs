@@ -38,6 +38,33 @@ pub struct GuidelineStatus {
     pub exists: bool,
     pub is_symlink: bool,
     pub matches_canonical: bool,
+    /// The canonical file (`~/.agents/AGENTS.md`) exists; without it nothing can be compared.
+    pub canonical_present: bool,
+}
+
+/// What a harness guidelines file's state means for the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuidelineHealth {
+    InSync,
+    /// Present, but its content differs from the canonical file.
+    Drift,
+    /// Present, but the canonical file is missing, so it cannot be verified (not real drift).
+    CanonicalMissing,
+    Missing,
+}
+
+impl GuidelineStatus {
+    pub fn health(&self) -> GuidelineHealth {
+        if !self.exists {
+            GuidelineHealth::Missing
+        } else if !self.canonical_present {
+            GuidelineHealth::CanonicalMissing
+        } else if self.matches_canonical {
+            GuidelineHealth::InSync
+        } else {
+            GuidelineHealth::Drift
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +150,7 @@ pub fn check_guidelines_status() -> Result<Vec<GuidelineStatus>, String> {
             exists,
             is_symlink,
             matches_canonical,
+            canonical_present: canonical_bytes.is_some(),
         });
     }
 
@@ -275,5 +303,32 @@ mod tests {
         let long_chars = "x".repeat(15_001);
         let metrics_chars = GuidelineMetrics::compute(&long_chars);
         assert!(metrics_chars.exceeds_recommended_budget);
+    }
+
+    #[test]
+    fn health_separates_a_missing_canonical_from_real_drift() {
+        let status = |exists, canonical_present, matches_canonical| GuidelineStatus {
+            harness: target_guidelines().expect("targets")[0].harness,
+            path: PathBuf::from("x"),
+            exists,
+            is_symlink: true,
+            matches_canonical,
+            canonical_present,
+        };
+        assert_eq!(status(true, true, true).health(), GuidelineHealth::InSync);
+        assert_eq!(status(true, true, false).health(), GuidelineHealth::Drift);
+        assert_eq!(
+            status(true, false, false).health(),
+            GuidelineHealth::CanonicalMissing,
+            "no canonical file: unverifiable, not drift"
+        );
+        assert_eq!(
+            status(false, true, false).health(),
+            GuidelineHealth::Missing
+        );
+        assert_eq!(
+            status(false, false, false).health(),
+            GuidelineHealth::Missing
+        );
     }
 }

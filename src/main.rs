@@ -254,12 +254,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(statuses) => {
                 println!("\x1b[1;36m✦ Global Guidelines Status ✦\x1b[0m");
                 let mut all_ok = true;
+                if statuses.iter().any(|s| s.exists && !s.canonical_present)
+                    && let Ok(canonical) = crate::domain::guidelines::canonical_guidelines_path()
+                {
+                    println!(
+                        "\x1b[1;33m!\x1b[0m Canonical file not found at {}: maga compares every harness file against it, so they cannot be verified (this is not drift). Link or create it, e.g. as a symlink to your guidelines file.",
+                        canonical.display()
+                    );
+                }
                 for s in statuses {
-                    let mark = if s.exists && s.matches_canonical {
-                        "\x1b[1;32m✓\x1b[0m"
-                    } else {
-                        all_ok = false;
-                        "\x1b[1;31m✗\x1b[0m"
+                    use crate::domain::guidelines::GuidelineHealth;
+                    let mark = match s.health() {
+                        GuidelineHealth::InSync => "\x1b[1;32m✓\x1b[0m",
+                        GuidelineHealth::CanonicalMissing => {
+                            all_ok = false;
+                            "\x1b[1;33m?\x1b[0m"
+                        }
+                        GuidelineHealth::Drift | GuidelineHealth::Missing => {
+                            all_ok = false;
+                            "\x1b[1;31m✗\x1b[0m"
+                        }
                     };
                     let sym_tag = if s.is_symlink { " (symlink)" } else { "" };
                     println!(

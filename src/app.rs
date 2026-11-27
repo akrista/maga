@@ -627,7 +627,8 @@ impl App {
             StoragePaths::load_env_context,
         );
         let harnesses = loaded.enabled_harness_servers();
-        let outcome = reconcile_harnesses_with_env(&loaded.mcp.mcps, &harnesses, Some(&env_ctx));
+        let mut outcome =
+            reconcile_harnesses_with_env(&loaded.mcp.mcps, &harnesses, Some(&env_ctx));
         let mut initial_fx = vec![FxTrigger::Startup];
         let initial_mode = if !outcome.conflicts.is_empty() {
             initial_fx.push(FxTrigger::ConflictAlert);
@@ -650,6 +651,7 @@ impl App {
                         false,
                     ));
                 }
+                outcome.canonical = loaded.mcp.mcps.clone();
             } else {
                 if (!loaded.config_exists || loaded.config_needs_save)
                     && let Err(e) = loaded.save_config(p)
@@ -1398,6 +1400,7 @@ impl App {
         if let Some(ref paths) = self.paths {
             match self.loaded.save_all(paths, &self.outcome.canonical) {
                 Ok(()) => {
+                    self.outcome.canonical = self.loaded.mcp.mcps.clone();
                     self.status_message = Some((format!("✓ {msg}"), false));
                 }
                 Err(e) => {
@@ -1579,6 +1582,11 @@ impl App {
 
         let disk_needs_sync = new_outcome.conflicts.is_empty()
             && (fresh.mcp.mcps != new_outcome.canonical
+                || new_outcome
+                    .canonical
+                    .values()
+                    .any(McpServerConfig::has_literal_secrets)
+                || fresh.harness_has_resolved_secrets(&new_outcome.canonical, &env_ctx)
                 || fresh.mcp_had_spaced_keys
                 || any_harness_out_of_sync);
 
@@ -1609,6 +1617,9 @@ impl App {
 
         self.loaded = fresh;
         self.outcome = new_outcome;
+        if disk_needs_sync {
+            self.outcome.canonical = self.loaded.mcp.mcps.clone();
+        }
 
         // Restore selection to the previously highlighted server name if still present
         if let Some(ref target_name) = prev_selected_name

@@ -236,6 +236,14 @@ impl StoragePaths {
         self.opencode_json.clone()
     }
 
+    /// `.env.local` next to `mcp.toml`: where maga stores secrets it moves out of configs.
+    pub fn maga_dotenv_path(&self) -> PathBuf {
+        self.mcp_toml
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".env.local")
+    }
+
     pub fn dotenv_search_paths(&self) -> Vec<PathBuf> {
         if self.isolated {
             return self
@@ -262,6 +270,78 @@ impl StoragePaths {
     pub fn load_env_context(&self) -> BTreeMap<String, String> {
         crate::domain::model::load_env_context(&self.dotenv_search_paths())
     }
+}
+
+/// Inserts or updates `KEY="value"` lines in a dotenv file, keeping every other line.
+/// Creates the file (owner-only on Unix) when missing.
+pub fn upsert_dotenv(path: &Path, vars: &BTreeMap<String, String>) -> Result<(), String> {
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    let mut pending: BTreeMap<&String, String> = BTreeMap::new();
+    for (k, v) in vars {
+        let quoted = crate::domain::model::dotenv_quote(v)
+            .ok_or_else(|| format!("Value for {k} cannot be stored in a dotenv file"))?;
+        pending.insert(k, quoted);
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    for line in existing.lines() {
+        let key = line
+            .trim()
+            .strip_prefix("export ")
+            .unwrap_or(line.trim())
+            .split_once('=')
+            .map(|(k, _)| k.trim());
+        match key.and_then(|k| pending.remove_entry(&k.to_string())) {
+            Some((k, quoted)) => lines.push(format!("{k}={quoted}")),
+            None => lines.push(line.to_string()),
+        }
+    }
+    lines.extend(
+        pending
+            .into_iter()
+            .map(|(k, quoted)| format!("{k}={quoted}")),
+    );
+
+    let mut content = lines.join("\n");
+    content.push('\n');
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create directory {}: {e}", parent.display()))?;
+    }
+    #[cfg(unix)]
+    if !path.exists() {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("Failed to create {}: {e}", path.display()))?;
+    }
+    fs::write(path, content).map_err(|e| format!("Failed to write {}: {e}", path.display()))
+}
+
+/// Appends any missing `entries` to `<dir>/.gitignore` (creating it) so local files stay untracked.
+pub fn ensure_gitignore(dir: &Path, entries: &[&str]) -> Result<(), String> {
+    let path = dir.join(".gitignore");
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let missing: Vec<&str> = entries
+        .iter()
+        .copied()
+        .filter(|e| !existing.lines().any(|l| l.trim() == *e))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    for entry in missing {
+        content.push_str(entry);
+        content.push('\n');
+    }
+    fs::write(&path, content).map_err(|e| format!("Failed to write {}: {e}", path.display()))
 }
 
 pub fn expand_tilde(path_str: &str) -> PathBuf {
@@ -309,6 +389,25 @@ impl LoadedConfigs {
             HarnessKind::Grok => &self.grok.servers,
             HarnessKind::OpenCode => &self.opencode.servers,
         }
+    }
+
+    /// True when an enabled harness still holds a copy of a canonical server with its
+    /// `${VAR}` references resolved to secret values (written by older maga versions).
+    pub fn harness_has_resolved_secrets(
+        &self,
+        canonical: &BTreeMap<String, McpServerConfig>,
+        env: &BTreeMap<String, String>,
+    ) -> bool {
+        HarnessKind::ALL
+            .into_iter()
+            .filter(|kind| self.config.tools.is_enabled(*kind))
+            .any(|kind| {
+                self.harness_servers(kind).iter().any(|(name, server)| {
+                    canonical
+                        .get(name)
+                        .is_some_and(|c| server.is_resolved_copy_of(c, env))
+                })
+            })
     }
 
     pub fn harness_has_raw_spaced_keys(&self, kind: HarnessKind) -> bool {
@@ -534,6 +633,30 @@ impl LoadedConfigs {
         is_windows: bool,
         custom_env: Option<&BTreeMap<String, String>>,
     ) -> Result<(), String> {
+        let env_before = custom_env
+            .cloned()
+            .unwrap_or_else(|| paths.load_env_context());
+        let mut env_owned = env_before.clone();
+
+        // Secrets never reach mcp.toml or harness files: literal values move to .env.local
+        // and the configs keep `${VAR}` references.
+        let mut canonical = canonical.clone();
+        let mut new_secrets = BTreeMap::new();
+        for (name, server) in &mut canonical {
+            let found = server.externalize_secrets(name, &env_owned);
+            env_owned.extend(found.clone());
+            new_secrets.extend(found);
+        }
+        new_secrets.retain(|k, v| env_before.get(k) != Some(v));
+        if !new_secrets.is_empty() {
+            let dotenv = paths.maga_dotenv_path();
+            upsert_dotenv(&dotenv, &new_secrets)?;
+            if let Some(dir) = dotenv.parent() {
+                ensure_gitignore(dir, &[".env.local"])?;
+            }
+        }
+        let env_ref = &env_owned;
+
         self.mcp.mcps = canonical.clone();
 
         let mcp_str = self.mcp.to_toml_string()?;
@@ -552,15 +675,6 @@ impl LoadedConfigs {
         self.mcp_exists = true;
         self.mcp_had_spaced_keys = false;
 
-        let default_env;
-        let env_ref = match custom_env {
-            Some(e) => e,
-            None => {
-                default_env = paths.load_env_context();
-                &default_env
-            }
-        };
-
         let active_prof = self
             .config
             .active_profile
@@ -571,7 +685,7 @@ impl LoadedConfigs {
             canonical
                 .iter()
                 .map(|(k, v)| {
-                    let mut exported = v.for_harness_export(is_windows, env_ref);
+                    let mut exported = v.for_harness_export(is_windows);
                     let profile_active = self.profiles.is_server_active(active_prof, k);
                     let harness_enabled = v.enabled_for_harness(harness);
                     // A broken placeholder in an exported config is worse than a disabled
@@ -697,6 +811,11 @@ impl LoadedConfigs {
         let is_converged = !any_missing_file
             && !self.mcp_had_spaced_keys
             && self.mcp.mcps == outcome.canonical
+            && !outcome
+                .canonical
+                .values()
+                .any(McpServerConfig::has_literal_secrets)
+            && !self.harness_has_resolved_secrets(&outcome.canonical, &env_context)
             && enabled_servers.iter().all(|(k, map)| {
                 crate::domain::reconcile::harness_maps_match_with_env(
                     map,
@@ -1294,11 +1413,12 @@ url = "https://mcp.docs.astro.build/mcp"
         assert!(!mcp_toml_content.contains("cmd"));
         assert!(!mcp_toml_content.contains("UltraSecret123!"));
 
-        // Claude on disk MUST have cmd /c shim and interpolated secrets
+        // Claude on disk MUST have the cmd /c shim and keep ${VAR} references (no secrets)
         let claude_content = fs::read_to_string(&paths.claude_json).expect("read claude.json");
         assert!(claude_content.contains("\"command\": \"cmd\""));
         assert!(claude_content.contains("\"/c\""));
-        assert!(claude_content.contains("sqlserver://sa:UltraSecret123!@10.0.0.5:1433/App"));
+        assert!(claude_content.contains("sqlserver://sa:${DB_PASS}@${DB_HOST}:1433/App"));
+        assert!(!claude_content.contains("UltraSecret123!"));
 
         // 2. Reloading from disk should unwrap shims and converge without false drift
         let mut reloaded = LoadedConfigs::load(&paths).expect("reload");
@@ -1328,13 +1448,100 @@ url = "https://mcp.docs.astro.build/mcp"
         let claude_debian = fs::read_to_string(&paths.claude_json).expect("read claude.json");
         assert!(claude_debian.contains("\"command\": \"dbhub\""));
         assert!(!claude_debian.contains("\"/c\""));
-        assert!(claude_debian.contains("UltraSecret123!"));
+        assert!(claude_debian.contains("${DB_PASS}"));
+        assert!(!claude_debian.contains("UltraSecret123!"));
 
         let reloaded_debian = LoadedConfigs::load(&paths).expect("reload debian");
         let status_debian = reloaded_debian.check_headless(&paths);
         assert_eq!(
             status_debian,
             crate::domain::reconcile::ConvergenceStatus::Converged
+        );
+    }
+
+    #[test]
+    fn save_all_moves_literal_secrets_to_env_local_and_keeps_references_everywhere() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = StoragePaths::in_dir(dir.path());
+        let mut loaded = LoadedConfigs::default();
+        let mut server = McpServerConfig::new_http("https://api.example.com/mcp");
+        server.headers.insert(
+            "Authorization".to_string(),
+            "Bearer sk-live-123".to_string(),
+        );
+        loaded.mcp.mcps.insert("api".to_string(), server);
+
+        // Pre-existing user lines in .env.local must survive.
+        fs::write(dir.path().join(".env.local"), "# mine\nOTHER=1\n").unwrap();
+
+        loaded
+            .save_all(&paths, &loaded.mcp.mcps.clone())
+            .expect("save_all");
+
+        let mcp_toml = fs::read_to_string(&paths.mcp_toml).unwrap();
+        let claude = fs::read_to_string(&paths.claude_json).unwrap();
+        for content in [&mcp_toml, &claude] {
+            assert!(content.contains("Bearer ${API_AUTHORIZATION}"), "{content}");
+            assert!(!content.contains("sk-live-123"), "{content}");
+        }
+
+        let env_local = fs::read_to_string(dir.path().join(".env.local")).unwrap();
+        assert!(env_local.contains("# mine\nOTHER=1\n"));
+        assert!(env_local.contains("API_AUTHORIZATION=\"sk-live-123\""));
+        let gitignore = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(gitignore.lines().any(|l| l == ".env.local"));
+
+        // The export stays enabled (reference resolves) and a second sync is a no-op.
+        assert!(claude.contains("\"enabled\"") || !claude.contains("\"disabled\": true"));
+        let mut reloaded = LoadedConfigs::load(&paths).expect("reload");
+        assert!(!reloaded.sync_headless(&paths, false).expect("sync"));
+    }
+
+    #[test]
+    fn sync_headless_rewrites_legacy_harness_copy_with_resolved_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = StoragePaths::in_dir(dir.path());
+        fs::write(dir.path().join(".env.local"), "GH_TOKEN=\"ghp_legacy\"\n").unwrap();
+
+        let mut loaded = LoadedConfigs::default();
+        let mut server = McpServerConfig::new_stdio("gh", vec![]);
+        server
+            .env
+            .insert("GH_TOKEN".to_string(), "${GH_TOKEN}".to_string());
+        loaded.mcp.mcps.insert("gh".to_string(), server);
+        loaded
+            .save_all(&paths, &loaded.mcp.mcps.clone())
+            .expect("save_all");
+
+        // Simulate an older maga that wrote the resolved secret into the harness file.
+        let claude = fs::read_to_string(&paths.claude_json).unwrap();
+        fs::write(
+            &paths.claude_json,
+            claude.replace("${GH_TOKEN}", "ghp_legacy"),
+        )
+        .unwrap();
+
+        let mut reloaded = LoadedConfigs::load(&paths).expect("reload");
+        assert!(reloaded.sync_headless(&paths, false).expect("sync"));
+        let claude = fs::read_to_string(&paths.claude_json).unwrap();
+        assert!(claude.contains("${GH_TOKEN}"));
+        assert!(!claude.contains("ghp_legacy"));
+    }
+
+    #[test]
+    fn upsert_dotenv_updates_in_place_and_appends() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join(".env.local");
+        fs::write(&file, "A=1\nexport B=old\n# note\n").unwrap();
+
+        let mut vars = BTreeMap::new();
+        vars.insert("B".to_string(), "new".to_string());
+        vars.insert("C".to_string(), "x y".to_string());
+        upsert_dotenv(&file, &vars).expect("upsert");
+
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "A=1\nB=\"new\"\n# note\nC=\"x y\"\n"
         );
     }
 }

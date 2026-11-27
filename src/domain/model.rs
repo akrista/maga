@@ -231,23 +231,120 @@ impl McpServerConfig {
         names.into_iter().filter(|n| !env.contains_key(n)).collect()
     }
 
+    /// True when `env`, `headers` or the `url` query hold literal values for secret-looking
+    /// names (tokens, keys, passwords...) instead of `${VAR}` references.
+    pub fn has_literal_secrets(&self) -> bool {
+        !self
+            .clone()
+            .externalize_secrets("probe", &BTreeMap::new())
+            .is_empty()
+    }
+
+    /// Replaces literal secret values with `${VAR}` references in place and returns the
+    /// `VAR -> value` pairs the caller must persist (e.g. in `.env.local`).
+    ///
+    /// Covers `env` values, `headers` values and secret-looking `url` query parameters.
+    /// A variable name is reused when `known_env` already holds the same value; on a clash
+    /// with a different value the server name is prefixed. Values a dotenv file cannot
+    /// represent (newlines, both quote kinds) are left untouched.
+    /// ponytail: `args` are not scanned (flag/positional secrets are not name-addressable).
+    pub fn externalize_secrets(
+        &mut self,
+        server_name: &str,
+        known_env: &BTreeMap<String, String>,
+    ) -> BTreeMap<String, String> {
+        let server = sanitize_var_name(server_name);
+        let mut found: BTreeMap<String, String> = BTreeMap::new();
+        let mut claim = |preferred: String, value: &str| -> String {
+            let mut name = preferred.clone();
+            let mut n = 1;
+            loop {
+                let taken = found.get(&name).or_else(|| known_env.get(&name));
+                match taken {
+                    None => break,
+                    Some(existing) if existing == value => break,
+                    Some(_) => {
+                        name = if n == 1 {
+                            format!("{server}_{preferred}")
+                        } else {
+                            format!("{server}_{preferred}_{n}")
+                        };
+                        n += 1;
+                    }
+                }
+            }
+            found.insert(name.clone(), value.to_string());
+            name
+        };
+
+        for (key, value) in &mut self.env {
+            if is_literal_secret(key, value) {
+                let name = claim(sanitize_var_name(key), value);
+                *value = format!("${{{name}}}");
+            }
+        }
+
+        for (key, value) in &mut self.headers {
+            let (scheme, secret) = match value.split_once(' ') {
+                Some((s, rest)) if matches!(s, "Bearer" | "Basic" | "Token") => {
+                    (format!("{s} "), rest)
+                }
+                _ => (String::new(), value.as_str()),
+            };
+            if is_literal_secret(key, secret) {
+                let name = claim(format!("{server}_{}", sanitize_var_name(key)), secret);
+                *value = format!("{scheme}${{{name}}}");
+            }
+        }
+
+        if let Some(url) = &self.url
+            && let Some((base, query)) = url.split_once('?')
+        {
+            let (query, fragment) = match query.split_once('#') {
+                Some((q, f)) => (q, format!("#{f}")),
+                None => (query, String::new()),
+            };
+            let rewritten: Vec<String> = query
+                .split('&')
+                .map(|pair| match pair.split_once('=') {
+                    Some((k, v)) if is_literal_secret(k, v) => {
+                        let name = claim(format!("{server}_{}", sanitize_var_name(k)), v);
+                        format!("{k}=${{{name}}}")
+                    }
+                    _ => pair.to_string(),
+                })
+                .collect();
+            self.url = Some(format!("{base}?{}{fragment}", rewritten.join("&")));
+        }
+
+        found
+    }
+
+    /// True when `self` (a harness copy) is `canonical` with its `${VAR}` references already
+    /// resolved to values: equal after interpolation but not literally.
+    pub fn is_resolved_copy_of(&self, canonical: &Self, env: &BTreeMap<String, String>) -> bool {
+        let mut this = self.clone();
+        this.unwrap_windows_shim();
+        let mut canon = canonical.clone();
+        canon.unwrap_windows_shim();
+        let resolved = canon.interpolate(env);
+        !this.same_definition(&canon) && this.same_definition(&resolved)
+    }
+
     /// Prepares this configuration for export to a target harness on the specified OS.
-    /// Interpolates environment variables and wraps non-PE commands in `cmd /c` on Windows.
-    pub fn for_harness_export(&self, is_windows: bool, env: &BTreeMap<String, String>) -> Self {
-        let interpolated = self.interpolate(env);
-        if interpolated.transport == Transport::Stdio {
-            let (cmd, args) = wrap_command_for_platform(
-                interpolated.command.as_deref(),
-                &interpolated.args,
-                is_windows,
-            );
+    /// Keeps `${VAR}` references as-is (secrets never land in harness files) and wraps
+    /// non-PE commands in `cmd /c` on Windows.
+    pub fn for_harness_export(&self, is_windows: bool) -> Self {
+        if self.transport == Transport::Stdio {
+            let (cmd, args) =
+                wrap_command_for_platform(self.command.as_deref(), &self.args, is_windows);
             Self {
                 command: cmd,
                 args,
-                ..interpolated
+                ..self.clone()
             }
         } else {
-            interpolated
+            self.clone()
         }
     }
 
@@ -271,6 +368,51 @@ impl McpServerConfig {
 
         let interpolated = unshimmed_canonical.interpolate(env);
         unshimmed_self.same_harness_state(&interpolated)
+    }
+}
+
+/// Upper-cases `raw` and maps every non-alphanumeric character to `_` (valid env var name).
+fn sanitize_var_name(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// A non-empty, dotenv-storable value with no `$` reference under a secret-looking name.
+fn is_literal_secret(name: &str, value: &str) -> bool {
+    const MARKERS: [&str; 8] = [
+        "TOKEN",
+        "SECRET",
+        "PASS",
+        "KEY",
+        "AUTH",
+        "CREDENTIAL",
+        "BEARER",
+        "SIGNATURE",
+    ];
+    let upper = name.to_ascii_uppercase();
+    !value.trim().is_empty()
+        && !value.contains('$')
+        && MARKERS.iter().any(|m| upper.contains(m))
+        && dotenv_quote(value).is_some()
+}
+
+/// Renders `value` for a `.env` line using the quoting `parse_dotenv_str` understands;
+/// `None` when no quoting can round-trip it.
+pub fn dotenv_quote(value: &str) -> Option<String> {
+    if value.contains(['\n', '\r']) {
+        return None;
+    }
+    match (value.contains('"'), value.contains('\'')) {
+        (false, _) => Some(format!("\"{value}\"")),
+        (true, false) => Some(format!("'{value}'")),
+        (true, true) => None,
     }
 }
 
@@ -1849,5 +1991,79 @@ theme = "elite"
         assert!(serialized.contains("active_profile = \"work\""));
         let reparsed = MagaConfig::from_toml_str(&serialized).expect("reparse config");
         assert_eq!(cfg.active_profile, reparsed.active_profile);
+    }
+
+    #[test]
+    fn externalize_secrets_replaces_env_headers_and_url_query() {
+        let mut http =
+            McpServerConfig::new_http("https://api.example.com/mcp?apiKey=k-123&mode=fast");
+        http.headers
+            .insert("Authorization".to_string(), "Bearer tok-abc".to_string());
+        http.headers
+            .insert("Accept".to_string(), "application/json".to_string());
+        http.env
+            .insert("GITHUB_TOKEN".to_string(), "ghp_x".to_string());
+        http.env
+            .insert("LOG_LEVEL".to_string(), "debug".to_string());
+
+        let found = http.externalize_secrets("my-srv", &BTreeMap::new());
+
+        assert_eq!(http.env["GITHUB_TOKEN"], "${GITHUB_TOKEN}");
+        assert_eq!(http.env["LOG_LEVEL"], "debug");
+        assert_eq!(
+            http.headers["Authorization"],
+            "Bearer ${MY_SRV_AUTHORIZATION}"
+        );
+        assert_eq!(http.headers["Accept"], "application/json");
+        assert_eq!(
+            http.url.as_deref(),
+            Some("https://api.example.com/mcp?apiKey=${MY_SRV_APIKEY}&mode=fast")
+        );
+        assert_eq!(found["GITHUB_TOKEN"], "ghp_x");
+        assert_eq!(found["MY_SRV_AUTHORIZATION"], "tok-abc");
+        assert_eq!(found["MY_SRV_APIKEY"], "k-123");
+        assert!(!http.has_literal_secrets());
+    }
+
+    #[test]
+    fn externalize_secrets_reuses_equal_values_and_prefixes_clashes() {
+        let mut known = BTreeMap::new();
+        known.insert("API_KEY".to_string(), "same".to_string());
+
+        let mut reuse = McpServerConfig::new_stdio("x", vec![]);
+        reuse.env.insert("API_KEY".to_string(), "same".to_string());
+        reuse.externalize_secrets("a", &known);
+        assert_eq!(reuse.env["API_KEY"], "${API_KEY}");
+
+        let mut clash = McpServerConfig::new_stdio("x", vec![]);
+        clash.env.insert("API_KEY".to_string(), "other".to_string());
+        let found = clash.externalize_secrets("b", &known);
+        assert_eq!(clash.env["API_KEY"], "${B_API_KEY}");
+        assert_eq!(found["B_API_KEY"], "other");
+    }
+
+    #[test]
+    fn externalize_secrets_skips_references_empty_and_unstorable_values() {
+        let mut cfg = McpServerConfig::new_stdio("x", vec![]);
+        cfg.env
+            .insert("A_TOKEN".to_string(), "${A_TOKEN}".to_string());
+        cfg.env.insert("B_TOKEN".to_string(), String::new());
+        cfg.env
+            .insert("C_TOKEN".to_string(), "it's \"both\"".to_string());
+
+        let found = cfg.externalize_secrets("s", &BTreeMap::new());
+
+        assert!(found.is_empty());
+        assert_eq!(cfg.env["A_TOKEN"], "${A_TOKEN}");
+        assert_eq!(cfg.env["C_TOKEN"], "it's \"both\"");
+    }
+
+    #[test]
+    fn dotenv_quote_roundtrips_through_parse_dotenv_str() {
+        for value in ["plain", "with space # not a comment", "a\"b", "p@ss=w0rd"] {
+            let line = format!("K={}", dotenv_quote(value).expect("quotable"));
+            assert_eq!(parse_dotenv_str(&line)["K"], value);
+        }
+        assert!(dotenv_quote("a\nb").is_none());
     }
 }

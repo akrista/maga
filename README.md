@@ -57,7 +57,7 @@
 
 - **Canonical MCP Registry (`~/.config/maga/mcp.toml`)**: Define `stdio` (`command`, `args`, `env`, `description`) and `http` (`url`, `headers`, `description`) MCP servers once, cleanly separated from UI/tool preferences in `~/.config/maga/settings.toml` (plus machine-specific `settings.local.toml`) and plugin state in `~/.config/maga/plugins.toml`.
 - **Two-Way Reconciliation & Conflict Detection**: Automatically imports untracked servers on startup and live reload, detects definition drift, case-insensitive name collisions (e.g., `"Context7"` vs `"context7"`), and servers referencing `${VAR}` / `$VAR` placeholders with no value in the environment, and groups identical definitions into numbered variants (`[1]`..`[N]`) for side-by-side resolution.
-- **Secrets stay out of configs**: Literal tokens, keys, and passwords in `env`, `headers`, and URL query parameters are moved to `~/.config/maga/.env.local` (created next to a `.gitignore` that excludes it), and both `mcp.toml` and every harness config keep `${VAR}` references. The harness must have those variables in its environment (e.g. load `.env.local` from your shell profile); servers with unresolved variables are exported disabled. Secret-looking `args` are not scanned.
+- **Secrets stay out of shared files, and `maga` never touches your shell or profile**: literal tokens, keys, and passwords in `env`, `headers`, and URL query parameters move to `~/.config/maga/.env.local`, the single source of truth, and `mcp.toml` keeps `${VAR}` references. On every sync each harness receives them through the mechanism its official documentation describes, always in user-local files that `maga` adds to a `.gitignore` next to them (see [Secret delivery](#secret-delivery-per-harness)). `args` are not scanned.
 - **Per-Harness Plugin Management (`Tab` / `1` / `2`)**: Discovers installed and configured plugins across all 5 harnesses, extracts bundled `skills`, `hooks`, and `MCPs` counts/identifiers, toggles plugins in each harness's native config file, retains disabled OpenCode npm specifiers in `plugins.toml`, and supports complete native uninstall (`d`).
 - **Live MCP Health Probing & Tool Inspection (`p` / `P` / `t`)**: Executes non-blocking, bounded-timeout (8s) JSON-RPC `initialize` + `tools/list` handshakes over `stdio` subprocesses and `http` / SSE endpoints, displaying live round-trip latency (`ms`) and exposed tool definitions.
 - **Lossless Schema Translation & Symlink-Safe Atomic Backups**: Writes `.bak` backups before every update via canonicalized same-directory atomic temp-file replacement—preserving symbolic links, non-MCP keys, OAuth/session state, `"plugin:*"` entries, and per-server harness options.
@@ -108,6 +108,20 @@ A thin wrapper over the [`skills`](https://skills.sh) CLI (`bunx skills`, fallin
 - **Search & install**: <kbd>f</kbd> runs `skills find`, <kbd>Enter</kbd> installs the highlighted result for every harness enabled in `settings.toml`. <kbd>a</kbd> installs a package by name (`owner/repo` or `owner/repo@skill`). <kbd>Tab</kbd> in either dialog switches between **global** (`-g`) and **project** (the directory `maga` was started in).
 - **Per-harness activation**: the list shows one column per harness (`AGY CLD GHC GRK OPC`); <kbd>h</kbd>/<kbd>l</kbd> pick a column and <kbd>Space</kbd> unlinks (`skills remove -a`) or relinks (`skills add <source> -a`) the skill for that harness. Relinking needs the source recorded by the CLI, so hand-made skills can be unlinked but not relinked.
 - All CLI calls run on a worker thread; the title shows the running operation.
+
+### Secret delivery (per harness)
+
+`~/.config/maga/.env.local` is the only place `maga` keeps secret values. When syncing, `${VAR}` references in `mcp.toml` are delivered like this (documentation checked 2026-11-27):
+
+| Harness | What `maga` writes | Source |
+| :--- | :--- | :--- |
+| **Claude Code** | `${VAR}` in `~/.claude.json`; the value in the `env` block of `~/.claude/settings.json`, which Claude Code copies into its process environment | [MCP: env var expansion](https://code.claude.com/docs/en/mcp), [env vars: settings files](https://code.claude.com/docs/en/env-vars) |
+| **OpenCode** | `{file:~/.config/maga/secrets/VAR}` in `env`/`headers` (one owner-only file per secret, no trailing newline); `url`/`command`/`args` are resolved to literals because the docs only show substitution for `environment` and `headers` | [Config: variables](https://opencode.ai/docs/config/), [MCP servers](https://opencode.ai/docs/mcp-servers/) |
+| **Antigravity** | The literal value in `~/.gemini/config/mcp_config.json`: its MCP docs describe no expansion or env file | [Antigravity MCP](https://antigravity.google/docs/mcp) |
+| **GitHub Copilot CLI** | The literal value in `~/.copilot/mcp-config.json`: `${VAR}` is documented only against the host environment, with no env file | [Copilot CLI MCP](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers), [MCP configuration reference](https://code.visualstudio.com/docs/copilot/reference/mcp-configuration) |
+| **Grok** | The literal value in `~/.grok/config.toml`: `${VAR}` is documented only against the environment, with no env file | [Grok Build MCP servers](https://docs.x.ai/build/features/mcp-servers) |
+
+Harnesses in the last three rows have no documented way to read a secret from a file, so their config holds the value itself. `maga` flags this in the status line after a sync and in the **Harness** view (`6`). Two points the docs do not state: that Claude Code resolves `${VAR}` in `~/.claude.json` from the `settings.json` `env` block, and that OpenCode accepts `{file:…}` inside MCP fields (it documents the syntax for config strings in general). Values are only added to `settings.json` and the `secrets/` files, never removed.
 
 
 ## Quick Start

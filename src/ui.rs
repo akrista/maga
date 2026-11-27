@@ -1810,4 +1810,23 @@ mod tests {
         assert!(frame.contains("context7"));
         assert!(frame.contains("enabled (synced)"));
     }
+
+    #[test]
+    fn harness_view_states_the_secret_mechanism_and_warns_about_literals() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = build_test_app(130, 40);
+        app.handle_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
+        let claude = render_to_string(130, 40, &app, false);
+        assert!(claude.contains("Secrets") && claude.contains("settings.json"));
+        assert!(!claude.contains("stored as literals for"));
+
+        app.harness_selected = HarnessKind::Grok;
+        app.loaded
+            .secret_literals
+            .insert(HarnessKind::Grok, vec!["context7".to_string()]);
+        let grok = render_to_string(130, 40, &app, false);
+        assert!(grok.contains("no env-file mechanism"));
+        assert!(grok.contains("secrets stored as literals for: context7"));
+    }
 }

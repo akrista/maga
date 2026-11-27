@@ -1843,7 +1843,24 @@ fn draw_harness_detail_panel(f: &mut Frame, area: Rect, app: &App, theme: &Theme
             theme.base,
         ),
         field("Skills", skills, theme.base),
+        field(
+            "Secrets",
+            crate::domain::secrets::describe(kind).to_string(),
+            if crate::domain::secrets::delivery(kind)
+                == crate::domain::secrets::SecretDelivery::Literal
+            {
+                theme.warning
+            } else {
+                theme.base
+            },
+        ),
     ];
+    if let Some(names) = app.loaded.secret_literals.get(&kind) {
+        lines.push(Line::from(Span::styled(
+            format!("⚠ secrets stored as literals for: {}", names.join(", ")),
+            theme.warning,
+        )));
+    }
 
     if let Some((name, on)) = app.harness_rows().into_iter().nth(app.harness_row) {
         lines.push(Line::from(""));

@@ -245,6 +245,19 @@ impl StoragePaths {
         self.opencode_json.clone()
     }
 
+    /// Directory holding `mcp.toml` (`~/.config/maga`).
+    pub fn maga_dir(&self) -> PathBuf {
+        self.mcp_toml
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    }
+
+    /// One file per secret, referenced by harnesses that support `{file:...}` (OpenCode).
+    pub fn secrets_dir(&self) -> PathBuf {
+        self.maga_dir().join("secrets")
+    }
+
     /// `.env.local` next to `mcp.toml`: where maga stores secrets it moves out of configs.
     pub fn maga_dotenv_path(&self) -> PathBuf {
         self.mcp_toml
@@ -330,6 +343,63 @@ pub fn upsert_dotenv(path: &Path, vars: &BTreeMap<String, String>) -> Result<(),
     fs::write(path, content).map_err(|e| format!("Failed to write {}: {e}", path.display()))
 }
 
+/// Merges `vars` into the `env` object of Claude Code's user `settings.json`, keeping every
+/// other key. Claude Code copies that block into its process environment, which is where the
+/// `${VAR}` references in `~/.claude.json` are resolved from. Unchanged files are not rewritten.
+pub fn upsert_claude_settings_env(
+    path: &Path,
+    vars: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let mut root: serde_json::Map<String, serde_json::Value> = match fs::read_to_string(path) {
+        Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text)
+            .map_err(|e| format!("Invalid Claude settings.json at {}: {e}", path.display()))?,
+        _ => serde_json::Map::new(),
+    };
+    let env = root
+        .entry("env")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| format!("`env` in {} is not an object", path.display()))?;
+    let mut changed = false;
+    for (key, value) in vars {
+        if env.get(key).and_then(|v| v.as_str()) != Some(value) {
+            env.insert(key.clone(), serde_json::Value::String(value.clone()));
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(());
+    }
+    let text = serde_json::to_string_pretty(&root)
+        .map_err(|e| format!("Failed to serialize {}: {e}", path.display()))?;
+    write_atomic_with_backup(path, &format!("{text}\n"))
+}
+
+/// Writes one file per secret (`<dir>/<VAR>`, exact bytes, no trailing newline), owner-only on
+/// Unix. Files whose content is already right are left alone.
+pub fn write_secret_files(dir: &Path, vars: &BTreeMap<String, String>) -> Result<(), String> {
+    fs::create_dir_all(dir)
+        .map_err(|e| format!("Failed to create directory {}: {e}", dir.display()))?;
+    for (name, value) in vars {
+        let file = dir.join(name);
+        if fs::read_to_string(&file).is_ok_and(|current| current == *value) {
+            continue;
+        }
+        #[cfg(unix)]
+        if !file.exists() {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&file)
+                .map_err(|e| format!("Failed to create {}: {e}", file.display()))?;
+        }
+        fs::write(&file, value).map_err(|e| format!("Failed to write {}: {e}", file.display()))?;
+    }
+    Ok(())
+}
+
 /// Appends any missing `entries` to `<dir>/.gitignore` (creating it) so local files stay untracked.
 pub fn ensure_gitignore(dir: &Path, entries: &[&str]) -> Result<(), String> {
     let path = dir.join(".gitignore");
@@ -387,6 +457,9 @@ pub struct LoadedConfigs {
     pub copilot: CopilotDocument,
     pub grok: GrokDocument,
     pub opencode: OpenCodeDocument,
+    /// Servers whose secrets were written literally into a harness config on the last sync
+    /// (the harness has no documented env/file mechanism).
+    pub secret_literals: BTreeMap<HarnessKind, Vec<String>>,
 }
 
 impl LoadedConfigs {
@@ -401,7 +474,7 @@ impl LoadedConfigs {
     }
 
     /// True when an enabled harness still holds a copy of a canonical server with its
-    /// `${VAR}` references resolved to secret values (written by older maga versions).
+    /// `${VAR}` references resolved to secret values, in a harness that should keep references.
     pub fn harness_has_resolved_secrets(
         &self,
         canonical: &BTreeMap<String, McpServerConfig>,
@@ -410,11 +483,22 @@ impl LoadedConfigs {
         HarnessKind::ALL
             .into_iter()
             .filter(|kind| self.config.tools.is_enabled(*kind))
+            // Literal-delivery harnesses legitimately hold resolved values.
+            .filter(|kind| {
+                crate::domain::secrets::delivery(*kind)
+                    != crate::domain::secrets::SecretDelivery::Literal
+            })
             .any(|kind| {
                 self.harness_servers(kind).iter().any(|(name, server)| {
-                    canonical
-                        .get(name)
-                        .is_some_and(|c| server.is_resolved_copy_of(c, env))
+                    canonical.get(name).is_some_and(|c| {
+                        if crate::domain::secrets::delivery(kind)
+                            == crate::domain::secrets::SecretDelivery::SettingsEnv
+                        {
+                            server.is_resolved_copy_of(c, env)
+                        } else {
+                            server.has_resolved_env_or_headers(c, env)
+                        }
+                    })
                 })
             })
     }
@@ -579,6 +663,7 @@ impl LoadedConfigs {
             copilot,
             grok,
             opencode,
+            secret_literals: BTreeMap::new(),
         })
     }
 
@@ -606,7 +691,7 @@ impl LoadedConfigs {
                 .file_name()
                 .and_then(|n| n.to_str()),
         ) {
-            ensure_gitignore(dir, &[local_name, ".env.local", "*.bak"])?;
+            ensure_gitignore(dir, &[local_name, ".env.local", "secrets/", "*.bak"])?;
         }
         let legacy = &paths.legacy_config_toml;
         if legacy != &paths.settings_toml && legacy.exists() {
@@ -721,30 +806,53 @@ impl LoadedConfigs {
             .as_deref()
             .or(self.profiles.active.as_deref());
 
-        let export_for_harness = |harness: HarnessKind| -> BTreeMap<String, McpServerConfig> {
-            canonical
+        let secrets_dir = paths.secrets_dir();
+        let mut secret_literals: BTreeMap<HarnessKind, Vec<String>> = BTreeMap::new();
+        // Returns the servers for one harness, the secret values its delivery mechanism must
+        // persist, and the servers whose secrets end up literally in the harness config.
+        let export_for_harness = |harness: HarnessKind| -> (
+            BTreeMap<String, McpServerConfig>,
+            BTreeMap<String, String>,
+            Vec<String>,
+        ) {
+            let mut values = BTreeMap::new();
+            let mut literal_servers = Vec::new();
+            let servers = canonical
                 .iter()
                 .map(|(k, v)| {
-                    let mut exported = v.for_harness_export(is_windows);
+                    let base = v.for_harness_export(is_windows);
                     let profile_active = self.profiles.is_server_active(active_prof, k);
                     let harness_enabled = v.enabled_for_harness(harness);
                     // A broken placeholder in an exported config is worse than a disabled
                     // server: harnesses would read raw ${VAR} and fail to connect.
-                    let missing = exported.unresolved_env_vars(env_ref);
+                    let missing = base.unresolved_env_vars(env_ref);
                     if !missing.is_empty() {
                         eprintln!(
                             "maga: server {k}: unresolved env vars [{}], disabling export",
                             missing.join(", ")
                         );
                     }
-                    exported.enabled = profile_active && harness_enabled && missing.is_empty();
+                    let delivered =
+                        crate::domain::secrets::deliver(&base, harness, env_ref, &secrets_dir);
+                    let usable = profile_active && harness_enabled && missing.is_empty();
+                    let mut exported = delivered.server;
+                    exported.enabled = usable;
+                    if missing.is_empty() {
+                        values.extend(delivered.values);
+                        if delivered.literal && usable {
+                            literal_servers.push(k.clone());
+                        }
+                    }
                     (k.clone(), exported)
                 })
-                .collect()
+                .collect();
+            (servers, values, literal_servers)
         };
 
         if self.config.tools.antigravity.enabled {
-            let agy_servers = export_for_harness(HarnessKind::Antigravity);
+            let (agy_servers, values, literal) = export_for_harness(HarnessKind::Antigravity);
+            secret_literals.insert(HarnessKind::Antigravity, literal);
+            let _ = &values;
             let agy_str = self.agy.to_json_string(&agy_servers)?;
             let agy_path = paths.effective_agy_path(&self.config);
             write_atomic_with_backup(&agy_path, &agy_str)?;
@@ -752,7 +860,14 @@ impl LoadedConfigs {
         }
 
         if self.config.tools.claude.enabled {
-            let claude_servers = export_for_harness(HarnessKind::Claude);
+            let (claude_servers, values, literal) = export_for_harness(HarnessKind::Claude);
+            secret_literals.insert(HarnessKind::Claude, literal);
+            if !values.is_empty() {
+                upsert_claude_settings_env(
+                    &paths.effective_claude_settings_path(&self.config),
+                    &values,
+                )?;
+            }
             let claude_str = self.claude.to_json_string(&claude_servers)?;
             let claude_path = paths.effective_claude_path(&self.config);
             write_atomic_with_backup(&claude_path, &claude_str)?;
@@ -760,7 +875,9 @@ impl LoadedConfigs {
         }
 
         if self.config.tools.copilot.enabled {
-            let copilot_servers = export_for_harness(HarnessKind::Copilot);
+            let (copilot_servers, values, literal) = export_for_harness(HarnessKind::Copilot);
+            secret_literals.insert(HarnessKind::Copilot, literal);
+            let _ = &values;
             let copilot_str = self.copilot.to_json_string(&copilot_servers)?;
             let copilot_path = paths.effective_copilot_path(&self.config);
             write_atomic_with_backup(&copilot_path, &copilot_str)?;
@@ -768,7 +885,9 @@ impl LoadedConfigs {
         }
 
         if self.config.tools.grok.enabled {
-            let grok_servers = export_for_harness(HarnessKind::Grok);
+            let (grok_servers, values, literal) = export_for_harness(HarnessKind::Grok);
+            secret_literals.insert(HarnessKind::Grok, literal);
+            let _ = &values;
             let grok_str = self.grok.to_toml_string(&grok_servers)?;
             let grok_path = paths.effective_grok_path(&self.config);
             write_atomic_with_backup(&grok_path, &grok_str)?;
@@ -776,12 +895,21 @@ impl LoadedConfigs {
         }
 
         if self.config.tools.opencode.enabled {
-            let opencode_servers = export_for_harness(HarnessKind::OpenCode);
+            let (opencode_servers, values, literal) = export_for_harness(HarnessKind::OpenCode);
+            secret_literals.insert(HarnessKind::OpenCode, literal);
+            if !values.is_empty() {
+                write_secret_files(&secrets_dir, &values)?;
+                ensure_gitignore(&paths.maga_dir(), &["secrets/"])?;
+            }
             let opencode_str = self.opencode.to_json_string(&opencode_servers)?;
             let opencode_path = paths.effective_opencode_path(&self.config);
             write_atomic_with_backup(&opencode_path, &opencode_str)?;
             self.opencode = OpenCodeDocument::parse_json_str(&opencode_str)?;
         }
+
+        secret_literals
+            .retain(|kind, servers| self.config.tools.is_enabled(*kind) && !servers.is_empty());
+        self.secret_literals = secret_literals;
 
         Ok(())
     }
@@ -1637,5 +1765,111 @@ url = "https://mcp.docs.astro.build/mcp"
         let reloaded = LoadedConfigs::load(&paths).expect("reload");
         assert_eq!(reloaded.config, loaded.config);
         assert!(!reloaded.config_needs_save);
+    }
+
+    #[test]
+    fn secrets_reach_each_harness_through_its_own_mechanism() {
+        let dir = tempdir().expect("create tempdir");
+        let paths = StoragePaths::in_dir(dir.path());
+        fs::write(
+            dir.path().join(".env.local"),
+            "MAGA_TEST_TOKEN=\"tok-123\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        fs::write(
+            dir.path().join(".claude").join("settings.json"),
+            "{\n  \"theme\": \"dark\"\n}\n",
+        )
+        .unwrap();
+
+        let mut loaded = LoadedConfigs::default();
+        let mut server = McpServerConfig::new_http("https://api.example.com/mcp");
+        server.headers.insert(
+            "Authorization".to_string(),
+            "Bearer ${MAGA_TEST_TOKEN}".to_string(),
+        );
+        loaded.mcp.mcps.insert("api".to_string(), server);
+        loaded
+            .save_all(&paths, &loaded.mcp.mcps.clone())
+            .expect("save_all");
+
+        let read = |p: &Path| fs::read_to_string(p).unwrap();
+
+        // Canonical registry: references only.
+        let mcp_toml = read(&paths.mcp_toml);
+        assert!(mcp_toml.contains("Bearer ${MAGA_TEST_TOKEN}") && !mcp_toml.contains("tok-123"));
+
+        // Claude Code: ${VAR} reference + value in settings.json `env`, other keys kept.
+        let claude = read(&paths.claude_json);
+        assert!(claude.contains("Bearer ${MAGA_TEST_TOKEN}") && !claude.contains("tok-123"));
+        let settings: serde_json::Value =
+            serde_json::from_str(&read(&dir.path().join(".claude").join("settings.json"))).unwrap();
+        assert_eq!(settings["env"]["MAGA_TEST_TOKEN"], "tok-123");
+        assert_eq!(settings["theme"], "dark");
+
+        // OpenCode: {file:} reference + one exact-bytes secret file, git-ignored.
+        let opencode = read(&paths.opencode_json);
+        assert!(
+            opencode.contains("Bearer {file:") && opencode.contains("/secrets/MAGA_TEST_TOKEN}")
+        );
+        assert!(!opencode.contains("tok-123"));
+        assert_eq!(
+            read(&dir.path().join("secrets").join("MAGA_TEST_TOKEN")),
+            "tok-123"
+        );
+        assert!(
+            read(&dir.path().join(".gitignore"))
+                .lines()
+                .any(|l| l == "secrets/")
+        );
+
+        // No documented mechanism: literal in the harness's own local config, and reported.
+        for file in [&paths.agy_json, &paths.copilot_json, &paths.grok_toml] {
+            assert!(read(file).contains("tok-123"), "{}", file.display());
+        }
+        let literal_harnesses: Vec<HarnessKind> = loaded.secret_literals.keys().copied().collect();
+        assert_eq!(
+            literal_harnesses,
+            [
+                HarnessKind::Antigravity,
+                HarnessKind::Copilot,
+                HarnessKind::Grok
+            ]
+        );
+        assert_eq!(loaded.secret_literals[&HarnessKind::Grok], ["api"]);
+
+        // The mixed delivery converges: reloading and syncing again changes nothing.
+        let mut reloaded = LoadedConfigs::load(&paths).expect("reload");
+        assert_eq!(
+            reloaded.check_headless(&paths),
+            crate::domain::reconcile::ConvergenceStatus::Converged
+        );
+        assert!(!reloaded.sync_headless(&paths, false).expect("sync"));
+    }
+
+    #[test]
+    fn upsert_claude_settings_env_merges_and_skips_unchanged_files() {
+        let dir = tempdir().expect("create tempdir");
+        let file = dir.path().join("settings.json");
+        fs::write(&file, "{\"env\": {\"KEEP\": \"1\"}, \"model\": \"x\"}").unwrap();
+
+        let mut vars = BTreeMap::new();
+        vars.insert("NEW".to_string(), "v".to_string());
+        upsert_claude_settings_env(&file, &vars).expect("upsert");
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(json["env"]["KEEP"], "1");
+        assert_eq!(json["env"]["NEW"], "v");
+        assert_eq!(json["model"], "x");
+
+        let before = fs::read_to_string(&file).unwrap();
+        fs::remove_file(dir.path().join("settings.json.bak")).unwrap();
+        upsert_claude_settings_env(&file, &vars).expect("noop upsert");
+        assert_eq!(fs::read_to_string(&file).unwrap(), before);
+        assert!(
+            !dir.path().join("settings.json.bak").exists(),
+            "unchanged file is not rewritten"
+        );
     }
 }

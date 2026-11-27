@@ -1727,13 +1727,28 @@ impl App {
         self.sync_scroll_offset();
     }
 
+    /// Suffix for status messages when some harness had to store secrets as literals.
+    fn secret_warning(&self) -> String {
+        if self.loaded.secret_literals.is_empty() {
+            return String::new();
+        }
+        let names: Vec<&str> = self
+            .loaded
+            .secret_literals
+            .keys()
+            .map(|k| k.display_name())
+            .collect();
+        format!(" · ⚠ secrets stored as literals in: {}", names.join(", "))
+    }
+
     pub fn sync_to_disk(&mut self, success_msg: impl Into<String>) {
         let msg = success_msg.into();
         if let Some(ref paths) = self.paths {
             match self.loaded.save_all(paths, &self.outcome.canonical) {
                 Ok(()) => {
                     self.outcome.canonical = self.loaded.mcp.mcps.clone();
-                    self.status_message = Some((format!("✓ {msg}"), false));
+                    let warning = self.secret_warning();
+                    self.status_message = Some((format!("✓ {msg}{warning}"), false));
                 }
                 Err(e) => {
                     self.status_message = Some((format!("✗ Sync error: {e}"), true));
@@ -4882,5 +4897,31 @@ mod tests {
         }
         assert_eq!(app.section, WorkspaceSection::Harness);
         assert_eq!(app.harness_selected, HarnessKind::Antigravity);
+    }
+
+    #[test]
+    fn sync_warns_when_a_harness_must_store_secrets_as_literals() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = StoragePaths::in_dir(dir.path());
+        std::fs::write(dir.path().join(".env.local"), "MAGA_WARN_TOKEN=\"abc\"\n").unwrap();
+        let mut loaded = LoadedConfigs::load(&paths).expect("load");
+        let mut server = McpServerConfig::new_http("https://api.example.com/mcp");
+        server
+            .headers
+            .insert("Authorization".into(), "Bearer ${MAGA_WARN_TOKEN}".into());
+        loaded.mcp.mcps.insert("api".into(), server);
+
+        let mut app = App::new(Some(paths), loaded, 130, 30);
+        app.sync_to_disk("Synchronized");
+        let (msg, is_error) = app.status_message.clone().expect("status");
+        assert!(!is_error);
+        assert!(
+            msg.contains("⚠ secrets stored as literals in: Antigravity, Copilot, Grok"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("Claude") && !msg.contains("OpenCode"),
+            "{msg}"
+        );
     }
 }

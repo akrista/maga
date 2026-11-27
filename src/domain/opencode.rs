@@ -201,6 +201,7 @@ fn parse_opencode_server(obj: &Map<String, Value>) -> Option<McpServerConfig> {
         project_policy: crate::domain::model::ProjectPolicy::Mirror,
     };
     server.unwrap_windows_shim();
+    crate::domain::secrets::restore_server(&mut server);
     Some(server)
 }
 

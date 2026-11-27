@@ -208,6 +208,22 @@ impl McpServerConfig {
         }
     }
 
+    /// Names of all `${VAR}` / `$VAR` placeholders (without `:-default`) used by this server.
+    pub fn referenced_env_vars(&self) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        let fields = self
+            .command
+            .iter()
+            .chain(&self.args)
+            .chain(self.env.values())
+            .chain(&self.url)
+            .chain(self.headers.values());
+        for field in fields {
+            extract_plain_placeholders(field, &mut names);
+        }
+        names
+    }
+
     /// Returns the sorted names of `${VAR}` / `$VAR` placeholders in this configuration
     /// that have no value in `env`. Placeholders with `${VAR:-fallback}` defaults resolve
     /// via the fallback and are never reported.
@@ -329,6 +345,24 @@ impl McpServerConfig {
         canon.unwrap_windows_shim();
         let resolved = canon.interpolate(env);
         !this.same_definition(&canon) && this.same_definition(&resolved)
+    }
+
+    /// Like [`Self::is_resolved_copy_of`] but looking only at `env` and `headers` values: the
+    /// fields where OpenCode keeps references while it resolves everything else.
+    pub fn has_resolved_env_or_headers(
+        &self,
+        canonical: &Self,
+        env: &BTreeMap<String, String>,
+    ) -> bool {
+        let resolved = canonical.interpolate(env);
+        let differs = |mine: &BTreeMap<String, String>,
+                       canon: &BTreeMap<String, String>,
+                       res: &BTreeMap<String, String>| {
+            mine.iter()
+                .any(|(k, v)| canon.get(k).is_some_and(|c| c != v) && res.get(k) == Some(v))
+        };
+        differs(&self.env, &canonical.env, &resolved.env)
+            || differs(&self.headers, &canonical.headers, &resolved.headers)
     }
 
     /// Prepares this configuration for export to a target harness on the specified OS.

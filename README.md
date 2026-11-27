@@ -223,7 +223,7 @@ maga update
 
 ### Using maga as an MCP server
 
-Register maga itself in any harness's MCP config. Read tools (`list_servers`, `probe_server`, `check_drift`) are always available; mutating tools (`toggle_server`, `sync`) require opt-in via `MAGA_MCP_MUTATIONS=1`:
+Register maga itself in any harness's MCP config. Read tools are always available; tools that change files or install software require opt-in via `MAGA_MCP_MUTATIONS=1` and are hidden otherwise:
 
 ```json
 {
@@ -341,6 +341,24 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/projects"]
 [mcps.filesystem.env]
 NODE_ENV = "production"
 ```
+
+| Tool | Mutating | What it does |
+| :--- | :---: | :--- |
+| `list_servers` | | Canonical MCP servers with enabled state, per-harness state, masked endpoint and conflicts |
+| `probe_server` | | Real MCP handshake against one or all servers |
+| `check_drift` | | Whether every enabled harness matches the registry, without writing |
+| `list_harnesses` | | Per harness: synced or not, config file, active servers, plugin counts, how secrets reach it (and which servers must keep literal secrets) |
+| `list_plugins` | | Plugins per harness (enabled, kind, version) |
+| `list_secrets` | | Secret **names** only: referenced `${VAR}`s, who uses them, whether each is defined, and servers still holding literal secrets |
+| `list_skills` | | Installed skills (global and current project) and the harnesses they are active for |
+| `search_skills` | | Search skills.sh (sends the query to that service) |
+| `toggle_server` | yes | Enable or disable a server and sync |
+| `sync` | yes | Reconcile and sync to all enabled harnesses (`force` overrides conflicts) |
+| `set_server_harness` | yes | Force a server on, off or back to inheriting for ONE harness, then sync |
+| `install_skill` | yes | Install `owner/repo[@skill]` through the `skills` CLI (strictly validated: no URLs, paths or options) |
+| `set_skill_harness` | yes | Link or unlink an installed skill for one harness |
+
+Secret **values** are never returned: endpoints, flags and URL credentials are masked, and every response is scrubbed of the values in `.env.local` and of any secret still literal in the registry. Deliberately not exposed: adding or deleting servers (it would let an agent register an arbitrary command), plugin uninstall, skill removal, guidelines and refs, self-update and settings. Those stay in the TUI.
 
 ### 2. Per-Harness Plugin Ledger (`~/.config/maga/plugins.toml`)
 

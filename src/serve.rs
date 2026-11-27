@@ -4,17 +4,21 @@
 //! goes to stderr; no server-side state — every tool call reconciles from disk; the
 //! mutation gate is read exactly once at startup.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, Write};
 
 use serde_json::{Value, json};
 
-use crate::domain::model::{HarnessKind, MagaConfig, McpServerConfig};
+use crate::domain::model::{
+    HarnessKind, MagaConfig, McpRegistry, McpServerConfig, looks_like_secret_name, parse_dotenv_str,
+};
 use crate::domain::probe::{DEFAULT_PROBE_TIMEOUT, ServerProbeState, probe_server};
 use crate::domain::reconcile::{
     ConflictKind, ConvergenceStatus, McpConflict, ReconcileOutcome, reconcile_harnesses_with_env,
 };
 use crate::domain::storage::{HeadlessSyncError, LoadedConfigs, StoragePaths};
+
+mod tools;
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
@@ -152,6 +156,7 @@ fn tool_definitions(mutations: bool) -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {} },
         }),
     ];
+    tools.extend(tools::read_definitions());
     if mutations {
         tools.push(json!({
             "name": "toggle_server",
@@ -173,6 +178,7 @@ fn tool_definitions(mutations: bool) -> Vec<Value> {
                 "properties": { "force": { "type": "boolean", "description": "Push canonical mcp.toml authoritatively, overriding conflicts." } },
             },
         }));
+        tools.extend(tools::write_definitions());
     }
     tools
 }
@@ -200,17 +206,23 @@ fn tools_call(
         "list_servers" => list_servers(paths),
         "probe_server" => probe_server_tool(&args, paths),
         "check_drift" => check_drift(paths),
-        "toggle_server" | "sync" if !mutations => Err(DispatchError::Tool(read_only_error(name))),
+        name if tools::is_mutating(name) && !mutations => {
+            Err(DispatchError::Tool(read_only_error(name)))
+        }
         "toggle_server" => toggle_server(&args, paths),
         "sync" => sync(&args, paths),
-        other => Err(DispatchError::Rpc(-32602, format!("Unknown tool: {other}"))),
+        other => tools::call(other, &args, paths)
+            .unwrap_or_else(|| Err(DispatchError::Rpc(-32602, format!("Unknown tool: {other}")))),
     };
     match outcome {
         Ok(value) => Ok(tool_text(
-            serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".into()),
+            scrub(
+                serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".into()),
+                paths,
+            ),
             false,
         )),
-        Err(DispatchError::Tool(message)) => Ok(tool_text(message, true)),
+        Err(DispatchError::Tool(message)) => Ok(tool_text(scrub(message, paths), true)),
         Err(rpc) => Err(rpc),
     }
 }
@@ -254,16 +266,24 @@ fn conflict_brief(conflicts: &[McpConflict]) -> String {
 }
 
 fn list_servers(paths: &StoragePaths) -> Result<Value, DispatchError> {
-    let (_, outcome) = reconcile_from_disk(paths).map_err(DispatchError::Tool)?;
+    let (loaded, outcome) = reconcile_from_disk(paths).map_err(DispatchError::Tool)?;
     let servers: Vec<Value> = outcome
         .canonical
         .iter()
         .map(|(name, cfg)| {
+            let per_harness: BTreeMap<&str, bool> = loaded
+                .config
+                .tools
+                .enabled_harnesses()
+                .into_iter()
+                .map(|h| (h.key(), cfg.enabled_for_harness(h)))
+                .collect();
             json!({
                 "name": name,
                 "enabled": cfg.enabled,
                 "transport": cfg.transport.as_str(),
-                "endpoint": cfg.endpoint_summary(),
+                "endpoint": cfg.redacted().endpoint_summary(),
+                "harnesses": per_harness,
                 "conflicted": outcome.conflicts.iter().any(|c| c.matches_name(name)),
                 "description": cfg.description,
             })
@@ -477,6 +497,49 @@ fn next_session_notes(config: &MagaConfig) -> Vec<String> {
             )
         })
         .collect()
+}
+
+/// Secret values that must never reach an agent: everything in maga's `.env.local`, the values
+/// of secret-looking variables the registry references, and literal secrets still in it.
+fn secret_values(paths: &StoragePaths) -> Vec<String> {
+    let mut values = BTreeSet::new();
+    let mut secret_names = BTreeSet::new();
+    if let Ok(text) = std::fs::read_to_string(paths.maga_dotenv_path()) {
+        for (name, value) in parse_dotenv_str(&text) {
+            values.insert(value);
+            secret_names.insert(name);
+        }
+    }
+    if let Ok(text) = std::fs::read_to_string(&paths.mcp_toml)
+        && let Ok(registry) = McpRegistry::from_toml_str(&text)
+    {
+        let env = paths.load_env_context();
+        for cfg in registry.mcps.values() {
+            for var in cfg.referenced_env_vars() {
+                if looks_like_secret_name(&var)
+                    && let Some(value) = env.get(&var)
+                {
+                    values.insert(value.clone());
+                }
+            }
+            values.extend(cfg.secret_fragments());
+        }
+    }
+    // Very short values would mangle ordinary text; longest first so overlaps mask fully.
+    let mut values: Vec<String> = values
+        .into_iter()
+        .filter(|v| v.chars().count() >= 6)
+        .collect();
+    values.sort_by_key(|v| std::cmp::Reverse(v.len()));
+    values
+}
+
+/// Defense in depth: masks any secret value in `text`, whatever produced it (errors, probe output).
+fn scrub(mut text: String, paths: &StoragePaths) -> String {
+    for secret in secret_values(paths) {
+        text = text.replace(&secret, "***");
+    }
+    text
 }
 
 fn error_response(id: Value, code: i64, message: &str) -> Value {

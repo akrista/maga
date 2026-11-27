@@ -1968,7 +1968,11 @@ impl App {
         let any_harness_out_of_sync = HarnessKind::ALL.into_iter().any(|kind| {
             fresh.config.tools.is_enabled(kind)
                 && (!harness_maps_match_with_env(
-                    fresh.harness_servers(kind),
+                    &crate::domain::reconcile::follow_overrides(
+                        kind,
+                        fresh.harness_servers(kind),
+                        &new_outcome.canonical,
+                    ),
                     &new_outcome.canonical,
                     Some(&env_ctx),
                 ) || fresh.harness_has_raw_spaced_keys(kind)

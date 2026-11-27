@@ -185,6 +185,10 @@ pub fn parse_installed_output(raw: &str) -> Result<Vec<InstalledSkill>, String> 
 /// Launcher: `MAGA_SKILLS_CMD` (whitespace-separated, e.g. `pnpm dlx skills`), else
 /// `bunx skills`, else `npx -y skills`.
 pub fn run_skills(args: &[String], cwd: &Path) -> Result<String, String> {
+    #[cfg(test)]
+    if let Some(result) = test_support::mocked(args) {
+        return result;
+    }
     let launcher: Vec<String> = match std::env::var("MAGA_SKILLS_CMD") {
         Ok(custom) if !custom.trim().is_empty() => {
             custom.split_whitespace().map(String::from).collect()
@@ -242,6 +246,27 @@ pub fn list_installed(cwd: &Path) -> Result<Vec<InstalledSkill>, String> {
 /// Searches skills.sh through `skills find <query>`.
 pub fn search(query: &str, cwd: &Path) -> Result<Vec<SearchHit>, String> {
     run_skills(&["find".into(), query.into()], cwd).map(|out| parse_search_output(&out))
+}
+
+/// Per-thread fake of the CLI so tests never spawn `bunx`.
+#[cfg(test)]
+pub mod test_support {
+    use std::cell::RefCell;
+
+    type Fake = Box<dyn Fn(&[String]) -> Result<String, String>>;
+
+    thread_local! {
+        static FAKE: RefCell<Option<Fake>> = RefCell::new(None);
+    }
+
+    /// Routes every `run_skills` call on this thread through `fake`.
+    pub fn install(fake: impl Fn(&[String]) -> Result<String, String> + 'static) {
+        FAKE.with(|f| *f.borrow_mut() = Some(Box::new(fake)));
+    }
+
+    pub(super) fn mocked(args: &[String]) -> Option<Result<String, String>> {
+        FAKE.with(|f| f.borrow().as_ref().map(|fake| fake(args)))
+    }
 }
 
 #[cfg(test)]

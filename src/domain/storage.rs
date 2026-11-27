@@ -986,7 +986,7 @@ impl LoadedConfigs {
             && !self.harness_has_resolved_secrets(&outcome.canonical, &env_context)
             && enabled_servers.iter().all(|(k, map)| {
                 crate::domain::reconcile::harness_maps_match_with_env(
-                    map,
+                    &crate::domain::reconcile::follow_overrides(*k, map, &outcome.canonical),
                     &outcome.canonical,
                     Some(&env_context),
                 ) && !self.harness_has_raw_spaced_keys(*k)

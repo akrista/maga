@@ -383,25 +383,44 @@ impl McpServerConfig {
     }
 
     /// Compares this harness-provided configuration against a canonical configuration,
-    /// considering both literal equality and template equality after variable interpolation
-    /// and Windows shim normalization.
+    /// field by field: each string may be literally equal or equal after `${VAR}`
+    /// interpolation, so harnesses that keep references in some fields (headers, env) and hold
+    /// resolved values in others (URL, args) still match. Windows shims are normalised.
     pub fn matches_canonical_or_interpolated(
         &self,
         canonical: &Self,
         env: &BTreeMap<String, String>,
     ) -> bool {
-        let mut unshimmed_self = self.clone();
-        unshimmed_self.unwrap_windows_shim();
+        let mut this = self.clone();
+        this.unwrap_windows_shim();
+        let mut canon = canonical.clone();
+        canon.unwrap_windows_shim();
 
-        let mut unshimmed_canonical = canonical.clone();
-        unshimmed_canonical.unwrap_windows_shim();
-
-        if unshimmed_self.same_harness_state(&unshimmed_canonical) {
+        if this.same_harness_state(&canon) {
             return true;
         }
-
-        let interpolated = unshimmed_canonical.interpolate(env);
-        unshimmed_self.same_harness_state(&interpolated)
+        if this.enabled != canon.enabled || this.transport != canon.transport {
+            return false;
+        }
+        let eq =
+            |mine: &str, theirs: &str| mine == theirs || mine == interpolate_string(theirs, env);
+        let opt = |mine: &Option<String>, theirs: &Option<String>| match (mine, theirs) {
+            (None, None) => true,
+            (Some(m), Some(t)) => eq(m, t),
+            _ => false,
+        };
+        let map = |mine: &BTreeMap<String, String>, theirs: &BTreeMap<String, String>| {
+            mine.len() == theirs.len()
+                && mine
+                    .iter()
+                    .all(|(k, v)| theirs.get(k).is_some_and(|t| eq(v, t)))
+        };
+        opt(&this.command, &canon.command)
+            && this.args.len() == canon.args.len()
+            && this.args.iter().zip(&canon.args).all(|(m, t)| eq(m, t))
+            && map(&this.env, &canon.env)
+            && opt(&this.url, &canon.url)
+            && map(&this.headers, &canon.headers)
     }
 }
 
@@ -447,6 +466,138 @@ pub fn dotenv_quote(value: &str) -> Option<String> {
         (false, _) => Some(format!("\"{value}\"")),
         (true, false) => Some(format!("'{value}'")),
         (true, true) => None,
+    }
+}
+
+const REDACTED: &str = "***";
+
+pub fn looks_like_secret_name(name: &str) -> bool {
+    const MARKERS: [&str; 9] = [
+        "TOKEN",
+        "SECRET",
+        "PASS",
+        "KEY",
+        "AUTH",
+        "CREDENTIAL",
+        "BEARER",
+        "SIGNATURE",
+        "DSN",
+    ];
+    let upper = name.to_ascii_uppercase();
+    MARKERS.iter().any(|m| upper.contains(m))
+}
+
+/// True when the value is made of `${VAR}` references (a name, not a secret) or is empty.
+fn is_reference_or_empty(value: &str) -> bool {
+    let mut names = BTreeSet::new();
+    extract_plain_placeholders(value, &mut names);
+    value.trim().is_empty() || !names.is_empty()
+}
+
+/// Masks the password of `scheme://user:pass@host` and secret-looking query parameter values,
+/// pushing each removed value into `found`.
+fn mask_url(input: &str, found: &mut Vec<String>) -> String {
+    let mut out = input.to_string();
+    if let Some(scheme_end) = out.find("://") {
+        let authority_start = scheme_end + 3;
+        let authority_end = out[authority_start..]
+            .find(['/', '?', '#'])
+            .map_or(out.len(), |i| authority_start + i);
+        if let Some(at) = out[authority_start..authority_end].rfind('@') {
+            let userinfo_end = authority_start + at;
+            if let Some(colon) = out[authority_start..userinfo_end].find(':') {
+                let pass_start = authority_start + colon + 1;
+                let password = out[pass_start..userinfo_end].to_string();
+                if !is_reference_or_empty(&password) {
+                    found.push(password);
+                    out.replace_range(pass_start..userinfo_end, REDACTED);
+                }
+            }
+        }
+    }
+    if let Some((base, rest)) = out.split_once('?') {
+        let (query, fragment) = match rest.split_once('#') {
+            Some((q, f)) => (q, format!("#{f}")),
+            None => (rest, String::new()),
+        };
+        let masked: Vec<String> = query
+            .split('&')
+            .map(|pair| match pair.split_once('=') {
+                Some((k, v)) if looks_like_secret_name(k) && !is_reference_or_empty(v) => {
+                    found.push(v.to_string());
+                    format!("{k}={REDACTED}")
+                }
+                _ => pair.to_string(),
+            })
+            .collect();
+        out = format!("{base}?{}{fragment}", masked.join("&"));
+    }
+    out
+}
+
+impl McpServerConfig {
+    /// A copy that is safe to show to an agent or in logs: literal values of secret-looking
+    /// `env`/`headers` entries, flag values (`--token x`, `--api-key=x`, `KEY=x`) and URL
+    /// credentials become `***`. `${VAR}` references stay, since they are names.
+    pub fn redacted(&self) -> Self {
+        self.redact_into(&mut Vec::new())
+    }
+
+    /// The literal secret values [`Self::redacted`] removes, for scrubbing free-form text
+    /// (error messages, probe output) that might echo them.
+    pub fn secret_fragments(&self) -> Vec<String> {
+        let mut found = Vec::new();
+        self.redact_into(&mut found);
+        found
+    }
+
+    fn redact_into(&self, found: &mut Vec<String>) -> Self {
+        let mut out = self.clone();
+        for (key, value) in out.env.iter_mut().chain(out.headers.iter_mut()) {
+            if looks_like_secret_name(key) && !is_reference_or_empty(value) {
+                // Keep a scheme such as "Bearer " visible.
+                *value = match value.split_once(' ') {
+                    Some((scheme, token)) if matches!(scheme, "Bearer" | "Basic" | "Token") => {
+                        found.push(token.to_string());
+                        format!("{scheme} {REDACTED}")
+                    }
+                    _ => {
+                        found.push(value.clone());
+                        REDACTED.to_string()
+                    }
+                };
+            }
+        }
+        out.url = out.url.as_deref().map(|u| mask_url(u, found));
+
+        let mut flag_takes_secret = false;
+        for arg in &mut out.args {
+            let is_flag = arg.starts_with('-');
+            let bare = arg.trim_start_matches('-');
+            if let Some((name, value)) = bare.split_once('=')
+                && looks_like_secret_name(name)
+                && !is_reference_or_empty(value)
+            {
+                found.push(value.to_string());
+                let prefix = &arg[..arg.len() - bare.len()];
+                *arg = format!("{prefix}{name}={REDACTED}");
+                flag_takes_secret = false;
+            } else if is_flag {
+                flag_takes_secret = looks_like_secret_name(bare) && !bare.contains('=');
+            } else if flag_takes_secret && !is_reference_or_empty(arg) {
+                *arg = if arg.contains("://") {
+                    mask_url(arg, found)
+                } else {
+                    found.push(arg.clone());
+                    REDACTED.to_string()
+                };
+                flag_takes_secret = false;
+            } else {
+                *arg = mask_url(arg, found);
+                flag_takes_secret = false;
+            }
+        }
+        out
     }
 }
 
@@ -2192,5 +2343,87 @@ theme = "elite"
             assert_eq!(parse_dotenv_str(&line)["K"], value);
         }
         assert!(dotenv_quote("a\nb").is_none());
+    }
+
+    #[test]
+    fn redacted_hides_literal_secrets_but_keeps_references_and_structure() {
+        let mut http = McpServerConfig::new_http(
+            "https://user:hunter2@api.example.com/mcp?apiKey=k-123&mode=fast&t=${T}",
+        );
+        http.headers
+            .insert("Authorization".into(), "Bearer live-token".into());
+        http.headers.insert("X-Api-Key".into(), "${MY_KEY}".into());
+        http.headers
+            .insert("Accept".into(), "application/json".into());
+        http.env.insert("GITHUB_TOKEN".into(), "ghp_abc".into());
+        http.env.insert("LOG_LEVEL".into(), "debug".into());
+
+        let mut fragments = http.secret_fragments();
+        fragments.sort();
+        assert_eq!(fragments, ["ghp_abc", "hunter2", "k-123", "live-token"]);
+
+        let r = http.redacted();
+        assert_eq!(
+            r.url.as_deref(),
+            Some("https://user:***@api.example.com/mcp?apiKey=***&mode=fast&t=${T}")
+        );
+        assert_eq!(r.headers["Authorization"], "Bearer ***");
+        assert_eq!(r.headers["X-Api-Key"], "${MY_KEY}", "references are names");
+        assert_eq!(r.headers["Accept"], "application/json");
+        assert_eq!(r.env["GITHUB_TOKEN"], "***");
+        assert_eq!(r.env["LOG_LEVEL"], "debug");
+
+        let stdio = McpServerConfig::new_stdio(
+            "node",
+            vec![
+                "server.js".into(),
+                "--api-key".into(),
+                "sk-secret".into(),
+                "--token=abc123".into(),
+                "--port".into(),
+                "8080".into(),
+                "--dsn".into(),
+                "sqlserver://sa:P4ss@db:1433/app".into(),
+                "--password".into(),
+                "${DB_PASS}".into(),
+            ],
+        )
+        .redacted();
+        assert_eq!(
+            stdio.args,
+            [
+                "server.js",
+                "--api-key",
+                "***",
+                "--token=***",
+                "--port",
+                "8080",
+                "--dsn",
+                "sqlserver://sa:***@db:1433/app",
+                "--password",
+                "${DB_PASS}"
+            ]
+        );
+    }
+
+    #[test]
+    fn matches_mixed_reference_and_resolved_fields() {
+        // OpenCode keeps references in headers but resolves the URL.
+        let mut canonical = McpServerConfig::new_http("https://api.example.com/mcp?k=${API_KEY}");
+        canonical
+            .headers
+            .insert("Authorization".into(), "Bearer ${API_TOKEN}".into());
+        let env: BTreeMap<String, String> = [("API_KEY", "k1"), ("API_TOKEN", "t1")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+
+        let mut mixed = canonical.clone();
+        mixed.url = Some("https://api.example.com/mcp?k=k1".into());
+        assert!(mixed.matches_canonical_or_interpolated(&canonical, &env));
+
+        // A wrong resolved value is still real drift.
+        mixed.url = Some("https://api.example.com/mcp?k=other".into());
+        assert!(!mixed.matches_canonical_or_interpolated(&canonical, &env));
     }
 }

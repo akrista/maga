@@ -188,6 +188,28 @@ impl ReconcileOutcome {
     }
 }
 
+/// A harness copy that was forced on or off through a per-harness override (`harnesses` in
+/// `mcp.toml`) legitimately differs from the global `enabled` flag. Treat it as following the flag
+/// so only real drift is reported; a copy that disagrees with its own override is left as is.
+pub fn follow_overrides(
+    kind: HarnessKind,
+    harness_map: &BTreeMap<String, McpServerConfig>,
+    canonical: &BTreeMap<String, McpServerConfig>,
+) -> BTreeMap<String, McpServerConfig> {
+    harness_map
+        .iter()
+        .map(|(name, cfg)| {
+            let mut cfg = cfg.clone();
+            if let Some(m) = canonical.get(name)
+                && m.harnesses.get(&kind) == Some(&cfg.enabled)
+            {
+                cfg.enabled = m.enabled;
+            }
+            (name.clone(), cfg)
+        })
+        .collect()
+}
+
 /// Returns `true` if `harness_map` and `canonical_map` have the same keys and every entry matches
 /// (supporting `${ENV_VAR}` interpolation and Windows shim unwrapping).
 pub fn harness_maps_match(
@@ -266,7 +288,8 @@ pub fn evaluate_convergence_with_env(
 
     let mut drift_harnesses = Vec::new();
     for (kind, map) in harnesses {
-        if !harness_maps_match_with_env(map, &outcome.canonical, Some(env_ref)) {
+        let followed = follow_overrides(*kind, map, &outcome.canonical);
+        if !harness_maps_match_with_env(&followed, &outcome.canonical, Some(env_ref)) {
             drift_harnesses.push(*kind);
         }
     }
@@ -357,7 +380,12 @@ pub fn reconcile_harnesses_with_env(
     let norm_maga = normalize_server_map(maga);
     let norm_harnesses: Vec<(HarnessKind, BTreeMap<String, McpServerConfig>)> = harnesses
         .iter()
-        .map(|(k, m)| (*k, normalize_server_map(m)))
+        .map(|(k, m)| {
+            (
+                *k,
+                follow_overrides(*k, &normalize_server_map(m), &norm_maga),
+            )
+        })
         .collect();
     let maga = &norm_maga;
     let harnesses = norm_harnesses.as_slice();
@@ -604,7 +632,12 @@ pub fn reconcile_live_reload_harnesses_with_env(
     let mut adj_maga = normalize_server_map(disk_maga);
     let mut adj_harnesses: Vec<(HarnessKind, BTreeMap<String, McpServerConfig>)> = disk_harnesses
         .iter()
-        .map(|(k, m)| (*k, normalize_server_map(m)))
+        .map(|(k, m)| {
+            (
+                *k,
+                follow_overrides(*k, &normalize_server_map(m), &adj_maga),
+            )
+        })
         .collect();
 
     let mut all_names = BTreeSet::new();
@@ -1178,5 +1211,46 @@ mod tests {
         assert_eq!(outcome.conflicts.len(), 1);
         assert_eq!(outcome.conflicts[0].name, "dbhub");
         assert_eq!(outcome.conflicts[0].differing_fields(), vec!["args"]);
+    }
+
+    #[test]
+    fn per_harness_override_is_not_drift_but_a_plain_disabled_copy_is() {
+        let mut canonical_server = McpServerConfig::new_http("https://x.example.com/mcp");
+        canonical_server
+            .harnesses
+            .insert(HarnessKind::Claude, false);
+        let mut maga = BTreeMap::new();
+        maga.insert("x".to_string(), canonical_server.clone());
+        let env = BTreeMap::new();
+
+        let copy = |enabled: bool| {
+            let mut c = canonical_server.clone();
+            c.harnesses.clear();
+            c.enabled = enabled;
+            c
+        };
+        let others_on = |kind| (kind, BTreeMap::from([("x".to_string(), copy(true))]));
+
+        // Claude holds the forced-off copy, Grok follows the global flag: converged.
+        let claude_off = (
+            HarnessKind::Claude,
+            BTreeMap::from([("x".to_string(), copy(false))]),
+        );
+        let harnesses = vec![claude_off, others_on(HarnessKind::Grok)];
+        let outcome = reconcile_harnesses_with_env(&maga, &harnesses, Some(&env));
+        assert!(outcome.conflicts.is_empty(), "{:?}", outcome.conflicts);
+        assert_eq!(
+            evaluate_convergence_with_env(&maga, &harnesses, Some(&env)),
+            ConvergenceStatus::Converged
+        );
+
+        // Without an override, a harness holding a disabled copy is real drift as before.
+        let mut plain = canonical_server.clone();
+        plain.harnesses.clear();
+        let maga_plain = BTreeMap::from([("x".to_string(), plain)]);
+        assert!(!matches!(
+            evaluate_convergence_with_env(&maga_plain, &harnesses, Some(&env)),
+            ConvergenceStatus::Converged
+        ));
     }
 }

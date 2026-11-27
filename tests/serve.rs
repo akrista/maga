@@ -174,8 +174,16 @@ fn full_session_with_mutations() {
             "list_servers",
             "probe_server",
             "check_drift",
+            "list_harnesses",
+            "list_plugins",
+            "list_secrets",
+            "list_skills",
+            "search_skills",
             "toggle_server",
-            "sync"
+            "sync",
+            "set_server_harness",
+            "install_skill",
+            "set_skill_harness"
         ]
     );
 
@@ -306,7 +314,19 @@ fn read_only_session() {
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    assert_eq!(names, ["list_servers", "probe_server", "check_drift"]);
+    assert_eq!(
+        names,
+        [
+            "list_servers",
+            "probe_server",
+            "check_drift",
+            "list_harnesses",
+            "list_plugins",
+            "list_secrets",
+            "list_skills",
+            "search_skills"
+        ]
+    );
 
     let (frame, _) = server.call_tool(
         2,
@@ -340,4 +360,63 @@ fn read_only_session() {
     // The server survives protocol errors.
     let ping = server.request(4, "ping", json!({}));
     assert_eq!(ping["result"], json!({}));
+}
+
+#[test]
+fn new_tools_over_the_real_binary_never_leak_secrets() {
+    let mut server = spawn_server(false);
+    let dir = server._home.path().join("config/maga");
+    std::fs::create_dir_all(&dir).expect("create maga config dir");
+    std::fs::write(
+        dir.join("mcp.toml"),
+        "[mcps.api]\n\
+         enabled = true\n\
+         transport = \"http\"\n\
+         url = \"https://api.example.com/mcp?apiKey=sk-live-SECRETVALUE99\"\n\
+         [mcps.api.headers]\n\
+         Authorization = \"Bearer sk-live-SECRETVALUE99\"\n",
+    )
+    .expect("write mcp.toml");
+    std::fs::write(
+        dir.join(".env.local"),
+        "OTHER_TOKEN=\"another-secret-value-7\"\n",
+    )
+    .expect("write .env.local");
+
+    for (id, tool) in [
+        "list_servers",
+        "list_harnesses",
+        "list_secrets",
+        "list_plugins",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (frame, text) = server.call_tool(id as u64 + 1, tool, json!({}));
+        assert_eq!(frame["result"]["isError"], false, "{tool}: {text}");
+        assert!(
+            !text.contains("sk-live-SECRETVALUE99"),
+            "{tool} leaked: {text}"
+        );
+        assert!(
+            !text.contains("another-secret-value-7"),
+            "{tool} leaked: {text}"
+        );
+    }
+
+    let (_, secrets) = server.call_tool(10, "list_secrets", json!({}));
+    let secrets: Value = serde_json::from_str(&secrets).expect("JSON");
+    assert_eq!(secrets["dotenv_variables"], json!(["OTHER_TOKEN"]));
+    assert_eq!(secrets["servers_with_literal_secrets"], json!(["api"]));
+
+    // Mutating tools stay hidden and refuse to run without MAGA_MCP_MUTATIONS=1.
+    let (frame, text) = server.call_tool(
+        11,
+        "set_server_harness",
+        json!({ "name": "api", "harness": "claude", "state": "off" }),
+    );
+    assert_eq!(frame["result"]["isError"], true);
+    assert!(text.contains("read-only"), "{text}");
+    let (frame, _) = server.call_tool(12, "install_skill", json!({ "package": "o/r" }));
+    assert_eq!(frame["result"]["isError"], true);
 }

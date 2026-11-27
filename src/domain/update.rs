@@ -1,4 +1,3 @@
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::io::{Read, Write};
@@ -112,73 +111,50 @@ pub fn check_latest_release(repo: &str) -> Result<UpdateInfo, String> {
         "Unsupported host platform/architecture for binary self-update".to_string()
     })?;
 
+    // `/releases/latest` redirects to `/releases/tag/<tag>`: resolving the tag this way avoids
+    // the GitHub REST API, whose unauthenticated quota (60 req/h per IP) yields HTTP 403.
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(10)))
         .http_status_as_error(false)
+        .max_redirects(0)
         .build()
         .into();
 
-    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    let mut resp = agent
-        .get(&url)
+    let latest_url = format!("https://github.com/{repo}/releases/latest");
+    let resp = agent
+        .get(&latest_url)
         .header("User-Agent", &format!("maga/{CURRENT_VERSION}"))
-        .header("Accept", "application/vnd.github.v3+json")
         .call()
-        .map_err(|e| format!("Failed to reach GitHub Releases API: {e}"))?;
+        .map_err(|e| format!("Failed to reach GitHub (check your network connection): {e}"))?;
 
     let status = resp.status().as_u16();
-    if status >= 400 {
-        return Err(format!("GitHub API returned HTTP {status}"));
+    if !(300..400).contains(&status) {
+        return Err(format!(
+            "GitHub returned HTTP {status} resolving the latest release"
+        ));
     }
+    let tag_name = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|location| location.trim_end_matches('/').rsplit('/').next())
+        .filter(|tag| !tag.is_empty() && *tag != "latest")
+        .ok_or_else(|| "Could not resolve the latest release tag".to_string())?
+        .to_string();
 
-    let body = resp
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| format!("Failed to read GitHub response: {e}"))?;
+    let release_notes_url = Some(format!("https://github.com/{repo}/releases/tag/{tag_name}"));
 
-    let val: Value = serde_json::from_str(&body)
-        .map_err(|e| format!("Failed to parse GitHub release JSON: {e}"))?;
-
-    let tag_name = val
-        .get("tag_name")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "Missing tag_name in release payload".to_string())?;
-
-    let release_notes_url = val
-        .get("html_url")
-        .and_then(|v| v.as_str())
-        .map(ToString::to_string);
-
-    let remote_semver = SemVer::parse(tag_name)
+    let remote_semver = SemVer::parse(&tag_name)
         .ok_or_else(|| format!("Could not parse remote version tag: {tag_name}"))?;
     let local_semver = SemVer::parse(CURRENT_VERSION)
         .ok_or_else(|| format!("Could not parse local version: {CURRENT_VERSION}"))?;
 
     let is_newer = remote_semver > local_semver;
 
-    let expected_asset_suffix = format!("{target}.{ext}");
-    let expected_sha_suffix = format!("{target}.{ext}.sha256");
-
-    let mut download_url = None;
-    let mut checksum_url = None;
-
-    if let Some(assets) = val.get("assets").and_then(|v| v.as_array()) {
-        for asset in assets {
-            if let Some(name) = asset.get("name").and_then(|v| v.as_str()) {
-                if name.ends_with(&expected_sha_suffix) {
-                    checksum_url = asset
-                        .get("browser_download_url")
-                        .and_then(|v| v.as_str())
-                        .map(ToString::to_string);
-                } else if name.ends_with(&expected_asset_suffix) {
-                    download_url = asset
-                        .get("browser_download_url")
-                        .and_then(|v| v.as_str())
-                        .map(ToString::to_string);
-                }
-            }
-        }
-    }
+    // Asset names follow release.yml: `maga-<tag>-<target>.<ext>` plus a combined `SHA256SUMS`.
+    let release_base = format!("https://github.com/{repo}/releases/download/{tag_name}");
+    let download_url = Some(format!("{release_base}/maga-{tag_name}-{target}.{ext}"));
+    let checksum_url = Some(format!("{release_base}/SHA256SUMS"));
 
     Ok(UpdateInfo {
         current_version: CURRENT_VERSION.to_string(),
@@ -219,40 +195,48 @@ pub fn download_and_verify(
         .read_to_end(&mut archive_bytes)
         .map_err(|e| format!("Failed to read asset data: {e}"))?;
 
-    if let Some(sha_url) = checksum_url {
-        let mut sha_resp = agent
-            .get(sha_url)
+    if let Some(sums_url) = checksum_url {
+        let archive_name = download_url.rsplit('/').next().unwrap_or(download_url);
+        let mut sums_resp = agent
+            .get(sums_url)
             .header("User-Agent", &format!("maga/{CURRENT_VERSION}"))
             .call()
-            .map_err(|e| format!("Failed to download checksum: {e}"))?;
+            .map_err(|e| format!("Failed to download checksums: {e}"))?;
 
-        if sha_resp.status().as_u16() < 400 {
-            let sha_text = sha_resp
-                .body_mut()
-                .read_to_string()
-                .map_err(|e| format!("Failed to read checksum data: {e}"))?;
-            let expected_sha = sha_text
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_lowercase();
+        // Fail closed: an unverifiable archive is never installed.
+        let sums_status = sums_resp.status().as_u16();
+        if sums_status >= 400 {
+            return Err(format!("Checksums download failed with HTTP {sums_status}"));
+        }
+        let sums_text = sums_resp
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| format!("Failed to read checksums: {e}"))?;
+        let expected_sha = expected_sha256(&sums_text, archive_name)
+            .ok_or_else(|| format!("No checksum listed for {archive_name}"))?;
 
-            if !expected_sha.is_empty() {
-                let mut hasher = Sha256::new();
-                hasher.update(&archive_bytes);
-                let computed_sha = format!("{:x}", hasher.finalize());
+        let mut hasher = Sha256::new();
+        hasher.update(&archive_bytes);
+        let computed_sha = format!("{:x}", hasher.finalize());
 
-                if computed_sha != expected_sha {
-                    return Err(format!(
-                        "Checksum verification failed! Expected {expected_sha}, computed {computed_sha}"
-                    ));
-                }
-            }
+        if computed_sha != expected_sha {
+            return Err(format!(
+                "Checksum verification failed! Expected {expected_sha}, computed {computed_sha}"
+            ));
         }
     }
 
     Ok(archive_bytes)
+}
+
+/// Looks up `archive_name` in a `sha256sum`-style listing (`<hash>  <file>` per line).
+fn expected_sha256(sums: &str, archive_name: &str) -> Option<String> {
+    sums.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let hash = parts.next()?;
+        let name = parts.next()?.trim_start_matches('*');
+        (name == archive_name).then(|| hash.to_lowercase())
+    })
 }
 
 pub fn extract_binary(
@@ -385,6 +369,21 @@ mod tests {
         assert!(v0_4_0 > v0_3_1);
         assert!(v1_0_0 > v0_4_0);
         assert!(v1_0_0 > v1_0_0_beta);
+    }
+
+    #[test]
+    fn test_expected_sha256_lookup() {
+        let sums = "AAA111  maga-v1.0.0-x86_64-unknown-linux-musl.tar.gz\n\
+                    bbb222 *maga-v1.0.0-x86_64-pc-windows-msvc.zip\n";
+        assert_eq!(
+            expected_sha256(sums, "maga-v1.0.0-x86_64-unknown-linux-musl.tar.gz").as_deref(),
+            Some("aaa111")
+        );
+        assert_eq!(
+            expected_sha256(sums, "maga-v1.0.0-x86_64-pc-windows-msvc.zip").as_deref(),
+            Some("bbb222")
+        );
+        assert_eq!(expected_sha256(sums, "maga-v1.0.0-other.tar.gz"), None);
     }
 
     #[test]

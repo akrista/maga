@@ -121,7 +121,7 @@ irm https://raw.githubusercontent.com/akrista/maga/master/install.ps1 | iex
 
 Pin a release with `MAGA_VERSION=v0.4.2` (or `--version v0.4.2`); override the destination with `MAGA_INSTALL_DIR`. If `maga` is already installed, re-running the script simply delegates to `maga --update`; add `--force` to reinstall.
 
-> **Upgrading:** use `maga --update`. It replaces the binary in place, even while an agent is running `maga serve` as an MCP server on Windows, where `cargo install` fails because the running `maga.exe` is locked. Running agents keep the old version until restarted.
+> **Upgrading:** use `maga update` (alias of `maga --update`). It replaces the binary in place, even while an agent is running `maga serve` as an MCP server on Windows, where `cargo install` fails because the running `maga.exe` is locked. Running agents keep the old version until restarted.
 
 **Option 2 — Manual Archive or `cargo-binstall`**
 
@@ -174,10 +174,10 @@ maga --sync
 maga --sync --force
 
 # Check if a newer version of maga is available on GitHub Releases
-maga --check-update
+maga check-update
 
 # Automatically download, verify, and replace maga in-place with the latest release
-maga --update
+maga update
 ```
 
 | Flag | Default / Behavior |
@@ -194,8 +194,8 @@ maga --update
 | `--check` | Verify whether canonical state and harnesses are converged without writing any files (exit 0 = converged, 1 = drift, 2 = conflict) |
 | `--sync` | Reconcile and synchronize canonical MCPs to all enabled harnesses non-interactively, failing fast on conflicts (exit 0 = synced, 2 = conflict) |
 | `--force` | Combined with `--sync`: authoritatively push `mcp.toml` to all enabled harnesses, overriding conflicts |
-| `--check-update` | Query GitHub Releases for a newer version of `maga` and print status without modifying files |
-| `--update` | Download the matching release archive, verify its SHA-256 checksum, and upgrade the binary in-place |
+| `check-update` (`--check-update`) | Query GitHub Releases for a newer version of `maga` and print status without modifying files |
+| `update` (`--update`) | Download the matching release archive, verify its SHA-256 checksum, and upgrade the binary in-place |
 | `--serve` | Run maga as an MCP server over stdio (JSON-RPC 2.0): agents can list, probe, drift-check, toggle and sync MCP servers conversationally |
 
 ### Using maga as an MCP server

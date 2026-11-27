@@ -12,7 +12,7 @@ pub mod ui;
 use crate::app::App;
 use crate::domain::storage::{LoadedConfigs, StoragePaths};
 use crate::theme::Theme;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use crossterm::cursor::Show;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
@@ -26,6 +26,9 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(name = "maga", version, about)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Override path to general `maga` TOML config (`~/.config/maga/config.toml`).
     #[arg(long)]
     config: Option<PathBuf>,
@@ -95,6 +98,17 @@ struct Cli {
     serve: bool,
 }
 
+/// Subcommand shortcuts for the most common flags (`maga update` == `maga --update`).
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Download and install the latest release of maga in-place (same as `--update`).
+    Update,
+    /// Check whether a newer version is available without updating (same as `--check-update`).
+    CheckUpdate,
+    /// Print the installed maga version (same as `--version`).
+    Version,
+}
+
 /// RAII guard that ensures raw mode and alternate screen are always restored on exit or panic.
 struct TerminalGuard;
 
@@ -123,7 +137,16 @@ fn install_panic_hook() {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    match cli.command.take() {
+        Some(Command::Update) => cli.update = true,
+        Some(Command::CheckUpdate) => cli.check_update = true,
+        Some(Command::Version) => {
+            println!("maga {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        None => {}
+    }
 
     if cli.check_update {
         println!("\x1b[1;36m✦ maga update check ✦\x1b[0m");
@@ -133,7 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  Latest version:  {}", info.latest_version);
                 if info.is_newer {
                     println!(
-                        "\x1b[1;33m  Update available! Run `maga --update` to upgrade.\x1b[0m"
+                        "\x1b[1;33m  Update available! Run `maga update` to upgrade.\x1b[0m"
                     );
                     if let Some(notes) = &info.release_notes_url {
                         println!("  Release notes:   {notes}");

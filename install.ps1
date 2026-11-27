@@ -127,7 +127,15 @@ if ($env:PROCESSOR_ARCHITECTURE -ne "AMD64") {
 $Target = "x86_64-pc-windows-msvc"
 
 if (-not $Version) {
-    $Version = (Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest").tag_name
+    # /releases/latest redirects to /releases/tag/<tag>: no API quota (the REST API answers HTTP 403 once spent).
+    $request = [Net.HttpWebRequest]::Create("https://github.com/$Repo/releases/latest")
+    $request.AllowAutoRedirect = $false   # Invoke-WebRequest -MaximumRedirection 0 throws on Windows PowerShell 5.1
+    $request.UserAgent = "maga-install"
+    $response = $request.GetResponse()
+    $location = $response.Headers["Location"]
+    $response.Close()
+    $Version = ("$location" -split "/")[-1]
+    if (-not $Version -or $Version -eq "latest") { throw "Could not resolve the latest release." }
 }
 if (-not $Version.StartsWith("v")) { $Version = "v$Version" }
 

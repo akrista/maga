@@ -879,7 +879,7 @@ mod tests {
             .expect("save all target configs");
 
         let reloaded = LoadedConfigs::load(&paths).expect("reload all target configs");
-        assert!(paths.config_toml.exists());
+        assert!(paths.settings_toml.exists());
         assert!(paths.mcp_toml.exists());
         assert_eq!(reloaded.mcp.mcps["sqlite-mcp"], merged);
         assert_eq!(reloaded.agy.servers["sqlite-mcp"], merged);

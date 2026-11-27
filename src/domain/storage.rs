@@ -18,7 +18,12 @@ use tempfile::NamedTempFile;
 /// Target file paths managed by `maga`.
 #[derive(Debug, Clone)]
 pub struct StoragePaths {
-    pub config_toml: PathBuf,
+    /// Versionable preferences (`settings.toml`).
+    pub settings_toml: PathBuf,
+    /// Machine-specific overrides (`settings.local.toml`, git-ignored).
+    pub settings_local_toml: PathBuf,
+    /// Pre-split `config.toml`, read once for migration and then moved to `.bak`.
+    pub legacy_config_toml: PathBuf,
     pub mcp_toml: PathBuf,
     pub plugins_toml: PathBuf,
     pub profiles_toml: PathBuf,
@@ -52,7 +57,9 @@ impl StoragePaths {
         let refs_cache_dir = data_root.join("maga").join("refs");
 
         Ok(Self {
-            config_toml: maga_dir.join("config.toml"),
+            settings_toml: maga_dir.join("settings.toml"),
+            settings_local_toml: maga_dir.join("settings.local.toml"),
+            legacy_config_toml: maga_dir.join("config.toml"),
             mcp_toml: maga_dir.join("mcp.toml"),
             plugins_toml: maga_dir.join("plugins.toml"),
             profiles_toml: maga_dir.join("profiles.toml"),
@@ -75,7 +82,9 @@ impl StoragePaths {
     /// Creates isolated test paths inside `dir`.
     pub fn in_dir(dir: &Path) -> Self {
         Self {
-            config_toml: dir.join("config.toml"),
+            settings_toml: dir.join("settings.toml"),
+            settings_local_toml: dir.join("settings.local.toml"),
+            legacy_config_toml: dir.join("config.toml"),
             mcp_toml: dir.join("mcp.toml"),
             plugins_toml: dir.join("plugins.toml"),
             profiles_toml: dir.join("profiles.toml"),
@@ -429,15 +438,24 @@ impl LoadedConfigs {
     }
 
     pub fn load(paths: &StoragePaths) -> Result<Self, String> {
-        let config_exists = paths.config_toml.exists();
+        let config_exists = paths.settings_toml.exists();
+        let legacy_pending = !config_exists
+            && paths.legacy_config_toml != paths.settings_toml
+            && paths.legacy_config_toml.exists();
         let mut config_needs_save = !config_exists;
-        let mut config = if config_exists {
-            let content = fs::read_to_string(&paths.config_toml)
-                .map_err(|e| format!("Failed to read {}: {e}", paths.config_toml.display()))?;
+        let mut config = if config_exists || legacy_pending {
+            let source = if config_exists {
+                &paths.settings_toml
+            } else {
+                &paths.legacy_config_toml
+            };
+            let content = fs::read_to_string(source)
+                .map_err(|e| format!("Failed to read {}: {e}", source.display()))?;
             if !MagaConfig::has_all_default_keys(&content) {
                 config_needs_save = true;
             }
-            MagaConfig::from_toml_str(&content)?
+            let local = fs::read_to_string(&paths.settings_local_toml).ok();
+            MagaConfig::from_layers(&content, local.as_deref())?
         } else {
             MagaConfig::default()
         };
@@ -573,10 +591,32 @@ impl LoadedConfigs {
         Ok(())
     }
 
-    /// Writes `config.toml` atomically to disk.
+    /// Writes `settings.toml` (portable) and `settings.local.toml` (machine-specific, git-ignored)
+    /// atomically, then retires a pre-split `config.toml` to `config.toml.bak`.
     pub fn save_config(&mut self, paths: &StoragePaths) -> Result<(), String> {
-        let config_str = self.config.to_toml_string()?;
-        write_atomic_with_backup(&paths.config_toml, &config_str)?;
+        let (shared, local) = self.config.to_split_toml_strings()?;
+        write_atomic_with_backup(&paths.settings_toml, &shared)?;
+        if !local.is_empty() || paths.settings_local_toml.exists() {
+            write_atomic_with_backup(&paths.settings_local_toml, &local)?;
+        }
+        if let (Some(dir), Some(local_name)) = (
+            paths.settings_toml.parent(),
+            paths
+                .settings_local_toml
+                .file_name()
+                .and_then(|n| n.to_str()),
+        ) {
+            ensure_gitignore(dir, &[local_name, ".env.local", "*.bak"])?;
+        }
+        let legacy = &paths.legacy_config_toml;
+        if legacy != &paths.settings_toml && legacy.exists() {
+            let mut bak = legacy.as_os_str().to_os_string();
+            bak.push(".bak");
+            let bak = PathBuf::from(bak);
+            let _ = fs::remove_file(&bak);
+            fs::rename(legacy, &bak)
+                .map_err(|e| format!("Failed to retire {}: {e}", legacy.display()))?;
+        }
         self.config_exists = true;
         self.config_needs_save = false;
         Ok(())
@@ -1053,10 +1093,11 @@ enabled = true
 transport = "http"
 url = "https://mcp.context7.com/mcp"
 "#;
-        fs::write(&paths.config_toml, legacy_config).expect("write legacy config.toml");
+        fs::write(&paths.legacy_config_toml, legacy_config).expect("write legacy config.toml");
 
         let mut loaded = LoadedConfigs::load(&paths).expect("load configs with legacy migration");
-        assert!(loaded.config_exists);
+        // Legacy config.toml is read, but settings.toml does not exist yet.
+        assert!(!loaded.config_exists);
         assert!(loaded.config_needs_save);
         assert!(!loaded.mcp_exists);
         assert!(loaded.mcp.mcps.contains_key("context7"));
@@ -1070,9 +1111,17 @@ url = "https://mcp.context7.com/mcp"
         assert!(paths.mcp_toml.exists());
         assert!(dir.path().join("config.toml.bak").exists());
         let saved_config =
-            fs::read_to_string(&paths.config_toml).expect("read cleaned config.toml");
+            fs::read_to_string(&paths.settings_toml).expect("read cleaned config.toml");
         assert!(!saved_config.contains("[mcps"));
         assert!(saved_config.contains("theme = \"minimal\""));
+        assert!(
+            !paths.legacy_config_toml.exists(),
+            "legacy file is retired to .bak"
+        );
+        assert!(
+            !paths.settings_local_toml.exists(),
+            "no machine-specific values, no local file"
+        );
 
         let saved_mcp = fs::read_to_string(&paths.mcp_toml).expect("read new mcp.toml");
         assert!(saved_mcp.contains("[mcps.context7]"));
@@ -1084,7 +1133,7 @@ url = "https://mcp.context7.com/mcp"
         let paths = StoragePaths::in_dir(dir.path());
 
         // Partial config.toml missing [refresh] and [tools] is marked for auto-population
-        fs::write(&paths.config_toml, "editor = \"nvim\"\n").expect("write config.toml");
+        fs::write(&paths.settings_toml, "editor = \"nvim\"\n").expect("write config.toml");
 
         let mut loaded = LoadedConfigs::load(&paths).expect("load configs");
         assert!(loaded.config_needs_save);
@@ -1096,8 +1145,11 @@ url = "https://mcp.context7.com/mcp"
         );
         loaded.save_all(&paths, &canonical).expect("save all");
 
-        let populated = fs::read_to_string(&paths.config_toml).unwrap();
-        assert!(populated.contains("editor = \"nvim\""));
+        let populated = fs::read_to_string(&paths.settings_toml).unwrap();
+        // The editor is machine-specific: it moves to settings.local.toml.
+        assert!(!populated.contains("nvim"));
+        let local = fs::read_to_string(&paths.settings_local_toml).unwrap();
+        assert!(local.contains("editor = \"nvim\""));
         assert!(populated.contains("[refresh]"));
         assert!(populated.contains("[tools.antigravity]"));
         assert!(populated.contains("config_path = \"~/.gemini/config/mcp_config.json\""));
@@ -1122,7 +1174,7 @@ url = "https://mcp.context7.com/mcp"
             .save_all(&paths, &canonical)
             .expect("save all on populated config");
         assert!(!bak_path.exists());
-        assert_eq!(fs::read_to_string(&paths.config_toml).unwrap(), populated);
+        assert_eq!(fs::read_to_string(&paths.settings_toml).unwrap(), populated);
     }
 
     #[test]
@@ -1166,7 +1218,7 @@ config_path = '{}'
             custom_grok.display(),
             custom_opencode.display(),
         );
-        fs::write(&paths.config_toml, config_content).expect("write config.toml");
+        fs::write(&paths.settings_toml, config_content).expect("write config.toml");
         fs::write(
             &default_claude,
             r#"{"mcpServers": {"ignored": {"type": "http", "url": "https://ignored.example.com/mcp"}}}"#,
@@ -1543,5 +1595,47 @@ url = "https://mcp.docs.astro.build/mcp"
             fs::read_to_string(&file).unwrap(),
             "A=1\nB=\"new\"\n# note\nC=\"x y\"\n"
         );
+    }
+
+    #[test]
+    fn settings_split_keeps_machine_paths_out_of_the_versioned_file() {
+        let dir = tempdir().expect("create tempdir");
+        let paths = StoragePaths::in_dir(dir.path());
+
+        // Legacy single file with a machine-specific override and a personal editor.
+        let legacy = "[ui]\neditor = \"C:/Tools/nvim.exe\"\ntheme = \"blush\"\n\n\
+            [tools.claude]\nenabled = true\nconfig_path = \"D:/work/claude.json\"\n";
+        fs::write(&paths.legacy_config_toml, legacy).expect("write legacy");
+
+        let mut loaded = LoadedConfigs::load(&paths).expect("load legacy");
+        assert_eq!(
+            loaded.config.tools.claude.config_path.as_deref(),
+            Some("D:/work/claude.json")
+        );
+        loaded.save_config(&paths).expect("save split");
+
+        let shared = fs::read_to_string(&paths.settings_toml).unwrap();
+        let local = fs::read_to_string(&paths.settings_local_toml).unwrap();
+        assert!(
+            !shared.contains("D:/work") && !shared.contains("nvim.exe"),
+            "{shared}"
+        );
+        assert!(shared.contains("theme = \"blush\""));
+        assert!(shared.contains("config_path = \"~/.claude.json\""));
+        assert!(local.contains("D:/work/claude.json") && local.contains("nvim.exe"));
+        assert!(dir.path().join("config.toml.bak").exists());
+
+        let gitignore = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        for entry in ["settings.local.toml", ".env.local", "*.bak"] {
+            assert!(
+                gitignore.lines().any(|l| l == entry),
+                "{entry} in {gitignore}"
+            );
+        }
+
+        // Layering the two files reproduces the original effective config.
+        let reloaded = LoadedConfigs::load(&paths).expect("reload");
+        assert_eq!(reloaded.config, loaded.config);
+        assert!(!reloaded.config_needs_save);
     }
 }

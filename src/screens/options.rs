@@ -11,7 +11,7 @@ pub fn draw_options_modal(f: &mut Frame, area: Rect, opt: &OptionsState, theme: 
 
     let block = Block::default()
         .title(Span::styled(
-            " OPTIONS · config.toml (j/k: field  Space/←/→: change  Enter: save  Esc: cancel) ",
+            " OPTIONS · settings.toml (j/k: field  Space/←/→: change  Enter: save  Esc: cancel) ",
             theme.header,
         ))
         .borders(Borders::ALL)

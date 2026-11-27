@@ -399,7 +399,7 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             " Tab/Shift+Tab: field · Space: switch transport · Enter: save · Esc: cancel"
         }
         ActiveMode::Options(_) => {
-            " j/k/Tab: field · Space/←/→: change value · Enter: save to config.toml · Esc: cancel"
+            " j/k/Tab: field · Space/←/→: change value · Enter: save to settings.toml · Esc: cancel"
         }
         ActiveMode::ConflictModal { .. } => {
             " 1..N: Keep Variant · E: Merge in $EDITOR · s/Esc: Skip"
@@ -1335,7 +1335,7 @@ mod tests {
         let mut app = build_test_app(80, 24);
         app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
         let frame_str = render_to_string(80, 24, &app, false);
-        assert!(frame_str.contains("OPTIONS · config.toml"));
+        assert!(frame_str.contains("OPTIONS · settings.toml"));
         assert!(frame_str.contains("blush (Warm Sunset)"));
         assert!(frame_str.contains("lite (ASCII Splash)"));
         assert!(frame_str.contains("Antigravity"));

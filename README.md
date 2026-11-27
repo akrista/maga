@@ -35,7 +35,7 @@
 ```text
          ┌──────────────────────────────────────────────────────────────┐
          │                     ~/.config/maga/                          │
-         │  mcp.toml (Canonical MCPs) · plugins.toml · config.toml (UI) │
+         │  mcp.toml (MCPs) · plugins.toml · settings.toml (UI)       │
          └──────────────────────────────┬───────────────────────────────┘
                                         │
                ┌────────────────────────┼────────────────────────┐
@@ -55,7 +55,7 @@
                      └─────────────────┘ └─────────────────┘
 ```
 
-- **Canonical MCP Registry (`~/.config/maga/mcp.toml`)**: Define `stdio` (`command`, `args`, `env`, `description`) and `http` (`url`, `headers`, `description`) MCP servers once, cleanly separated from UI/tool preferences in `~/.config/maga/config.toml` and plugin state in `~/.config/maga/plugins.toml`.
+- **Canonical MCP Registry (`~/.config/maga/mcp.toml`)**: Define `stdio` (`command`, `args`, `env`, `description`) and `http` (`url`, `headers`, `description`) MCP servers once, cleanly separated from UI/tool preferences in `~/.config/maga/settings.toml` (plus machine-specific `settings.local.toml`) and plugin state in `~/.config/maga/plugins.toml`.
 - **Two-Way Reconciliation & Conflict Detection**: Automatically imports untracked servers on startup and live reload, detects definition drift, case-insensitive name collisions (e.g., `"Context7"` vs `"context7"`), and servers referencing `${VAR}` / `$VAR` placeholders with no value in the environment, and groups identical definitions into numbered variants (`[1]`..`[N]`) for side-by-side resolution.
 - **Secrets stay out of configs**: Literal tokens, keys, and passwords in `env`, `headers`, and URL query parameters are moved to `~/.config/maga/.env.local` (created next to a `.gitignore` that excludes it), and both `mcp.toml` and every harness config keep `${VAR}` references. The harness must have those variables in its environment (e.g. load `.env.local` from your shell profile); servers with unresolved variables are exported disabled. Secret-looking `args` are not scanned.
 - **Per-Harness Plugin Management (`Tab` / `1` / `2`)**: Discovers installed and configured plugins across all 5 harnesses, extracts bundled `skills`, `hooks`, and `MCPs` counts/identifiers, toggles plugins in each harness's native config file, retains disabled OpenCode npm specifiers in `plugins.toml`, and supports complete native uninstall (`d`).
@@ -105,7 +105,7 @@ Switch between the **MCP Servers (`1`)** and **Plugins (`2`)** workspace section
 
 A thin wrapper over the [`skills`](https://skills.sh) CLI (`bunx skills`, falling back to `npx -y skills`; override the launcher with `MAGA_SKILLS_CMD`). The CLI keeps ownership of the canonical copy in `~/.agents/skills` and of the per-agent links (`~/.claude/skills`, `~/.gemini/config/skills`, ...); maga never writes those paths itself.
 
-- **Search & install**: <kbd>f</kbd> runs `skills find`, <kbd>Enter</kbd> installs the highlighted result for every harness enabled in `config.toml`. <kbd>a</kbd> installs a package by name (`owner/repo` or `owner/repo@skill`). <kbd>Tab</kbd> in either dialog switches between **global** (`-g`) and **project** (the directory `maga` was started in).
+- **Search & install**: <kbd>f</kbd> runs `skills find`, <kbd>Enter</kbd> installs the highlighted result for every harness enabled in `settings.toml`. <kbd>a</kbd> installs a package by name (`owner/repo` or `owner/repo@skill`). <kbd>Tab</kbd> in either dialog switches between **global** (`-g`) and **project** (the directory `maga` was started in).
 - **Per-harness activation**: the list shows one column per harness (`AGY CLD GHC GRK OPC`); <kbd>h</kbd>/<kbd>l</kbd> pick a column and <kbd>Space</kbd> unlinks (`skills remove -a`) or relinks (`skills add <source> -a`) the skill for that harness. Relinking needs the source recorded by the CLI, so hand-made skills can be unlinked but not relinked.
 - All CLI calls run on a worker thread; the title shows the running operation.
 
@@ -161,7 +161,7 @@ maga
 ```bash
 # Override individual config or harness file paths
 maga \
-  --config ~/.config/maga/config.toml \
+  --config ~/.config/maga/settings.toml \
   --mcp-config ~/.config/maga/mcp.toml \
   --plugins-config ~/.config/maga/plugins.toml \
   --agy-config ~/.gemini/config/mcp_config.json \
@@ -191,7 +191,7 @@ maga update
 
 | Flag | Default / Behavior |
 | :--- | :--- |
-| `--config <CONFIG>` | Override general `maga` config path (`~/.config/maga/config.toml`) |
+| `--config <CONFIG>` | Override general `maga` config path (`~/.config/maga/settings.toml`; a `.local.toml` sibling holds machine-specific values) |
 | `--mcp-config <MCP_CONFIG>` | Override canonical MCP registry path (`~/.config/maga/mcp.toml`) |
 | `--plugins-config <PLUGINS_CONFIG>` | Override per-harness plugins ledger path (`~/.config/maga/plugins.toml`) |
 | `--agy-config <AGY_CONFIG>` | Override Antigravity config path (`~/.gemini/config/mcp_config.json`) |
@@ -250,7 +250,7 @@ Register maga itself in any harness's MCP config. Read tools (`list_servers`, `p
 | <kbd>c</kbd> | Open the grouped-variant **Conflict Resolution** modal |
 | <kbd>m</kbd> | Toggle the high-resolution **Maga Hero Showcase (`54×22` Unicode Braille)** panel |
 | <kbd>b</kbd> | Toggle **Background-Only (`hide_ui`)** mode (hide foreground UI to view full-screen Riverflow art) |
-| <kbd>o</kbd> | Open the interactive **Options (`config.toml`)** modal |
+| <kbd>o</kbd> | Open the interactive **Options (`settings.toml`)** modal |
 | <kbd>r</kbd> / <kbd>R</kbd> | Reload & reconcile configs from disk now / Toggle periodic auto-refresh on or off |
 | <kbd>s</kbd> | Force push in-memory canonical registry to disk now (Guidelines: sync links · Refs: update all refs) |
 | <kbd>h</kbd> / <kbd>l</kbd> · <kbd>Space</kbd> · <kbd>f</kbd> · <kbd>a</kbd> | **Skills** view: focus harness column · enable / disable the skill for it · search skills.sh and install · install by name (<kbd>Tab</kbd> in the dialog: global ⇄ project) |
@@ -263,7 +263,7 @@ Register maga itself in any harness's MCP config. Read tools (`list_servers`, `p
 | :--- | :--- |
 | **Add / Edit Form (`a` / `e`)** | <kbd>Tab</kbd> / <kbd>Shift+Tab</kbd> navigate fields · <kbd>Space</kbd> / <kbd>←</kbd> / <kbd>→</kbd> toggle `stdio` vs `http` or `enabled` · <kbd>Ctrl+e</kbd> edit in `$EDITOR` · <kbd>Enter</kbd> save & sync · <kbd>Esc</kbd> cancel |
 | **Conflict Resolution (`c`)** | <kbd>1</kbd>..<kbd>9</kbd> keep numbered variant & sync all enabled harnesses · <kbd>E</kbd> merge in `$EDITOR` · <kbd>s</kbd> / <kbd>Esc</kbd> skip for now · unresolved-env conflicts have no variants: set the missing env vars (or <kbd>E</kbd> to inline a literal) and they clear on reload |
-| **Options (`o`)** | <kbd>j</kbd> / <kbd>k</kbd> / <kbd>Tab</kbd> select setting · <kbd>Space</kbd> / <kbd>←</kbd> / <kbd>→</kbd> (or <kbd>-</kbd> / <kbd>+</kbd> on interval) cycle value · <kbd>Enter</kbd> save to `config.toml` · <kbd>Esc</kbd> cancel |
+| **Options (`o`)** | <kbd>j</kbd> / <kbd>k</kbd> / <kbd>Tab</kbd> select setting · <kbd>Space</kbd> / <kbd>←</kbd> / <kbd>→</kbd> (or <kbd>-</kbd> / <kbd>+</kbd> on interval) cycle value · <kbd>Enter</kbd> save to `settings.toml` · <kbd>Esc</kbd> cancel |
 
 ---
 
@@ -298,10 +298,10 @@ Press <kbd>/</kbd> in the workspace to filter the active section (**MCPs** or **
 
 ## Configuration Files
 
-`maga` cleanly separates canonical MCP server definitions (`mcp.toml`), per-harness plugin state (`plugins.toml`), and general UI/tool settings (`config.toml`).
+`maga` cleanly separates canonical MCP server definitions (`mcp.toml`), per-harness plugin state (`plugins.toml`), and portable UI/tool settings (`settings.toml`) and machine-specific overrides (`settings.local.toml`).
 
 > [!NOTE]
-> If `~/.config/maga/mcp.toml` does not exist on startup and `~/.config/maga/config.toml` contains a legacy `[mcps]` table, `maga` automatically migrates those servers into `mcp.toml` and cleans up `config.toml`.
+> If `~/.config/maga/mcp.toml` does not exist on startup and `~/.config/maga/config.toml` (the pre-split settings file) contains a legacy `[mcps]` table, `maga` automatically migrates those servers into `mcp.toml` and retires `config.toml` to `config.toml.bak`.
 
 ### 1. Canonical MCP Registry (`~/.config/maga/mcp.toml`)
 
@@ -343,9 +343,10 @@ source = "opencode.json"
 version = "1.6.0"
 ```
 
-### 3. Application Configuration (`~/.config/maga/config.toml`)
+### 3. Application Configuration (`~/.config/maga/settings.toml`)
 
-Press <kbd>o</kbd> inside the TUI to modify and persist these settings interactively, or edit `~/.config/maga/config.toml` directly. Missing standard keys are auto-populated on startup while preserving custom user keys:
+Press <kbd>o</kbd> inside the TUI to modify and persist these settings interactively, or edit `~/.config/maga/settings.toml` directly. Missing standard keys are auto-populated on startup while preserving custom user keys:
+Machine-specific values (harness `config_path` overrides that differ from the default, and the external `editor`) are written to `~/.config/maga/settings.local.toml` instead, which is layered over `settings.toml` and listed in a `.gitignore` that `maga` keeps next to it (together with `.env.local` and `*.bak`). A pre-split `config.toml` is migrated automatically and kept as `config.toml.bak`.
 
 ```toml
 # [ui] Visual theme, 3-tier mascot layers, and micro-animations

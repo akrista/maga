@@ -1004,6 +1004,52 @@ impl Default for UiConfig {
     }
 }
 
+/// Recursively overlays `over` onto `base`: nested tables merge, every other value is replaced.
+pub fn merge_toml_tables(base: &mut toml::Table, over: toml::Table) {
+    for (key, value) in over {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(b)), toml::Value::Table(o)) => merge_toml_tables(b, o),
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
+}
+
+/// Returns the nested table at `path` inside `root`, creating it on the way.
+fn local_table<'a>(root: &'a mut toml::Table, path: &[&str]) -> &'a mut toml::Table {
+    let mut cur = root;
+    for key in path {
+        cur = cur
+            .entry(key.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .expect("table by construction");
+    }
+    cur
+}
+
+/// Comment header written at the top of `settings.toml`.
+const CONFIG_HEADER: &str = "\
+# maga General Configuration\n\
+# Note: MCP server definitions are managed separately in mcp.toml.\n\
+#\n\
+# [ui]\n\
+#   theme         - Active TUI color theme: \"indigo\" | \"blush\" | \"elite\"\n\
+#   mascot_mode   - Companion mode: \"rich\" (moe/chibi companion box) | \"lite\" (ASCII splash)\n\
+#   background    - Enable full-TUI Riverflow ASCII background watermark (true/false)\n\
+#   hero_mascot   - Enable high-res Hero Mascot Showcase via [m] key and empty state (true/false)\n\
+#   hide_ui       - Hide foreground UI panels to display only the background art via [b] key (true/false)\n\
+#   animations    - Enable arcane ASCII flow/glitch and tachyonfx micro-animations (true/false)\n\
+#\n\
+# [refresh]\n\
+#   enabled       - Enable periodic background disk reload & reconciliation (true/false)\n\
+#   interval_secs - Polling interval in seconds for auto-refresh (0 disables timer)\n\
+#\n\
+# [tools.antigravity] / [tools.claude] / [tools.copilot] / [tools.grok] / [tools.opencode]\n\
+#   enabled       - Sync MCP servers with this harness (true/false)\n\
+#   config_path   - Path to the harness MCP config file (supports leading ~/)\n\n";
+
 /// Root structure of `~/.config/maga/config.toml` for general `maga` settings.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MagaConfig {
@@ -1038,26 +1084,73 @@ impl MagaConfig {
     pub fn to_toml_string(&self) -> Result<String, String> {
         let body =
             toml::to_string_pretty(self).map_err(|e| format!("Failed to serialize TOML: {e}"))?;
-        let header = "\
-# maga General Configuration\n\
-# Note: MCP server definitions are managed separately in mcp.toml.\n\
-#\n\
-# [ui]\n\
-#   theme         - Active TUI color theme: \"indigo\" | \"blush\" | \"elite\"\n\
-#   mascot_mode   - Companion mode: \"rich\" (moe/chibi companion box) | \"lite\" (ASCII splash)\n\
-#   background    - Enable full-TUI Riverflow ASCII background watermark (true/false)\n\
-#   hero_mascot   - Enable high-res Hero Mascot Showcase via [m] key and empty state (true/false)\n\
-#   hide_ui       - Hide foreground UI panels to display only the background art via [b] key (true/false)\n\
-#   animations    - Enable arcane ASCII flow/glitch and tachyonfx micro-animations (true/false)\n\
-#\n\
-# [refresh]\n\
-#   enabled       - Enable periodic background disk reload & reconciliation (true/false)\n\
-#   interval_secs - Polling interval in seconds for auto-refresh (0 disables timer)\n\
-#\n\
-# [tools.antigravity] / [tools.claude] / [tools.copilot] / [tools.grok] / [tools.opencode]\n\
-#   enabled       - Sync MCP servers with this harness (true/false)\n\
-#   config_path   - Path to the harness MCP config file (supports leading ~/)\n\n";
-        Ok(format!("{header}{body}"))
+        Ok(format!("{CONFIG_HEADER}{body}"))
+    }
+
+    /// Builds the effective config from `settings.toml` (`shared`) overlaid with the optional
+    /// machine-specific `settings.local.toml`; local keys win.
+    pub fn from_layers(shared: &str, local: Option<&str>) -> Result<Self, String> {
+        let Some(local) = local.filter(|l| !l.trim().is_empty()) else {
+            return Self::from_toml_str(shared);
+        };
+        let mut merged: toml::Table =
+            toml::from_str(shared).map_err(|e| format!("Invalid TOML: {e}"))?;
+        let over: toml::Table =
+            toml::from_str(local).map_err(|e| format!("Invalid local TOML: {e}"))?;
+        merge_toml_tables(&mut merged, over);
+        let merged = toml::to_string(&merged).map_err(|e| format!("Failed to merge TOML: {e}"))?;
+        Self::from_toml_str(&merged)
+    }
+
+    /// Serializes into `(settings.toml, settings.local.toml)`. Machine-specific values go to
+    /// the local file: harness `config_path` overrides (the shared file keeps the portable
+    /// default) and the external `editor`. Empty local content means nothing to store.
+    pub fn to_split_toml_strings(&self) -> Result<(String, String), String> {
+        let mut shared =
+            toml::Table::try_from(self).map_err(|e| format!("Failed to serialize TOML: {e}"))?;
+        let mut local = toml::Table::new();
+
+        for kind in HarnessKind::ALL {
+            let default = kind.default_config_path();
+            let custom = self.tools.get(kind).config_path.as_deref().map(str::trim);
+            if let Some(custom) = custom.filter(|c| !c.is_empty() && *c != default)
+                && let Some(tools) = shared.get_mut("tools").and_then(|t| t.as_table_mut())
+                && let Some(entry) = tools.get_mut(kind.key()).and_then(|t| t.as_table_mut())
+            {
+                entry.insert("config_path".into(), default.into());
+                local_table(&mut local, &["tools", kind.key()])
+                    .insert("config_path".into(), custom.into());
+            }
+        }
+        if let Some(editor) = shared
+            .get_mut("ui")
+            .and_then(|t| t.as_table_mut())
+            .and_then(|ui| ui.remove("editor"))
+        {
+            local_table(&mut local, &["ui"]).insert("editor".into(), editor);
+        }
+        if let Some(editor) = shared.remove("editor") {
+            local.insert("editor".into(), editor);
+        }
+
+        let render = |table: &toml::Table| {
+            toml::to_string_pretty(table).map_err(|e| format!("Failed to serialize TOML: {e}"))
+        };
+        let header = CONFIG_HEADER.replacen(
+            "# maga General Configuration",
+            "# maga settings (portable, safe to version; machine-specific values: settings.local.toml)",
+            1,
+        );
+        let local_body = if local.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "# maga machine-specific overrides (git-ignored).\n\
+                 # Layered over settings.toml: paths and values that only make sense on this machine.\n\n{}",
+                render(&local)?
+            )
+        };
+        Ok((format!("{header}{}", render(&shared)?), local_body))
     }
 
     /// Returns `true` if the raw TOML string already contains all standard `maga` configuration

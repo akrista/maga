@@ -705,7 +705,7 @@ impl App {
                 if (!loaded.config_exists || loaded.config_needs_save)
                     && let Err(e) = loaded.save_config(p)
                 {
-                    status_message = Some((format!("✗ Failed to save config.toml: {e}"), true));
+                    status_message = Some((format!("✗ Failed to save settings.toml: {e}"), true));
                 }
                 if loaded.plugins_ledger_needs_save
                     && let Err(e) = loaded.save_plugins_ledger(p)
@@ -1718,7 +1718,7 @@ impl App {
         if let Some(ref paths) = self.paths
             && let Err(e) = self.loaded.save_config(paths)
         {
-            self.status_message = Some((format!("✗ Failed to save config.toml: {e}"), true));
+            self.status_message = Some((format!("✗ Failed to save settings.toml: {e}"), true));
             return;
         }
 
@@ -3394,11 +3394,11 @@ impl App {
                     match res {
                         Ok(()) => {
                             self.status_message =
-                                Some(("✓ Saved options to config.toml".to_string(), false));
+                                Some(("✓ Saved options to settings.toml".to_string(), false));
                         }
                         Err(e) => {
                             self.status_message =
-                                Some((format!("✗ Failed to save config.toml: {e}"), true));
+                                Some((format!("✗ Failed to save settings.toml: {e}"), true));
                         }
                     }
                 } else {
@@ -3690,7 +3690,7 @@ mod tests {
         // Toggle auto-refresh off and verify it persists to config.toml
         app.toggle_auto_refresh();
         assert!(!app.auto_refresh_enabled());
-        let saved_cfg = fs::read_to_string(&paths.config_toml).expect("read config.toml");
+        let saved_cfg = fs::read_to_string(&paths.settings_toml).expect("read config.toml");
         assert!(saved_cfg.contains("enabled = false"));
 
         // External harness (Antigravity) adds "ext-server" on disk while maga is running
@@ -3721,7 +3721,7 @@ mod tests {
         let paths = StoragePaths::in_dir(dir.path());
 
         // Write an empty config.toml and conflicting harness definitions
-        fs::write(&paths.config_toml, "").expect("write empty config.toml");
+        fs::write(&paths.settings_toml, "").expect("write empty config.toml");
         fs::write(
             &paths.agy_json,
             r#"{"mcpServers": {"conflict-srv": {"type": "http", "url": "https://a.example.com/mcp"}}}"#,
@@ -3741,7 +3741,8 @@ mod tests {
         // mcp.toml was not written because of unresolved MCP conflicts
         assert!(!paths.mcp_toml.exists());
         // config.toml WAS auto-populated with all default maga settings
-        let populated = fs::read_to_string(&paths.config_toml).expect("read populated config.toml");
+        let populated =
+            fs::read_to_string(&paths.settings_toml).expect("read populated config.toml");
         assert!(populated.contains("[refresh]"));
         assert!(populated.contains("[tools.antigravity]"));
         assert!(populated.contains("config_path = \"~/.gemini/config/mcp_config.json\""));
@@ -3812,7 +3813,7 @@ mod tests {
         assert!(!app.loaded.config.ui.animations);
         assert_eq!(app.loaded.config.refresh.interval_secs, 6);
 
-        let saved_toml = fs::read_to_string(&paths.config_toml).expect("read config.toml");
+        let saved_toml = fs::read_to_string(&paths.settings_toml).expect("read config.toml");
         assert!(saved_toml.contains("theme = \"elite\""));
         assert!(saved_toml.contains("mascot_mode = \"rich\""));
         assert!(saved_toml.contains("background = true"));
@@ -4302,7 +4303,9 @@ mod tests {
     fn guidelines_tab_navigation_and_editor_trigger() {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = StoragePaths {
-            config_toml: dir.path().join("config.toml"),
+            settings_toml: dir.path().join("settings.toml"),
+            settings_local_toml: dir.path().join("settings.local.toml"),
+            legacy_config_toml: dir.path().join("config.toml"),
             mcp_toml: dir.path().join("mcp.toml"),
             plugins_toml: dir.path().join("plugins.toml"),
             profiles_toml: dir.path().join("profiles.toml"),

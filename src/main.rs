@@ -29,7 +29,7 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Override path to general `maga` TOML config (`~/.config/maga/config.toml`).
+    /// Override path to general `maga` settings (`~/.config/maga/settings.toml`; machine-specific values go to a `.local.toml` sibling).
     #[arg(long)]
     config: Option<PathBuf>,
 
@@ -211,7 +211,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut paths = StoragePaths::resolve_default()?;
     if let Some(cfg) = cli.config {
-        paths.config_toml = cfg;
+        paths.settings_local_toml = local_sibling(&cfg);
+        paths.legacy_config_toml = cfg.clone();
+        paths.settings_toml = cfg;
     }
     if let Some(mcp_cfg) = cli.mcp_config {
         paths.mcp_toml = mcp_cfg;
@@ -478,4 +480,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     event::run_event_loop(&mut terminal, &mut app, &theme)?;
 
     Ok(())
+}
+
+/// `foo.toml` -> `foo.local.toml` next to it (machine-specific overrides of `--config`).
+fn local_sibling(path: &std::path::Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("settings");
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("toml");
+    path.with_file_name(format!("{stem}.local.{ext}"))
 }

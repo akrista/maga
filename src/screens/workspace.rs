@@ -1633,7 +1633,13 @@ fn draw_skills_detail_panel(f: &mut Frame, area: Rect, app: &App, theme: &Theme)
         ]));
         lines.push(Line::from(vec![
             Span::styled("Path:     ", theme.muted),
-            Span::styled(skill.path.clone(), theme.base),
+            Span::styled(
+                skill
+                    .path
+                    .clone()
+                    .unwrap_or_else(|| "- (not on disk)".into()),
+                theme.base,
+            ),
         ]));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("Harnesses:", theme.header)));

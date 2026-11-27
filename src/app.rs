@@ -4428,7 +4428,7 @@ mod tests {
     fn skill(name: &str, source: Option<&str>, agents: &[&str]) -> InstalledSkill {
         InstalledSkill {
             name: name.to_string(),
-            path: format!("/skills/{name}"),
+            path: Some(format!("/skills/{name}")),
             scope: "global".to_string(),
             agents: agents.iter().map(|a| a.to_string()).collect(),
             source: source.map(String::from),

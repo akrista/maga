@@ -40,7 +40,9 @@ fn agent_label(kind: HarnessKind) -> &'static str {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct InstalledSkill {
     pub name: String,
-    pub path: String,
+    /// `null` for skills recorded in the lockfile but missing on disk.
+    #[serde(default)]
+    pub path: Option<String>,
     /// `"global"` or `"project"`.
     pub scope: String,
     #[serde(default)]
@@ -249,7 +251,7 @@ mod tests {
     fn skill(source: Option<&str>, scope: &str) -> InstalledSkill {
         InstalledSkill {
             name: "tui-design".to_string(),
-            path: "x".to_string(),
+            path: Some("x".to_string()),
             scope: scope.to_string(),
             agents: vec!["Claude Code".to_string()],
             source: source.map(String::from),
@@ -343,5 +345,16 @@ mod tests {
         let untracked = skill(None, "global");
         assert!(set_enabled_args(&untracked, HarnessKind::Claude, true).is_err());
         assert!(set_enabled_args(&untracked, HarnessKind::Claude, false).is_ok());
+    }
+
+    #[test]
+    fn parses_lockfile_only_skills_whose_path_is_null() {
+        let raw = r#"[{"name":"find-skills","path":null,"scope":"global","agents":[],
+            "source":"vercel-labs/skills"},
+            {"name":"b","path":"/p","scope":"project","agents":["OpenCode"],"source":null}]"#;
+        let skills = parse_installed_output(raw).expect("null path must not fail the whole list");
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0].path, None);
+        assert_eq!(skills[1].path.as_deref(), Some("/p"));
     }
 }

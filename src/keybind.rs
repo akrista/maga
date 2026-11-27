@@ -19,6 +19,7 @@ pub enum Action {
     SelectGuidelinesSection,
     SelectRefsSection,
     SelectSkillsSection,
+    OpenMessageLog,
     SelectHarnessSection,
     ToggleHarnessEnabled,
     SkillsSearch,
@@ -98,6 +99,9 @@ pub fn map_workspace_key(key: KeyEvent) -> Option<Action> {
             Some(Action::ToggleHarnessEnabled)
         }
         (KeyModifiers::NONE, KeyCode::Char('f')) => Some(Action::SkillsSearch),
+        (KeyModifiers::NONE, KeyCode::Char('L')) | (KeyModifiers::SHIFT, KeyCode::Char('L')) => {
+            Some(Action::OpenMessageLog)
+        }
         (KeyModifiers::NONE, KeyCode::Char('u')) => Some(Action::UpdateSelectedRef),
         (KeyModifiers::NONE, KeyCode::Char('/')) | (KeyModifiers::SHIFT, KeyCode::Char('/')) => {
             Some(Action::StartFilter)

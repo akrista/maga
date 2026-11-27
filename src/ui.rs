@@ -1,5 +1,5 @@
 use crate::app::{
-    ActiveMode, App, SIDEBAR_WIDTH, SidebarItem, SkillsInputPurpose, WorkspaceSection,
+    ActiveMode, App, SIDEBAR_WIDTH, SidebarItem, SkillsInputPurpose, StatusLevel, WorkspaceSection,
 };
 use crate::domain::model::{HarnessKind, ProjectPolicy};
 use crate::domain::skills::SearchHit;
@@ -18,6 +18,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation,
     ScrollbarState, Wrap,
 };
+use unicode_width::UnicodeWidthStr;
 
 /// Root render function (pure function of `App` state + `Theme`).
 pub fn draw(f: &mut Frame, app: &App, base_theme: &Theme) {
@@ -187,6 +188,11 @@ pub fn draw(f: &mut Frame, app: &App, base_theme: &Theme) {
             .clamp(14, 26) as u16;
             fx_areas.active_modal.set(centered_rect(68, modal_h, area));
             draw_matrix_modal(f, area, app, server_name, *selected, theme);
+        }
+        ActiveMode::MessageLog { scroll } => {
+            let (w, h) = message_log_dimensions(area);
+            fx_areas.active_modal.set(centered_rect(w, h, area));
+            draw_message_log_modal(f, area, app, *scroll, theme);
         }
         ActiveMode::Help => {
             let (help_w, help_h) = help_modal_dimensions(area);
@@ -471,11 +477,23 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         line1_spans.push(Span::styled(format!("[Profile: {prof}]"), theme.accent));
     }
     let line1 = Line::from(line1_spans);
+    let separator = "  ·  ";
+    let used = UnicodeWidthStr::width(refresh_badge.as_str()) + UnicodeWidthStr::width(separator);
     let mut line2_spans = vec![Span::styled(refresh_badge, refresh_style)];
     if let Some((ref msg, is_err)) = app.status_message {
-        let msg_style = if is_err { theme.error } else { theme.accent };
-        line2_spans.push(Span::styled("  ·  ", theme.muted));
-        line2_spans.push(Span::styled(msg.clone(), msg_style));
+        let msg_style = if is_err {
+            theme.error
+        } else if msg.contains('⚠') {
+            theme.warning
+        } else {
+            theme.accent
+        };
+        let room = (area.width as usize).saturating_sub(used);
+        line2_spans.push(Span::styled(separator, theme.muted));
+        line2_spans.push(Span::styled(
+            crate::screens::workspace::truncate_display_width(msg, room),
+            msg_style,
+        ));
     }
     let line2 = Line::from(line2_spans);
 
@@ -520,6 +538,9 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ActiveMode::MatrixModal { .. } => {
             " ↑/↓/j/k: Navigate · Space: Toggle override · Enter/Esc: Close & Save"
         }
+        ActiveMode::MessageLog { .. } => {
+            " j/k/PgUp/PgDn: scroll (newest first) · g/G: newest/oldest · Esc/q/L: close"
+        }
         ActiveMode::Help => " j/k/↑/↓/PgUp/PgDn/g/G: Scroll shortcuts · Esc/q/?: Close help",
         ActiveMode::Normal if app.details_focused => {
             " j/k/PgUp/PgDn/g/G: scroll DETAILS  p: re-probe  t/Esc: return to list  ?: help  q: quit"
@@ -554,6 +575,12 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         }
     } else {
         hints.to_string()
+    };
+
+    let hints = if matches!(app.mode, ActiveMode::Normal) {
+        format!(" L: log ·{hints}")
+    } else {
+        hints
     };
 
     let update_badge = app
@@ -1032,6 +1059,58 @@ fn draw_skills_results_modal(
         theme.muted,
     )));
     f.render_widget(Paragraph::new(lines).block(block), modal);
+}
+
+fn message_log_dimensions(area: Rect) -> (u16, u16) {
+    (
+        area.width.saturating_sub(4).clamp(40, 120),
+        area.height.saturating_sub(4).clamp(10, 30),
+    )
+}
+
+/// Full session message history, newest first (the status line only shows the latest, cut).
+fn draw_message_log_modal(f: &mut Frame, area: Rect, app: &App, scroll: usize, theme: &Theme) {
+    let (width, height) = message_log_dimensions(area);
+    let modal = centered_rect(width, height, area);
+    f.render_widget(Clear, modal);
+    let total = app.status_log.len();
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" MESSAGE LOG ({total}) · j/k: scroll · g/G: ends · Esc: close "),
+            theme.header,
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.active_border)
+        .padding(Padding::new(PADDING_SM, PADDING_SM, PADDING_XS, PADDING_XS));
+
+    let lines: Vec<Line> = if total == 0 {
+        vec![Line::from(Span::styled("No messages yet.", theme.muted))]
+    } else {
+        app.status_log
+            .iter()
+            .rev()
+            .skip(scroll)
+            .map(|entry| {
+                let (tag, style) = match entry.level {
+                    StatusLevel::Info => ("INFO ", theme.accent),
+                    StatusLevel::Warn => ("WARN ", theme.warning),
+                    StatusLevel::Error => ("ERROR", theme.error),
+                };
+                Line::from(vec![
+                    Span::styled(format!("{} ", entry.time), theme.muted),
+                    Span::styled(format!("{tag} "), style),
+                    Span::styled(entry.text.clone(), theme.base),
+                ])
+            })
+            .collect()
+    };
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        modal,
+    );
 }
 
 fn help_modal_dimensions(area: Rect) -> (u16, u16) {
@@ -1828,5 +1907,27 @@ mod tests {
         let grok = render_to_string(130, 40, &app, false);
         assert!(grok.contains("no env-file mechanism"));
         assert!(grok.contains("secrets stored as literals for: context7"));
+    }
+
+    #[test]
+    fn long_status_is_cut_with_ellipsis_and_readable_in_the_message_log() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let long = "Synchronized canonical registry to 5 harnesses · ⚠ secrets stored as literals \
+                    in: Antigravity, Copilot, Grok · TAILMARK";
+        let mut app = build_test_app(100, 30);
+        app.status_message = Some((long.to_string(), false));
+
+        let frame = render_to_string(100, 30, &app, false);
+        assert!(frame.contains('…'), "message is cut with an ellipsis");
+        assert!(!frame.contains("TAILMARK"));
+        assert!(frame.contains("L: log"), "help bar shows the log key");
+
+        app.record_status();
+        app.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
+        let log = render_to_string(100, 30, &app, false);
+        assert!(log.contains("MESSAGE LOG (1)"));
+        assert!(log.contains("TAILMARK"), "the popup shows the full message");
+        assert!(log.contains("WARN"));
     }
 }

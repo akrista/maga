@@ -270,6 +270,7 @@ Register maga itself in any harness's MCP config. Read tools (`list_servers`, `p
 | <kbd>s</kbd> | Force push in-memory canonical registry to disk now (Guidelines: sync links · Refs: update all refs) |
 | <kbd>h</kbd> / <kbd>l</kbd> · <kbd>Space</kbd> · <kbd>f</kbd> · <kbd>a</kbd> | **Skills** view: focus harness column · enable / disable the skill for it · search skills.sh and install · install by name (<kbd>Tab</kbd> in the dialog: global ⇄ project) |
 | <kbd>6</kbd> · <kbd>Space</kbd> · <kbd>e</kbd>/<kbd>Enter</kbd> · <kbd>H</kbd> | **Harness** view (also one sidebar row per harness): list the MCPs as that harness sees them · force the selected MCP on/off for it only (second press returns to inheriting) · open its MCP config in `$EDITOR` · enable/disable syncing with the harness |
+| <kbd>L</kbd> | Open the **message log**: every status message of the session with its time and level (info / warning / error), newest first; <kbd>j</kbd>/<kbd>k</kbd> scroll, <kbd>g</kbd>/<kbd>G</kbd> jump, <kbd>Esc</kbd> closes. Long messages are cut with `…` in the status line and read in full here |
 | <kbd>?</kbd> | Open Keyboard Shortcuts & ASCII Witch splash modal |
 | <kbd>q</kbd> / <kbd>Ctrl+C</kbd> | Quit `maga` |
 

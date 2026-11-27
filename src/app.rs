@@ -96,6 +96,26 @@ pub enum PluginRow {
     },
 }
 
+/// Severity of a status-bar message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+/// One entry of the session message history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusEntry {
+    /// Local wall-clock time, `HH:MM:SS`.
+    pub time: String,
+    pub level: StatusLevel,
+    pub text: String,
+}
+
+/// Maximum number of messages kept for the session.
+const STATUS_LOG_CAP: usize = 500;
+
 /// What the Skills text-input modal does with its text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillsInputPurpose {
@@ -162,6 +182,10 @@ pub enum ActiveMode {
         project: bool,
     },
     Help,
+    /// Session message history; `scroll` is the index of the first (newest-first) entry shown.
+    MessageLog {
+        scroll: usize,
+    },
 }
 
 /// Focused field in the interactive Options modal (`o` keybinding).
@@ -676,6 +700,9 @@ pub struct App {
     pub skills_rx: mpsc::Receiver<SkillsEvent>,
     pub mode: ActiveMode,
     pub status_message: Option<(String, bool)>, // (message, is_error)
+    /// Every status message shown this session, oldest first.
+    pub status_log: Vec<StatusEntry>,
+    last_logged_status: Option<(String, bool)>,
     pub pending_editor: Option<EditorRequest>,
     pub show_hero_mascot: bool,
     pub anim_tick: usize,
@@ -806,6 +833,8 @@ impl App {
             skills_rx,
             mode: initial_mode,
             status_message,
+            status_log: Vec::new(),
+            last_logged_status: None,
             pending_editor: None,
             show_hero_mascot: false,
             anim_tick: 0,
@@ -950,6 +979,7 @@ impl App {
             | ActiveMode::NewProfileModal { .. }
             | ActiveMode::SkillsInput { .. }
             | ActiveMode::SkillsResults { .. }
+            | ActiveMode::MessageLog { .. }
             | ActiveMode::Help => {
                 self.gaze_target = (0.0, 0.0);
             }
@@ -1299,6 +1329,24 @@ impl App {
             }
             Err(e) => self.status_message = Some((format!("✗ {e}"), true)),
         }
+    }
+
+    fn handle_message_log_key(&mut self, key: KeyEvent, mut scroll: usize) {
+        let last = self.status_log.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q' | 'L') => {
+                self.mode = ActiveMode::Normal;
+                return;
+            }
+            KeyCode::Down | KeyCode::Char('j') => scroll = (scroll + 1).min(last),
+            KeyCode::Up | KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
+            KeyCode::PageDown => scroll = (scroll + 8).min(last),
+            KeyCode::PageUp => scroll = scroll.saturating_sub(8),
+            KeyCode::Home | KeyCode::Char('g') => scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => scroll = last,
+            _ => {}
+        }
+        self.mode = ActiveMode::MessageLog { scroll };
     }
 
     fn handle_skills_input_key(
@@ -2036,6 +2084,38 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        self.handle_key_inner(key);
+        self.record_status();
+    }
+
+    /// Appends the current status message to the history when it is new.
+    pub fn record_status(&mut self) {
+        let Some((text, is_error)) = self.status_message.clone() else {
+            self.last_logged_status = None;
+            return;
+        };
+        if self.last_logged_status.as_ref() == Some(&(text.clone(), is_error)) {
+            return;
+        }
+        let level = if is_error {
+            StatusLevel::Error
+        } else if text.contains('⚠') {
+            StatusLevel::Warn
+        } else {
+            StatusLevel::Info
+        };
+        self.last_logged_status = Some((text.clone(), is_error));
+        self.status_log.push(StatusEntry {
+            time: chrono::Local::now().format("%H:%M:%S").to_string(),
+            level,
+            text,
+        });
+        if self.status_log.len() > STATUS_LOG_CAP {
+            self.status_log.remove(0);
+        }
+    }
+
+    fn handle_key_inner(&mut self, key: KeyEvent) {
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
             self.should_quit = true;
             return;
@@ -2078,6 +2158,7 @@ impl App {
             ActiveMode::NewProfileModal { input } => {
                 self.handle_new_profile_key(key, input);
             }
+            ActiveMode::MessageLog { scroll } => self.handle_message_log_key(key, scroll),
             ActiveMode::SkillsInput {
                 purpose,
                 input,
@@ -2256,6 +2337,7 @@ impl App {
                     | Action::SelectGuidelinesSection
                     | Action::SelectRefsSection
                     | Action::SelectSkillsSection
+                    | Action::OpenMessageLog
                     | Action::SelectHarnessSection => {}
                     _ => return,
                 }
@@ -2628,6 +2710,10 @@ impl App {
                     self.clamp_plugin_selection();
                     self.emit_fx(FxTrigger::SelectionChanged);
                 }
+            }
+            Action::OpenMessageLog => {
+                self.mode = ActiveMode::MessageLog { scroll: 0 };
+                self.emit_fx(FxTrigger::ModalOpened);
             }
             Action::StartFilter => {
                 self.mode = ActiveMode::Filtering;
@@ -4923,5 +5009,63 @@ mod tests {
             !msg.contains("Claude") && !msg.contains("OpenCode"),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn status_history_records_levels_dedups_and_opens_with_l() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = StoragePaths::in_dir(dir.path());
+        let loaded = LoadedConfigs::load(&paths).expect("load");
+        let mut app = App::new(Some(paths), loaded, 100, 30);
+        app.status_log.clear();
+        app.status_message = None;
+        app.record_status();
+
+        for (msg, is_error) in [
+            ("✓ Synchronized", false),
+            ("✓ Synchronized", false), // consecutive repeat is not logged twice
+            ("✓ Synced · ⚠ secrets stored as literals in: Grok", false),
+            ("✗ Sync error: boom", true),
+        ] {
+            app.status_message = Some((msg.to_string(), is_error));
+            app.record_status();
+        }
+        let levels: Vec<StatusLevel> = app.status_log.iter().map(|e| e.level).collect();
+        assert_eq!(
+            levels,
+            [StatusLevel::Info, StatusLevel::Warn, StatusLevel::Error]
+        );
+        assert_eq!(app.status_log[0].time.len(), 8, "HH:MM:SS");
+        assert_eq!(app.status_log[2].text, "✗ Sync error: boom");
+
+        // L opens the log; j/k clamp to the entries; Esc closes.
+        let press = |app: &mut App, code| app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        press(&mut app, KeyCode::Char('L'));
+        assert_eq!(app.mode, ActiveMode::MessageLog { scroll: 0 });
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.mode, ActiveMode::MessageLog { scroll: 0 });
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        assert_eq!(app.mode, ActiveMode::MessageLog { scroll: 2 });
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.mode, ActiveMode::MessageLog { scroll: 0 });
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, ActiveMode::Normal);
+    }
+
+    #[test]
+    fn status_history_is_capped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = StoragePaths::in_dir(dir.path());
+        let loaded = LoadedConfigs::load(&paths).expect("load");
+        let mut app = App::new(Some(paths), loaded, 100, 30);
+        app.status_log.clear();
+        for i in 0..(STATUS_LOG_CAP + 20) {
+            app.status_message = Some((format!("message {i}"), false));
+            app.record_status();
+        }
+        assert_eq!(app.status_log.len(), STATUS_LOG_CAP);
+        assert_eq!(app.status_log[0].text, "message 20");
     }
 }

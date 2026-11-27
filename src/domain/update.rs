@@ -77,11 +77,11 @@ pub fn current_target() -> Option<(&'static str, &'static str)> {
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        Some(("x86_64-unknown-linux-gnu", "tar.gz"))
+        Some(("x86_64-unknown-linux-musl", "tar.gz"))
     }
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     {
-        Some(("aarch64-unknown-linux-gnu", "tar.gz"))
+        Some(("aarch64-unknown-linux-musl", "tar.gz"))
     }
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     {

@@ -39,11 +39,11 @@ if [ "$FORCE" = false ] && [ -z "$VERSION" ] && command -v maga >/dev/null 2>&1;
     exec maga --update
 fi
 
-[ -n "${TERMUX_VERSION:-}" ] && die "Termux has no prebuilt binary (bionic libc). Use: cargo install --git https://github.com/$REPO --locked"
+[ -n "${TERMUX_VERSION:-}" ] && die "Termux is not supported by this installer yet. Use: cargo install --git https://github.com/$REPO --locked"
 
 case "$(uname -s)-$(uname -m)" in
-    Linux-x86_64)             TARGET="x86_64-unknown-linux-gnu" ;;
-    Linux-aarch64|Linux-arm64) TARGET="aarch64-unknown-linux-gnu" ;;
+    Linux-x86_64)              TARGET="x86_64-unknown-linux-musl" ;;
+    Linux-aarch64|Linux-arm64) TARGET="aarch64-unknown-linux-musl" ;;
     Darwin-x86_64)            TARGET="x86_64-apple-darwin" ;;
     Darwin-arm64|Darwin-aarch64) TARGET="aarch64-apple-darwin" ;;
     *) die "Unsupported platform: $(uname -s)-$(uname -m)" ;;

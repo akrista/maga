@@ -125,7 +125,7 @@ Pin a release with `MAGA_VERSION=v0.4.2` (or `--version v0.4.2`); override the d
 
 **Option 2 — Manual Archive or `cargo-binstall`**
 
-Download the archive for your platform (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, or `x86_64-pc-windows-msvc`) from [**GitHub Releases**](https://github.com/akrista/maga/releases), or:
+Download the archive for your platform (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, or `x86_64-pc-windows-msvc`) from [**GitHub Releases**](https://github.com/akrista/maga/releases), or:
 
 ```bash
 cargo binstall --git https://github.com/akrista/maga maga

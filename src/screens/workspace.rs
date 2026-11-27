@@ -1342,7 +1342,9 @@ fn draw_refs_list(
             let target_path = app.loaded.refs.effective_path(alias, entry, &cache_dir);
             let is_cloned = target_path.exists() && target_path.join(".git").exists();
 
-            let (badge, badge_style) = if is_cloned {
+            let (badge, badge_style) = if !app.ref_conflicts(alias).is_empty() {
+                ("[⚠ Conflict]", theme.warning)
+            } else if is_cloned {
                 ("[✓ Cloned]", theme.success)
             } else {
                 ("[✗ Not Cloned]", theme.warning)
@@ -1442,6 +1444,21 @@ fn draw_refs_detail_panel(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             Span::styled(status_text, status_style),
         ]));
 
+        for conflict in app.ref_conflicts(alias) {
+            let text = match conflict {
+                crate::domain::refs::RefConflict::Branch { wanted, actual } => format!(
+                    "pins '{wanted}', clone is on {}",
+                    actual.as_deref().unwrap_or("a detached HEAD")
+                ),
+                crate::domain::refs::RefConflict::Url { .. } => {
+                    "different URLs in refs.toml and clone".to_string()
+                }
+            };
+            lines.push(Line::from(vec![
+                Span::styled("Conflict:     ", theme.muted),
+                Span::styled(format!("⚠ {text} (press c)"), theme.warning),
+            ]));
+        }
         if let Some(info) = app.refs_info.get(alias) {
             lines.push(Line::from(vec![
                 Span::styled("Branch:       ", theme.muted),

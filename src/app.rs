@@ -10,7 +10,7 @@ use crate::domain::reconcile::{
     ConflictResolution, McpConflict, ReconcileOutcome, harness_maps_match_with_env,
     reconcile_harnesses_with_env, reconcile_live_reload_harnesses_with_env,
 };
-use crate::domain::refs::RepoInfo;
+use crate::domain::refs::{RefConflict, RepoInfo};
 use crate::domain::skills::{self, InstalledSkill, SearchHit, SkillScope};
 use crate::domain::storage::{LoadedConfigs, StoragePaths};
 use crate::fx::{FxEngine, FxTrigger};
@@ -208,6 +208,10 @@ pub enum ActiveMode {
     /// Session message history; `scroll` is the index of the first (newest-first) entry shown.
     MessageLog {
         scroll: usize,
+    },
+    /// Resolver for a disagreement between `refs.toml` and a reference clone.
+    RefConflict {
+        alias: String,
     },
 }
 
@@ -730,6 +734,8 @@ pub struct App {
     /// `(finished, total)` of the running update.
     pub refs_progress: (usize, usize),
     refs_failures: Vec<String>,
+    /// Refs left out of the running update because of an unresolved conflict.
+    refs_skipped: usize,
     refs_tx: mpsc::Sender<RefsEvent>,
     refs_rx: mpsc::Receiver<RefsEvent>,
     pub mode: ActiveMode,
@@ -872,6 +878,7 @@ impl App {
             refs_busy: false,
             refs_progress: (0, 0),
             refs_failures: Vec::new(),
+            refs_skipped: 0,
             refs_tx,
             refs_rx,
             mode: initial_mode,
@@ -1023,6 +1030,7 @@ impl App {
             | ActiveMode::SkillsInput { .. }
             | ActiveMode::SkillsResults { .. }
             | ActiveMode::MessageLog { .. }
+            | ActiveMode::RefConflict { .. }
             | ActiveMode::Help => {
                 self.gaze_target = (0.0, 0.0);
             }
@@ -1921,6 +1929,20 @@ impl App {
             self.status_message = Some(("A refs update is already running".to_string(), true));
             return;
         }
+        let (conflicted, aliases): (Vec<String>, Vec<String>) = aliases
+            .into_iter()
+            .partition(|alias| !self.ref_conflicts(alias).is_empty());
+        if aliases.is_empty() && !conflicted.is_empty() {
+            self.status_message = Some((
+                format!(
+                    "✗ {} ref(s) have conflicts with refs.toml: press c to resolve ({})",
+                    conflicted.len(),
+                    conflicted.join(", ")
+                ),
+                true,
+            ));
+            return;
+        }
         let cache_dir = self.refs_cache_dir();
         let work: Vec<_> = aliases
             .iter()
@@ -1937,6 +1959,7 @@ impl App {
         self.refs_busy = true;
         self.refs_progress = (0, work.len());
         self.refs_failures.clear();
+        self.refs_skipped = conflicted.len();
         self.status_message = Some((format!("… Updating {} ref(s)", work.len()), false));
         let tx = self.refs_tx.clone();
         std::thread::spawn(move || {
@@ -1990,6 +2013,153 @@ impl App {
         }
     }
 
+    // ── Ref conflicts: refs.toml vs the clone on disk ──
+
+    /// Disagreements between a registry entry and its clone (needs the cached clone state).
+    pub fn ref_conflicts(&self, alias: &str) -> Vec<RefConflict> {
+        match (self.loaded.refs.refs.get(alias), self.refs_info.get(alias)) {
+            (Some(entry), Some(info)) => crate::domain::refs::detect_conflicts(entry, info),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Opens the resolver for the selected ref, or for the first ref that has a conflict.
+    pub fn open_ref_conflict(&mut self) {
+        let selected = self
+            .loaded
+            .refs
+            .refs
+            .keys()
+            .nth(self.refs_selected)
+            .cloned();
+        let alias = selected
+            .filter(|a| !self.ref_conflicts(a).is_empty())
+            .or_else(|| {
+                self.loaded
+                    .refs
+                    .refs
+                    .keys()
+                    .find(|a| !self.ref_conflicts(a).is_empty())
+                    .cloned()
+            });
+        match alias {
+            Some(alias) => {
+                self.mode = ActiveMode::RefConflict { alias };
+                self.emit_fx(FxTrigger::ModalOpened);
+            }
+            None => {
+                self.status_message = Some(("No ref conflicts".to_string(), false));
+            }
+        }
+    }
+
+    fn handle_ref_conflict_key(&mut self, key: KeyEvent, alias: String) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q' | 's') => self.mode = ActiveMode::Normal,
+            KeyCode::Char('t') => self.resolve_ref_conflict(alias, true),
+            KeyCode::Char('c') => self.resolve_ref_conflict(alias, false),
+            _ => {}
+        }
+    }
+
+    /// Resolves the first conflict of `alias`: follow `refs.toml` (change the clone, in the
+    /// background) or follow the clone (rewrite `refs.toml`).
+    fn resolve_ref_conflict(&mut self, alias: String, use_toml: bool) {
+        let Some(conflict) = self.ref_conflicts(&alias).into_iter().next() else {
+            self.mode = ActiveMode::Normal;
+            return;
+        };
+
+        if use_toml {
+            self.mode = ActiveMode::Normal;
+            self.spawn_ref_resolution(alias, conflict);
+            return;
+        }
+
+        let Some(entry) = self.loaded.refs.refs.get_mut(&alias) else {
+            self.mode = ActiveMode::Normal;
+            return;
+        };
+        match &conflict {
+            RefConflict::Branch {
+                actual: Some(branch),
+                ..
+            } => entry.branch = Some(branch.clone()),
+            RefConflict::Branch { actual: None, .. } => {
+                self.status_message = Some((
+                    "The clone is on a detached HEAD: choose refs.toml (t)".to_string(),
+                    true,
+                ));
+                return;
+            }
+            RefConflict::Url { actual, .. } => entry.url = actual.clone(),
+        }
+        let saved = match self.paths.clone() {
+            Some(paths) => self.loaded.save_refs(&paths),
+            None => Ok(()),
+        };
+        match saved {
+            Ok(()) => {
+                self.status_message = Some((
+                    format!("✓ refs.toml now follows the clone of '{alias}'"),
+                    false,
+                ));
+                self.mode = if self.ref_conflicts(&alias).is_empty() {
+                    ActiveMode::Normal
+                } else {
+                    ActiveMode::RefConflict { alias }
+                };
+            }
+            Err(e) => {
+                self.status_message = Some((format!("✗ Failed to save refs.toml: {e}"), true));
+                self.mode = ActiveMode::Normal;
+            }
+        }
+    }
+
+    /// Makes the clone follow `refs.toml` (network work, so on the worker thread).
+    fn spawn_ref_resolution(&mut self, alias: String, conflict: RefConflict) {
+        if self.refs_busy {
+            self.status_message = Some(("A refs update is already running".to_string(), true));
+            return;
+        }
+        let Some(entry) = self.loaded.refs.refs.get(&alias).cloned() else {
+            return;
+        };
+        let path = self
+            .loaded
+            .refs
+            .effective_path(&alias, &entry, &self.refs_cache_dir());
+
+        self.refs_busy = true;
+        self.refs_progress = (0, 1);
+        self.refs_failures.clear();
+        self.refs_skipped = 0;
+        self.status_message = Some((format!("… Resolving '{alias}'"), false));
+        let tx = self.refs_tx.clone();
+        std::thread::spawn(move || {
+            let result = match conflict {
+                RefConflict::Branch { wanted, .. } => {
+                    crate::domain::refs::switch_clone_branch(&path, &wanted)
+                }
+                RefConflict::Url { wanted, .. } => {
+                    crate::domain::refs::set_clone_url(&path, &wanted).and_then(|()| {
+                        crate::domain::refs::clone_or_update_ref(&alias, &entry, &path)
+                    })
+                }
+            };
+            let info = crate::domain::refs::repo_info(&path);
+            let time = chrono::Local::now().format("%H:%M").to_string();
+            let _ = tx.send(RefsEvent::Updated {
+                alias,
+                result,
+                time,
+                info,
+            });
+            let _ = tx.send(RefsEvent::Finished);
+        });
+    }
+
     /// Drains finished refs work; returns true when state changed.
     pub fn poll_refs_events(&mut self) -> bool {
         let mut any = false;
@@ -2032,9 +2202,14 @@ impl App {
                 RefsEvent::Finished => {
                     self.refs_busy = false;
                     let total = self.refs_progress.1;
+                    let skipped = if self.refs_skipped > 0 {
+                        format!(" · {} skipped by conflicts (press c)", self.refs_skipped)
+                    } else {
+                        String::new()
+                    };
                     if self.refs_failures.is_empty() {
                         self.status_message =
-                            Some((format!("✓ Updated {total}/{total} refs"), false));
+                            Some((format!("✓ Updated {total}/{total} refs{skipped}"), false));
                         self.trigger_mascot_reaction(
                             MascotReaction::Casting,
                             Duration::from_millis(750),
@@ -2043,7 +2218,7 @@ impl App {
                     } else {
                         self.status_message = Some((
                             format!(
-                                "✗ Updated {}/{total} refs: {}",
+                                "✗ Updated {}/{total} refs: {}{skipped}",
                                 total - self.refs_failures.len(),
                                 self.refs_failures.join("; ")
                             ),
@@ -2311,6 +2486,7 @@ impl App {
                 self.handle_new_profile_key(key, input);
             }
             ActiveMode::MessageLog { scroll } => self.handle_message_log_key(key, scroll),
+            ActiveMode::RefConflict { alias } => self.handle_ref_conflict_key(key, alias),
             ActiveMode::SkillsInput {
                 purpose,
                 input,
@@ -3040,6 +3216,9 @@ impl App {
                     );
                     self.emit_fx(FxTrigger::ModalOpened);
                 }
+            }
+            Action::OpenConflicts if self.section == WorkspaceSection::Refs => {
+                self.open_ref_conflict();
             }
             Action::OpenConflicts => {
                 if self.section == WorkspaceSection::Refs {
@@ -5325,5 +5504,143 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Polls until the clone state of `alias` satisfies `done` (info refreshes arrive as events).
+    fn wait_for_info(
+        app: &mut App,
+        alias: &str,
+        done: impl Fn(&crate::domain::refs::RepoInfo) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while app.refs_info.get(alias).is_none_or(|i| !done(i)) {
+            app.poll_refs_events();
+            assert!(std::time::Instant::now() < deadline, "clone info timed out");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn refs_app_with_one_clone() -> (tempfile::TempDir, App, std::path::PathBuf) {
+        use crate::domain::refs::test_support::{file_url, git_ok, make_origin};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = StoragePaths::in_dir(dir.path());
+        let origin = dir.path().join("origin");
+        make_origin(&origin, "main docs");
+        git_ok(&origin, &["checkout", "-b", "v2"]);
+        std::fs::write(origin.join("doc.md"), "v2 docs").unwrap();
+        git_ok(&origin, &["commit", "-am", "v2 docs"]);
+        git_ok(&origin, &["checkout", "main"]);
+
+        let mut loaded = LoadedConfigs::load(&paths).expect("load");
+        loaded.refs.refs.insert(
+            "docs".to_string(),
+            crate::domain::refs::RefRepoEntry {
+                url: file_url(&origin),
+                branch: None,
+                description: None,
+                path: None,
+            },
+        );
+        std::fs::write(&paths.refs_toml, loaded.refs.to_toml().unwrap()).unwrap();
+        let mut app = App::new(Some(paths), loaded, 120, 30);
+        app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        wait_for_refs(&mut app);
+        assert!(app.refs_status["docs"].ok);
+        assert!(
+            app.ref_conflicts("docs").is_empty(),
+            "no pinned branch, no conflict"
+        );
+        (dir, app, origin)
+    }
+
+    #[test]
+    fn branch_conflict_skips_updates_and_resolves_toward_refs_toml_or_the_clone() {
+        let (dir, mut app, _origin) = refs_app_with_one_clone();
+        let press = |app: &mut App, c: char| {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        };
+        let clone_doc = dir.path().join("refs").join("docs").join("doc.md");
+        assert_eq!(std::fs::read_to_string(&clone_doc).unwrap(), "main docs");
+
+        // refs.toml now pins v2 while the clone is on main: a conflict.
+        app.loaded.refs.refs.get_mut("docs").unwrap().branch = Some("v2".to_string());
+        assert_eq!(app.ref_conflicts("docs").len(), 1);
+
+        // Updates leave it alone instead of silently moving the branch.
+        press(&mut app, 's');
+        let (msg, is_error) = app.status_message.clone().expect("status");
+        assert!(
+            is_error && msg.contains("have conflicts") && msg.contains("press c"),
+            "{msg}"
+        );
+        assert!(!app.refs_busy);
+        assert_eq!(std::fs::read_to_string(&clone_doc).unwrap(), "main docs");
+
+        // c opens the resolver; t follows refs.toml: the clone switches to v2.
+        press(&mut app, 'c');
+        assert_eq!(
+            app.mode,
+            ActiveMode::RefConflict {
+                alias: "docs".to_string()
+            }
+        );
+        press(&mut app, 't');
+        assert_eq!(app.mode, ActiveMode::Normal);
+        wait_for_refs(&mut app);
+        assert_eq!(std::fs::read_to_string(&clone_doc).unwrap(), "v2 docs");
+        assert!(app.ref_conflicts("docs").is_empty());
+
+        // The other way round: pin main while the clone is on v2, then follow the clone.
+        app.loaded.refs.refs.get_mut("docs").unwrap().branch = Some("main".to_string());
+        press(&mut app, 'c');
+        press(&mut app, 'c');
+        assert_eq!(app.mode, ActiveMode::Normal);
+        assert_eq!(app.loaded.refs.refs["docs"].branch.as_deref(), Some("v2"));
+        let saved = std::fs::read_to_string(dir.path().join("refs.toml")).unwrap();
+        assert!(saved.contains("branch = \"v2\""), "{saved}");
+        assert!(app.ref_conflicts("docs").is_empty());
+
+        // Nothing left to resolve.
+        press(&mut app, 'c');
+        assert_eq!(app.mode, ActiveMode::Normal);
+        let (msg, _) = app.status_message.clone().unwrap();
+        assert_eq!(msg, "No ref conflicts");
+    }
+
+    #[test]
+    fn url_conflict_resolves_by_repointing_origin_or_rewriting_refs_toml() {
+        use crate::domain::refs::test_support::{file_url, make_origin};
+
+        let (dir, mut app, origin) = refs_app_with_one_clone();
+        let press = |app: &mut App, c: char| {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        };
+        let other = dir.path().join("other-origin");
+        make_origin(&other, "other docs");
+
+        // refs.toml names another repository than the clone's origin.
+        app.loaded.refs.refs.get_mut("docs").unwrap().url = file_url(&other);
+        press(&mut app, 'c');
+        assert!(matches!(app.mode, ActiveMode::RefConflict { .. }));
+        press(&mut app, 'c'); // follow the clone: refs.toml takes the clone's origin URL
+        assert!(crate::domain::refs::same_repo(
+            &app.loaded.refs.refs["docs"].url,
+            &file_url(&origin)
+        ));
+        assert!(app.ref_conflicts("docs").is_empty());
+
+        // Again, but follow refs.toml: origin is re-pointed and the clone updated from it.
+        app.loaded.refs.refs.get_mut("docs").unwrap().url = file_url(&other);
+        press(&mut app, 'c');
+        press(&mut app, 't');
+        wait_for_refs(&mut app);
+        wait_for_info(&mut app, "docs", |i| i.subject == "other docs");
+        assert!(app.ref_conflicts("docs").is_empty());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("refs").join("docs").join("doc.md")).unwrap(),
+            "other docs"
+        );
     }
 }

@@ -2,6 +2,7 @@ use crate::app::{
     ActiveMode, App, SIDEBAR_WIDTH, SidebarItem, SkillsInputPurpose, StatusLevel, WorkspaceSection,
 };
 use crate::domain::model::{HarnessKind, ProjectPolicy};
+use crate::domain::refs::RefConflict;
 use crate::domain::skills::SearchHit;
 use crate::mascot::{
     build_ascii_splash_lines, render_fullscreen_background_canvas_with_state, sparkle_glyph,
@@ -188,6 +189,10 @@ pub fn draw(f: &mut Frame, app: &App, base_theme: &Theme) {
             .clamp(14, 26) as u16;
             fx_areas.active_modal.set(centered_rect(68, modal_h, area));
             draw_matrix_modal(f, area, app, server_name, *selected, theme);
+        }
+        ActiveMode::RefConflict { alias } => {
+            fx_areas.active_modal.set(centered_rect(86, 15, area));
+            draw_ref_conflict_modal(f, area, app, alias, theme);
         }
         ActiveMode::MessageLog { scroll } => {
             let (w, h) = message_log_dimensions(area);
@@ -538,6 +543,9 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ActiveMode::MatrixModal { .. } => {
             " ↑/↓/j/k: Navigate · Space: Toggle override · Enter/Esc: Close & Save"
         }
+        ActiveMode::RefConflict { .. } => {
+            " t: use refs.toml · c: use the clone · Esc: skip for now"
+        }
         ActiveMode::MessageLog { .. } => {
             " j/k/PgUp/PgDn: scroll (newest first) · g/G: newest/oldest · Esc/q/L: close"
         }
@@ -556,7 +564,7 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 " Tab/1-6: view  j/k: nav  e/Enter: edit AGENTS.md  s: resync links  t: details  r/R: refresh  ?: help  q: quit"
             }
             WorkspaceSection::Refs => {
-                " Tab/1-6: view  j/k: nav  Enter: sync ref  u: update ref  s: update all  e: edit refs.toml  r/R: refresh  ?: help  q: quit"
+                " Tab/1-6: view  j/k: nav  Enter: sync ref  u: update ref  s: update all  c: resolve conflicts  e: edit refs.toml  r/R: refresh  ?: help  q: quit"
             }
             WorkspaceSection::Skills => {
                 " Tab/1-6: view  j/k: nav  h/l: harness  Space: enable/disable  f: search  a: install by name  r: reload  ?: help  q: quit"
@@ -1105,6 +1113,106 @@ fn draw_message_log_modal(f: &mut Frame, area: Rect, app: &App, scroll: usize, t
             })
             .collect()
     };
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        modal,
+    );
+}
+
+/// Resolver for a disagreement between `refs.toml` and a reference clone.
+fn draw_ref_conflict_modal(f: &mut Frame, area: Rect, app: &App, alias: &str, theme: &Theme) {
+    let modal = centered_rect(86, 15, area);
+    f.render_widget(Clear, modal);
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" ✦ REF CONFLICT · {alias} ✦ "),
+            theme.header,
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.warning)
+        .padding(Padding::new(PADDING_SM, PADDING_SM, PADDING_XS, PADDING_XS));
+
+    let conflicts = app.ref_conflicts(alias);
+    let mut lines: Vec<Line> = Vec::new();
+    let hint = |url: &str| {
+        if crate::domain::refs::name_matches_alias(alias, url) {
+            "  ✓ name fits folder"
+        } else {
+            ""
+        }
+    };
+    let option = |key: &'static str, text: String| {
+        Line::from(vec![
+            Span::styled(format!("[{key}] "), theme.accent),
+            Span::styled(text, theme.base),
+        ])
+    };
+
+    match conflicts.first() {
+        Some(RefConflict::Branch { wanted, actual }) => {
+            let on = actual
+                .as_deref()
+                .map_or("a detached HEAD".to_string(), |b| format!("'{b}'"));
+            lines.push(Line::from(Span::styled(
+                format!("refs.toml pins branch '{wanted}', but the clone is on {on}."),
+                theme.base,
+            )));
+            lines.push(Line::from(""));
+            lines.push(option(
+                "t",
+                format!(
+                    "Use refs.toml: switch the clone to '{wanted}' (local edits are discarded)"
+                ),
+            ));
+            lines.push(option(
+                "c",
+                match actual {
+                    Some(b) => format!("Use the clone: write '{b}' into refs.toml (rewrites the file; comments are lost)"),
+                    None => "Use the clone: unavailable on a detached HEAD".to_string(),
+                },
+            ));
+        }
+        Some(RefConflict::Url { wanted, actual }) => {
+            lines.push(Line::from(Span::styled(
+                "refs.toml and the clone's origin point at different repositories:",
+                theme.base,
+            )));
+            lines.push(Line::from(vec![
+                Span::styled("  refs.toml:     ", theme.muted),
+                Span::styled(wanted.clone(), theme.base),
+                Span::styled(hint(wanted), theme.success),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  clone origin:  ", theme.muted),
+                Span::styled(actual.clone(), theme.base),
+                Span::styled(hint(actual), theme.success),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(option(
+                "t",
+                "Use refs.toml: point the clone's origin at it and update".to_string(),
+            ));
+            lines.push(option(
+                "c",
+                "Use the clone: write its origin URL into refs.toml (rewrites the file; comments are lost)"
+                    .to_string(),
+            ));
+        }
+        None => lines.push(Line::from(Span::styled("No conflict left.", theme.muted))),
+    }
+    if conflicts.len() > 1 {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("{} more conflict(s) after this one.", conflicts.len() - 1),
+            theme.muted,
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("[Esc: Skip for now]", theme.muted)));
+
     f.render_widget(
         Paragraph::new(lines)
             .block(block)
@@ -1992,6 +2100,7 @@ mod tests {
                 subject: "Merge pull request #153".to_string(),
                 dirty: 3,
                 shallow: true,
+                url: None,
             },
         );
         app.refs_info_loaded = true;
@@ -2007,5 +2116,56 @@ mod tests {
         app.refs_busy = true;
         app.refs_progress = (1, 4);
         assert!(render_to_string(130, 40, &app, false).contains("updating 1/4"));
+    }
+
+    #[test]
+    fn ref_conflict_modal_and_badge_explain_the_two_sides() {
+        use crate::domain::refs::{RefRepoEntry, RepoInfo};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = build_test_app(130, 40);
+        app.loaded.refs.refs.insert(
+            "docs-v2".to_string(),
+            RefRepoEntry {
+                url: "https://github.com/fosrl/docs-v2".to_string(),
+                branch: Some("v2".to_string()),
+                description: None,
+                path: None,
+            },
+        );
+        app.refs_info.insert(
+            "docs-v2".to_string(),
+            RepoInfo {
+                branch: Some("main".to_string()),
+                commit: "abc1234".to_string(),
+                date: "2026-11-27".to_string(),
+                subject: "s".to_string(),
+                dirty: 0,
+                shallow: true,
+                url: Some("https://github.com/fosrl/docs-v2.git".to_string()),
+            },
+        );
+        app.refs_info_loaded = true;
+        app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+
+        let list = render_to_string(130, 40, &app, false);
+        assert!(list.contains("[⚠ Conflict]"));
+        assert!(list.contains("pins 'v2', clone is on main"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        let modal = render_to_string(130, 40, &app, false);
+        assert!(modal.contains("REF CONFLICT · docs-v2"));
+        assert!(modal.contains("refs.toml pins branch 'v2', but the clone is on 'main'"));
+        assert!(modal.contains("[t] Use refs.toml") && modal.contains("[c] Use the clone"));
+        assert!(modal.contains("rewrites the file"));
+
+        // A different repository: both URLs are shown, with a hint for the one that fits.
+        app.refs_info.get_mut("docs-v2").unwrap().url =
+            Some("https://github.com/o/other".to_string());
+        app.refs_info.get_mut("docs-v2").unwrap().branch = Some("v2".to_string());
+        let modal = render_to_string(130, 40, &app, false);
+        assert!(modal.contains("different repositories"));
+        assert!(modal.contains("clone origin:") && modal.contains("https://github.com/o/other"));
+        assert!(modal.contains("name fits folder"));
     }
 }

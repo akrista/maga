@@ -1,4 +1,6 @@
-use crate::app::{ActiveMode, App, SIDEBAR_WIDTH, SkillsInputPurpose, WorkspaceSection};
+use crate::app::{
+    ActiveMode, App, SIDEBAR_WIDTH, SidebarItem, SkillsInputPurpose, WorkspaceSection,
+};
 use crate::domain::model::{HarnessKind, ProjectPolicy};
 use crate::domain::skills::SearchHit;
 use crate::mascot::{
@@ -208,17 +210,31 @@ pub fn draw(f: &mut Frame, app: &App, base_theme: &Theme) {
     );
 }
 
-/// Left navigation list (lazygit-style): one row per workspace section with its item count.
+/// Left navigation list (lazygit-style): the workspace sections, then one row per harness.
 fn draw_sidebar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let (_, total_plugins) = app.total_plugins_counts();
-    let count_of = |section: WorkspaceSection| -> String {
-        match section {
-            WorkspaceSection::Mcps => app.outcome.canonical.len().to_string(),
-            WorkspaceSection::Plugins => total_plugins.to_string(),
-            WorkspaceSection::Guidelines => app.guidelines_statuses.len().to_string(),
-            WorkspaceSection::Refs => app.loaded.refs.refs.len().to_string(),
-            WorkspaceSection::Skills if app.skills_loaded => app.skills.len().to_string(),
-            WorkspaceSection::Skills => "–".to_string(),
+    let count_of = |item: SidebarItem| -> String {
+        match item {
+            SidebarItem::Section(WorkspaceSection::Mcps) => app.outcome.canonical.len().to_string(),
+            SidebarItem::Section(WorkspaceSection::Plugins) => total_plugins.to_string(),
+            SidebarItem::Section(WorkspaceSection::Guidelines) => {
+                app.guidelines_statuses.len().to_string()
+            }
+            SidebarItem::Section(WorkspaceSection::Refs) => app.loaded.refs.refs.len().to_string(),
+            SidebarItem::Section(WorkspaceSection::Skills) if app.skills_loaded => {
+                app.skills.len().to_string()
+            }
+            SidebarItem::Section(_) => "–".to_string(),
+            SidebarItem::Harness(kind) if !app.loaded.config.tools.is_enabled(kind) => {
+                "off".to_string()
+            }
+            SidebarItem::Harness(kind) => app
+                .outcome
+                .canonical
+                .values()
+                .filter(|c| c.enabled_for_harness(kind))
+                .count()
+                .to_string(),
         }
     };
 
@@ -234,30 +250,36 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .border_style(border_style)
         .padding(Padding::new(PADDING_XS, PADDING_XS, PADDING_XS, PADDING_XS));
     let inner_width = block.inner(area).width as usize;
+    let current = app.current_sidebar_item();
 
-    let lines: Vec<Line> = WorkspaceSection::ALL
-        .iter()
-        .enumerate()
-        .map(|(idx, section)| {
-            let selected = *section == app.section;
-            let style = match (selected, app.sidebar_focused) {
-                (true, true) => theme.highlight,
-                (true, false) => theme.accent,
-                _ => theme.base,
-            };
-            let label = format!("{} {}", idx + 1, section.title());
-            let count = count_of(*section);
-            let pad = inner_width
-                .saturating_sub(2 + label.chars().count() + count.chars().count())
-                .max(1);
-            Line::from(vec![
-                Span::styled(if selected { "▸ " } else { "  " }, theme.accent),
-                Span::styled(label, style),
-                Span::styled(" ".repeat(pad), style),
-                Span::styled(count, theme.muted),
-            ])
-        })
-        .collect();
+    let mut lines: Vec<Line> = Vec::new();
+    for (idx, item) in App::sidebar_items().into_iter().enumerate() {
+        if idx == WorkspaceSection::ALL.len() {
+            lines.push(Line::from(Span::styled("─ Harnesses ─", theme.muted)));
+        }
+        let selected = item == current;
+        let off = matches!(item, SidebarItem::Harness(k) if !app.loaded.config.tools.is_enabled(k));
+        let style = match (selected, app.sidebar_focused) {
+            (true, true) => theme.highlight,
+            (true, false) => theme.accent,
+            _ if off => theme.muted,
+            _ => theme.base,
+        };
+        let label = match item {
+            SidebarItem::Section(s) => format!("{} {}", idx + 1, s.title()),
+            SidebarItem::Harness(k) => k.display_name().to_string(),
+        };
+        let count = count_of(item);
+        let pad = inner_width
+            .saturating_sub(2 + label.chars().count() + count.chars().count())
+            .max(1);
+        lines.push(Line::from(vec![
+            Span::styled(if selected { "▸ " } else { "  " }, theme.accent),
+            Span::styled(label, style),
+            Span::styled(" ".repeat(pad), style),
+            Span::styled(count, theme.muted),
+        ]));
+    }
 
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -357,6 +379,17 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             app.skills.len(),
             app.skills.len(),
         ),
+        WorkspaceSection::Harness => {
+            let rows = app.harness_rows();
+            (
+                theme.muted,
+                theme.muted,
+                theme.muted,
+                theme.muted,
+                rows.iter().filter(|(_, on)| *on).count(),
+                rows.len(),
+            )
+        }
     };
 
     let tab3_span = if area.width >= 105 {
@@ -459,9 +492,10 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             WorkspaceSection::Plugins => {
                 " Filter Plugins (name, desc, harness, skill/hook/mcp, is:/harness:/type:/desc:/skill:/hook:/mcp:) · Enter: keep · Esc: clear"
             }
-            WorkspaceSection::Guidelines | WorkspaceSection::Refs | WorkspaceSection::Skills => {
-                " Guidelines View · Esc: back to normal"
-            }
+            WorkspaceSection::Guidelines
+            | WorkspaceSection::Refs
+            | WorkspaceSection::Skills
+            | WorkspaceSection::Harness => " Guidelines View · Esc: back to normal",
         },
         ActiveMode::Form(_) => {
             " Tab/Shift+Tab: field · Space: switch transport · Enter: save · Esc: cancel"
@@ -492,28 +526,31 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         }
         ActiveMode::Normal => match app.section {
             WorkspaceSection::Mcps => {
-                " Tab/1-5: view  j/k: nav  Space: toggle  w: profile  x: matrix  p/P: probe  t: tools  m: mascot  o: options  r/R: refresh  /: filter  a/e/E: edit  d: del  c: conflicts  ?: help  q: quit"
+                " Tab/1-6: view  j/k: nav  Space: toggle  w: profile  x: matrix  p/P: probe  t: tools  m: mascot  o: options  r/R: refresh  /: filter  a/e/E: edit  d: del  c: conflicts  ?: help  q: quit"
             }
             WorkspaceSection::Plugins => {
-                " Tab/1-5: view  j/k: nav  h/l: fold  Space/Enter: toggle/fold  E: edit config  d: del  t: details  m: mascot  o: options  r/R: refresh  /: filter  ?: help  q: quit"
+                " Tab/1-6: view  j/k: nav  h/l: fold  Space/Enter: toggle/fold  E: edit config  d: del  t: details  m: mascot  o: options  r/R: refresh  /: filter  ?: help  q: quit"
             }
             WorkspaceSection::Guidelines => {
-                " Tab/1-5: view  j/k: nav  e/Enter: edit AGENTS.md  s: resync links  t: details  r/R: refresh  ?: help  q: quit"
+                " Tab/1-6: view  j/k: nav  e/Enter: edit AGENTS.md  s: resync links  t: details  r/R: refresh  ?: help  q: quit"
             }
             WorkspaceSection::Refs => {
-                " Tab/1-5: view  j/k: nav  Enter: sync ref  u: update ref  s: update all  e: edit refs.toml  r/R: refresh  ?: help  q: quit"
+                " Tab/1-6: view  j/k: nav  Enter: sync ref  u: update ref  s: update all  e: edit refs.toml  r/R: refresh  ?: help  q: quit"
             }
             WorkspaceSection::Skills => {
-                " Tab/1-5: view  j/k: nav  h/l: harness  Space: enable/disable  f: search  a: install by name  r: reload  ?: help  q: quit"
+                " Tab/1-6: view  j/k: nav  h/l: harness  Space: enable/disable  f: search  a: install by name  r: reload  ?: help  q: quit"
+            }
+            WorkspaceSection::Harness => {
+                " Tab/1-6: view  j/k: nav  Space: enable/disable MCP here  e/Enter: open config  H: toggle harness  r: reload  ?: help  q: quit"
             }
         },
     };
 
     let hints: String = if app.sidebar_visible() && matches!(app.mode, ActiveMode::Normal) {
         if app.sidebar_focused {
-            " j/k: section  Enter/Tab/l: open  1-5: jump  o: options  ?: help  q: quit".to_string()
+            " j/k: section  Enter/Tab/l: open  1-6: jump  o: options  ?: help  q: quit".to_string()
         } else {
-            hints.replace("Tab/1-5: view", "Tab: sidebar  1-5: view")
+            hints.replace("Tab/1-6: view", "Tab: sidebar  1-6: view")
         }
     } else {
         hints.to_string()
@@ -1031,7 +1068,7 @@ fn draw_help_modal(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         Line::from(vec![
             Span::styled("Tab / 1..5       ", theme.accent),
             Span::styled(
-                "Switch workspace view (1: MCPs · 2: Plugins · 3: Guidelines · 4: Refs · 5: Skills)",
+                "Switch workspace view (1: MCPs · 2: Plugins · 3: Guidelines · 4: Refs · 5: Skills · 6: Harness)",
                 theme.base,
             ),
         ]),
@@ -1755,5 +1792,22 @@ mod tests {
         let narrow = render_to_string(100, 24, &build_test_app(100, 24), false);
         assert!(!narrow.contains("Views"));
         assert!(narrow.contains("[1: MCPs"));
+    }
+
+    #[test]
+    fn sidebar_lists_harnesses_and_harness_view_renders_details() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = build_test_app(130, 30);
+        let frame = render_to_string(130, 30, &app, false);
+        assert!(frame.contains("Harnesses"));
+        assert!(frame.contains("Claude Code") && frame.contains("OpenCode"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
+        let frame = render_to_string(130, 30, &app, false);
+        assert!(frame.contains("Claude Code · MCPs"));
+        assert!(frame.contains("HARNESS · Claude Code"));
+        assert!(frame.contains("context7"));
+        assert!(frame.contains("enabled (synced)"));
     }
 }

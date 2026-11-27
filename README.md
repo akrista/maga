@@ -234,7 +234,7 @@ Register maga itself in any harness's MCP config. Read tools (`list_servers`, `p
 
 | Key | Action |
 | :--- | :--- |
-| <kbd>Tab</kbd> / <kbd>Shift+Tab</kbd> · <kbd>1</kbd>..<kbd>5</kbd> | Switch workspace section: **MCPs (`1`)**, **Plugins (`2`)**, **Guidelines (`3`)**, **Refs (`4`)**, **Skills (`5`)** |
+| <kbd>Tab</kbd> / <kbd>Shift+Tab</kbd> · <kbd>1</kbd>..<kbd>6</kbd> | Switch workspace section: **MCPs (`1`)**, **Plugins (`2`)**, **Guidelines (`3`)**, **Refs (`4`)**, **Skills (`5`)**, **Harness (`6`)** |
 | <kbd>Tab</kbd> (terminals ≥ 120 cols) | Toggle focus between the **left sidebar** and the content. In the sidebar <kbd>j</kbd>/<kbd>k</kbd>/<kbd>g</kbd>/<kbd>G</kbd> switch section live; <kbd>Enter</kbd>/<kbd>Tab</kbd>/<kbd>l</kbd> return to the content. Narrower terminals keep the header tabs and the <kbd>Tab</kbd> section cycle |
 | <kbd>j</kbd> / <kbd>k</kbd> / <kbd>↑</kbd> / <kbd>↓</kbd> | Navigate active list (or scroll `DETAILS` tools when `t` focus is active) |
 | <kbd>PgUp</kbd> / <kbd>PgDn</kbd> / <kbd>Ctrl+u</kbd> / <kbd>Ctrl+d</kbd> | Jump 10 rows up / down |
@@ -255,6 +255,7 @@ Register maga itself in any harness's MCP config. Read tools (`list_servers`, `p
 | <kbd>r</kbd> / <kbd>R</kbd> | Reload & reconcile configs from disk now / Toggle periodic auto-refresh on or off |
 | <kbd>s</kbd> | Force push in-memory canonical registry to disk now (Guidelines: sync links · Refs: update all refs) |
 | <kbd>h</kbd> / <kbd>l</kbd> · <kbd>Space</kbd> · <kbd>f</kbd> · <kbd>a</kbd> | **Skills** view: focus harness column · enable / disable the skill for it · search skills.sh and install · install by name (<kbd>Tab</kbd> in the dialog: global ⇄ project) |
+| <kbd>6</kbd> · <kbd>Space</kbd> · <kbd>e</kbd>/<kbd>Enter</kbd> · <kbd>H</kbd> | **Harness** view (also one sidebar row per harness): list the MCPs as that harness sees them · force the selected MCP on/off for it only (second press returns to inheriting) · open its MCP config in `$EDITOR` · enable/disable syncing with the harness |
 | <kbd>?</kbd> | Open Keyboard Shortcuts & ASCII Witch splash modal |
 | <kbd>q</kbd> / <kbd>Ctrl+C</kbd> | Quit `maga` |
 

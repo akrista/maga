@@ -31,6 +31,15 @@ pub enum WorkspaceSection {
     Guidelines,
     Refs,
     Skills,
+    /// Per-harness view, reached from the sidebar (`harness_selected`) or `6`.
+    Harness,
+}
+
+/// One selectable row of the left sidebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarItem {
+    Section(WorkspaceSection),
+    Harness(HarnessKind),
 }
 
 /// Minimum terminal width at which the left sidebar replaces the header tabs.
@@ -55,6 +64,7 @@ impl WorkspaceSection {
             Self::Guidelines => "Guidelines",
             Self::Refs => "Refs",
             Self::Skills => "Skills",
+            Self::Harness => "Harness",
         }
     }
 
@@ -64,7 +74,7 @@ impl WorkspaceSection {
             Self::Plugins => Self::Guidelines,
             Self::Guidelines => Self::Refs,
             Self::Refs => Self::Skills,
-            Self::Skills => Self::Mcps,
+            Self::Skills | Self::Harness => Self::Mcps,
         }
     }
 }
@@ -685,6 +695,10 @@ pub struct App {
     pub details_focused: bool,
     /// Keyboard focus is on the left sidebar (only when it is visible).
     pub sidebar_focused: bool,
+    /// Harness shown by the `Harness` section.
+    pub harness_selected: HarnessKind,
+    /// Cursor in the harness view's MCP list.
+    pub harness_row: usize,
     pub details_scroll: usize,
     pub help_scroll: usize,
     pub available_update: Arc<Mutex<Option<String>>>,
@@ -810,6 +824,8 @@ impl App {
             probe_rx,
             details_focused: false,
             sidebar_focused: false,
+            harness_selected: HarnessKind::Claude,
+            harness_row: 0,
             details_scroll: 0,
             help_scroll: 0,
             available_update,
@@ -961,6 +977,9 @@ impl App {
                             (self.loaded.refs.refs.len(), self.refs_selected, 0)
                         }
                         WorkspaceSection::Skills => (self.skills.len(), self.skills_selected, 0),
+                        WorkspaceSection::Harness => {
+                            (self.harness_rows().len(), self.harness_row, 0)
+                        }
                     };
                     if visible_len == 0 {
                         self.gaze_target = (-0.30, 0.0);
@@ -2085,28 +2104,116 @@ impl App {
         self.recompute_focus_gaze_target();
     }
 
+    // ── Harness view ──
+
+    /// MCP servers as seen by `harness_selected`: `(name, active for this harness)`.
+    pub fn harness_rows(&self) -> Vec<(String, bool)> {
+        let kind = self.harness_selected;
+        self.outcome
+            .canonical
+            .iter()
+            .map(|(name, cfg)| (name.clone(), cfg.enabled_for_harness(kind)))
+            .collect()
+    }
+
+    /// Flips the selected MCP for this harness only (a per-harness override, like the matrix).
+    fn toggle_harness_server_override(&mut self) {
+        let kind = self.harness_selected;
+        let Some((name, active)) = self.harness_rows().into_iter().nth(self.harness_row) else {
+            return;
+        };
+        if let Some(server) = self.outcome.canonical.get_mut(&name) {
+            if !active == server.enabled {
+                server.harnesses.remove(&kind);
+            } else {
+                server.harnesses.insert(kind, !active);
+            }
+        }
+        let state = if active { "disabled" } else { "enabled" };
+        self.sync_to_disk(format!("'{name}' {state} for {}", kind.display_name()));
+        self.emit_fx(FxTrigger::ServerToggled);
+    }
+
+    /// Opens the selected harness's MCP config file in `$EDITOR`.
+    fn open_harness_config(&mut self) {
+        let Some(ref paths) = self.paths else {
+            return;
+        };
+        let path = paths.effective_harness_path(self.harness_selected, &self.loaded.config);
+        self.pending_editor = Some(EditorRequest {
+            original_name: None,
+            conflict_index: None,
+            initial_toml: String::new(),
+            direct_file_path: Some(path),
+        });
+    }
+
+    /// Enables/disables syncing with the selected harness (`[tools.<harness>].enabled`).
+    fn toggle_harness_enabled(&mut self) {
+        let kind = self.harness_selected;
+        let entry = self.loaded.config.tools.get_mut(kind);
+        entry.enabled = !entry.enabled;
+        let state = if entry.enabled { "enabled" } else { "disabled" };
+        if let Some(paths) = self.paths.clone() {
+            if let Err(e) = self.loaded.save_config(&paths) {
+                self.status_message = Some((format!("✗ Failed to save settings.toml: {e}"), true));
+                return;
+            }
+            self.refresh_from_disk(true);
+        }
+        self.status_message = Some((format!("✓ {} {state}", kind.display_name()), false));
+    }
+
+    /// Sidebar rows in display order: the five sections, then one row per harness.
+    pub fn sidebar_items() -> Vec<SidebarItem> {
+        WorkspaceSection::ALL
+            .into_iter()
+            .map(SidebarItem::Section)
+            .chain(HarnessKind::ALL.into_iter().map(SidebarItem::Harness))
+            .collect()
+    }
+
+    pub fn current_sidebar_item(&self) -> SidebarItem {
+        if self.section == WorkspaceSection::Harness {
+            SidebarItem::Harness(self.harness_selected)
+        } else {
+            SidebarItem::Section(self.section)
+        }
+    }
+
+    fn select_sidebar_item(&mut self, item: SidebarItem) {
+        if item == self.current_sidebar_item() {
+            return;
+        }
+        match item {
+            SidebarItem::Section(section) => self.section = section,
+            SidebarItem::Harness(kind) => {
+                self.section = WorkspaceSection::Harness;
+                self.harness_selected = kind;
+                self.harness_row = 0;
+            }
+        }
+        self.details_scroll = 0;
+        self.ensure_skills_loaded();
+        self.emit_fx(FxTrigger::SelectionChanged);
+    }
+
     /// The sidebar replaces the header tabs on wide terminals.
     pub fn sidebar_visible(&self) -> bool {
         self.width >= SIDEBAR_MIN_WIDTH && !self.loaded.config.ui.hide_ui
     }
 
-    /// Moves the sidebar selection by `delta` (clamped) and switches the section live.
+    /// Moves the sidebar selection by `delta` (clamped) and switches the view live.
     fn step_sidebar(&mut self, delta: isize) {
-        let current = WorkspaceSection::ALL
+        let items = Self::sidebar_items();
+        let current = items
             .iter()
-            .position(|s| *s == self.section)
+            .position(|i| *i == self.current_sidebar_item())
             .unwrap_or(0);
-        let last = WorkspaceSection::ALL.len() - 1;
         let next = (current as isize)
             .saturating_add(delta)
-            .clamp(0, last as isize) as usize;
-        let target = WorkspaceSection::ALL[next];
-        if target != self.section {
-            self.section = target;
-            self.details_scroll = 0;
-            self.ensure_skills_loaded();
-            self.emit_fx(FxTrigger::SelectionChanged);
-        }
+            .clamp(0, items.len() as isize - 1) as usize;
+        self.select_sidebar_item(items[next]);
     }
 
     pub fn apply_workspace_action(&mut self, action: Action) {
@@ -2133,7 +2240,8 @@ impl App {
                     | Action::SelectPluginsSection
                     | Action::SelectGuidelinesSection
                     | Action::SelectRefsSection
-                    | Action::SelectSkillsSection => {}
+                    | Action::SelectSkillsSection
+                    | Action::SelectHarnessSection => {}
                     _ => return,
                 }
             } else if action == Action::ToggleWorkspaceSection {
@@ -2148,6 +2256,7 @@ impl App {
             WorkspaceSection::Guidelines => self.guidelines_statuses.len(),
             WorkspaceSection::Refs => self.loaded.refs.refs.len(),
             WorkspaceSection::Skills => self.skills.len(),
+            WorkspaceSection::Harness => self.harness_rows().len(),
         };
         match action {
             Action::Quit => self.should_quit = true,
@@ -2185,6 +2294,14 @@ impl App {
                     self.emit_fx(FxTrigger::SelectionChanged);
                 }
             }
+            Action::SelectHarnessSection => {
+                if self.section != WorkspaceSection::Harness {
+                    self.section = WorkspaceSection::Harness;
+                    self.harness_row = 0;
+                    self.details_scroll = 0;
+                    self.emit_fx(FxTrigger::SelectionChanged);
+                }
+            }
             Action::SelectSkillsSection => {
                 if self.section != WorkspaceSection::Skills {
                     self.section = WorkspaceSection::Skills;
@@ -2214,6 +2331,9 @@ impl App {
                         }
                         WorkspaceSection::Skills => {
                             self.skills_selected = (self.skills_selected + 1) % len;
+                        }
+                        WorkspaceSection::Harness => {
+                            self.harness_row = (self.harness_row + 1) % len;
                         }
                     }
                     self.details_scroll = 0;
@@ -2259,6 +2379,9 @@ impl App {
                             self.skills_selected =
                                 self.skills_selected.checked_sub(1).unwrap_or(len - 1);
                         }
+                        WorkspaceSection::Harness => {
+                            self.harness_row = self.harness_row.checked_sub(1).unwrap_or(len - 1);
+                        }
                     }
                     self.details_scroll = 0;
                     self.emit_fx(FxTrigger::SelectionChanged);
@@ -2285,6 +2408,9 @@ impl App {
                         }
                         WorkspaceSection::Skills => {
                             self.skills_selected = (self.skills_selected + 10).min(len - 1);
+                        }
+                        WorkspaceSection::Harness => {
+                            self.harness_row = (self.harness_row + 10).min(len - 1);
                         }
                     }
                     self.details_scroll = 0;
@@ -2313,6 +2439,9 @@ impl App {
                         WorkspaceSection::Skills => {
                             self.skills_selected = self.skills_selected.saturating_sub(10);
                         }
+                        WorkspaceSection::Harness => {
+                            self.harness_row = self.harness_row.saturating_sub(10);
+                        }
                     }
                     self.details_scroll = 0;
                     self.emit_fx(FxTrigger::SelectionChanged);
@@ -2340,6 +2469,9 @@ impl App {
                         WorkspaceSection::Skills => {
                             self.skills_selected = 0;
                         }
+                        WorkspaceSection::Harness => {
+                            self.harness_row = 0;
+                        }
                     }
                     self.details_scroll = 0;
                     self.emit_fx(FxTrigger::SelectionChanged);
@@ -2366,6 +2498,9 @@ impl App {
                         }
                         WorkspaceSection::Skills => {
                             self.skills_selected = len - 1;
+                        }
+                        WorkspaceSection::Harness => {
+                            self.harness_row = len - 1;
                         }
                     }
                     self.details_scroll = 0;
@@ -2405,6 +2540,7 @@ impl App {
                     self.clone_or_update_selected_ref(false);
                 }
                 WorkspaceSection::Skills => self.toggle_selected_skill_harness(),
+                WorkspaceSection::Harness => self.toggle_harness_server_override(),
             },
             Action::ConfirmOrFold => {
                 if self.section == WorkspaceSection::Guidelines {
@@ -2420,6 +2556,8 @@ impl App {
                     self.clone_or_update_selected_ref(false);
                 } else if self.section == WorkspaceSection::Skills {
                     self.toggle_selected_skill_harness();
+                } else if self.section == WorkspaceSection::Harness {
+                    self.open_harness_config();
                 } else if self.section == WorkspaceSection::Plugins
                     && let Some(PluginRow::HarnessHeader { harness, .. }) =
                         self.selected_plugin_row()
@@ -2498,6 +2636,13 @@ impl App {
                 self.mode = ActiveMode::Form(FormState::new_add());
                 self.emit_fx(FxTrigger::ModalOpened);
             }
+            Action::EditForm | Action::OpenEditor if self.section == WorkspaceSection::Harness => {
+                self.open_harness_config();
+            }
+            Action::ToggleHarnessEnabled if self.section == WorkspaceSection::Harness => {
+                self.toggle_harness_enabled();
+            }
+            Action::ToggleHarnessEnabled => {}
             Action::AddForm | Action::SkillsSearch if self.section == WorkspaceSection::Skills => {
                 let purpose = if action == Action::AddForm {
                     SkillsInputPurpose::Add
@@ -2705,6 +2850,7 @@ impl App {
                             WorkspaceSection::Guidelines => "Guidelines Inspector",
                             WorkspaceSection::Refs => "Reference Inspector",
                             WorkspaceSection::Skills => "Skill Inspector",
+                            WorkspaceSection::Harness => "Harness Inspector",
                         };
                         self.status_message = Some((format!("✓ Returned to {inspector}"), false));
                     }
@@ -2814,6 +2960,7 @@ impl App {
                     WorkspaceSection::Guidelines => "GUIDELINES",
                     WorkspaceSection::Refs => "REFERENCES",
                     WorkspaceSection::Skills => "SKILLS",
+                    WorkspaceSection::Harness => "MCPS",
                 };
                 if self.details_focused {
                     self.status_message = Some((
@@ -2849,6 +2996,7 @@ impl App {
                     WorkspaceSection::Guidelines => "GUIDELINES",
                     WorkspaceSection::Refs => "REFERENCES",
                     WorkspaceSection::Skills => "SKILLS",
+                    WorkspaceSection::Harness => "MCPS",
                 };
                 self.status_message =
                     Some((format!("✓ Returned focus to {list_label} list"), false));
@@ -2888,7 +3036,8 @@ impl App {
                     }
                     WorkspaceSection::Guidelines
                     | WorkspaceSection::Refs
-                    | WorkspaceSection::Skills => {}
+                    | WorkspaceSection::Skills
+                    | WorkspaceSection::Harness => {}
                 }
                 self.mode = ActiveMode::Normal;
             }
@@ -2917,7 +3066,8 @@ impl App {
                 }
                 WorkspaceSection::Guidelines
                 | WorkspaceSection::Refs
-                | WorkspaceSection::Skills => {}
+                | WorkspaceSection::Skills
+                | WorkspaceSection::Harness => {}
             },
             KeyCode::Char(c) => match self.section {
                 WorkspaceSection::Mcps => {
@@ -2932,7 +3082,8 @@ impl App {
                 }
                 WorkspaceSection::Guidelines
                 | WorkspaceSection::Refs
-                | WorkspaceSection::Skills => {}
+                | WorkspaceSection::Skills
+                | WorkspaceSection::Harness => {}
             },
             _ => {}
         }
@@ -4642,10 +4793,25 @@ mod tests {
 
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(app.section, WorkspaceSection::Plugins);
-        press(&mut app, KeyCode::Char('G'));
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Char('j'));
+        }
         assert_eq!(app.section, WorkspaceSection::Skills);
         press(&mut app, KeyCode::Char('j'));
-        assert_eq!(app.section, WorkspaceSection::Skills, "clamped at the end");
+        assert_eq!(
+            app.section,
+            WorkspaceSection::Harness,
+            "harness rows follow the sections"
+        );
+        assert_eq!(app.harness_selected, HarnessKind::Antigravity);
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.harness_selected, HarnessKind::OpenCode);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(
+            app.harness_selected,
+            HarnessKind::OpenCode,
+            "clamped at the end"
+        );
         press(&mut app, KeyCode::Char('g'));
         assert_eq!(app.section, WorkspaceSection::Mcps);
 
@@ -4663,5 +4829,58 @@ mod tests {
         assert!(!app.sidebar_visible());
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.section, WorkspaceSection::Skills);
+    }
+
+    #[test]
+    fn harness_view_toggles_per_harness_override_opens_config_and_disables_harness() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = StoragePaths::in_dir(dir.path());
+        let mut loaded = LoadedConfigs::load(&paths).expect("load");
+        loaded.mcp.mcps.insert(
+            "context7".to_string(),
+            McpServerConfig::new_http("https://mcp.context7.com/mcp"),
+        );
+        let mut app = App::new(Some(paths.clone()), loaded, 130, 30);
+        let press = |app: &mut App, code| app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+
+        press(&mut app, KeyCode::Char('6'));
+        assert_eq!(app.section, WorkspaceSection::Harness);
+        assert_eq!(app.harness_selected, HarnessKind::Claude);
+        assert_eq!(app.harness_rows(), vec![("context7".to_string(), true)]);
+
+        // Space forces it off for this harness only, a second Space goes back to inheriting.
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.harness_rows(), vec![("context7".to_string(), false)]);
+        assert_eq!(
+            app.outcome.canonical["context7"]
+                .harnesses
+                .get(&HarnessKind::Claude),
+            Some(&false)
+        );
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.outcome.canonical["context7"].harnesses.is_empty());
+
+        // e opens the harness's MCP config file.
+        press(&mut app, KeyCode::Char('e'));
+        let req = app.pending_editor.take().expect("editor request");
+        assert_eq!(
+            req.direct_file_path,
+            Some(paths.effective_harness_path(HarnessKind::Claude, &app.loaded.config))
+        );
+
+        // H stops syncing with the harness and persists it.
+        press(&mut app, KeyCode::Char('H'));
+        assert!(!app.loaded.config.tools.claude.enabled);
+        let saved = std::fs::read_to_string(&paths.settings_toml).expect("settings.toml");
+        assert!(saved.contains("enabled = false"), "{saved}");
+
+        // The sidebar lists harnesses after the sections and selecting one opens its view.
+        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Tab);
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        assert_eq!(app.section, WorkspaceSection::Harness);
+        assert_eq!(app.harness_selected, HarnessKind::Antigravity);
     }
 }

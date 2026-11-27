@@ -37,6 +37,7 @@ pub fn draw_workspace(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             WorkspaceSection::Guidelines => draw_guidelines_list(f, area, app, theme, &fx_areas),
             WorkspaceSection::Refs => draw_refs_list(f, area, app, theme, &fx_areas),
             WorkspaceSection::Skills => draw_skills_list(f, area, app, theme, &fx_areas),
+            WorkspaceSection::Harness => draw_harness_list(f, area, app, theme, &fx_areas),
         }
         return;
     }
@@ -53,6 +54,7 @@ pub fn draw_workspace(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         WorkspaceSection::Guidelines => draw_guidelines_list(f, columns[0], app, theme, &fx_areas),
         WorkspaceSection::Refs => draw_refs_list(f, columns[0], app, theme, &fx_areas),
         WorkspaceSection::Skills => draw_skills_list(f, columns[0], app, theme, &fx_areas),
+        WorkspaceSection::Harness => draw_harness_list(f, columns[0], app, theme, &fx_areas),
     }
 
     let show_hero_showcase = hero_mascot_enabled
@@ -78,6 +80,7 @@ pub fn draw_workspace(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             }
             WorkspaceSection::Refs => draw_refs_detail_panel(f, right_rows[0], app, theme),
             WorkspaceSection::Skills => draw_skills_detail_panel(f, right_rows[0], app, theme),
+            WorkspaceSection::Harness => draw_harness_detail_panel(f, right_rows[0], app, theme),
         }
         draw_companion_panel(f, right_rows[1], app, theme, &fx_areas);
     } else {
@@ -88,6 +91,7 @@ pub fn draw_workspace(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             WorkspaceSection::Guidelines => draw_guidelines_detail_panel(f, columns[1], app, theme),
             WorkspaceSection::Refs => draw_refs_detail_panel(f, columns[1], app, theme),
             WorkspaceSection::Skills => draw_skills_detail_panel(f, columns[1], app, theme),
+            WorkspaceSection::Harness => draw_harness_detail_panel(f, columns[1], app, theme),
         }
     }
 
@@ -1669,6 +1673,211 @@ fn draw_skills_detail_panel(f: &mut Frame, area: Rect, app: &App, theme: &Theme)
         ("  a          ", "Install by name (owner/repo[@skill])"),
         ("  Tab        ", "In the install dialog: global ⇄ project"),
         ("  r          ", "Reload installed skills"),
+    ] {
+        lines.push(Line::from(vec![
+            Span::styled(keys, theme.accent),
+            Span::styled(text, theme.base),
+        ]));
+    }
+
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn draw_harness_list(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+    _fx_areas: &crate::fx::FxAreas,
+) {
+    let kind = app.harness_selected;
+    let rows = app.harness_rows();
+    let active = rows.iter().filter(|(_, on)| *on).count();
+    let enabled = app.loaded.config.tools.is_enabled(kind);
+    let border_style =
+        if matches!(app.mode, ActiveMode::Normal) && !app.details_focused && !app.sidebar_focused {
+            theme.active_border
+        } else {
+            theme.border
+        };
+    let block = Block::default()
+        .title(Span::styled(
+            format!(
+                " {} · MCPs ({active}/{} active) ",
+                kind.display_name(),
+                rows.len()
+            ),
+            theme.header,
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .padding(Padding::new(PADDING_SM, PADDING_SM, PADDING_XS, PADDING_XS));
+
+    if rows.is_empty() {
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled("No MCP servers registered.", theme.muted)),
+        ];
+        f.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
+
+    let selected = app.harness_row.min(rows.len() - 1);
+    let items: Vec<ListItem> = rows
+        .iter()
+        .enumerate()
+        .map(|(idx, (name, on))| {
+            let is_selected = idx == selected;
+            let (mark, mark_style) = if !enabled {
+                ("–", theme.muted)
+            } else if *on {
+                ("●", theme.success)
+            } else {
+                ("·", theme.muted)
+            };
+            let note = match app
+                .outcome
+                .canonical
+                .get(name)
+                .and_then(|c| c.harnesses.get(&kind))
+            {
+                Some(true) => "  forced on",
+                Some(false) => "  forced off",
+                None => "",
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(if is_selected { "▸ " } else { "  " }, theme.accent),
+                Span::styled(format!("{mark} "), mark_style),
+                Span::styled(
+                    name.clone(),
+                    if is_selected {
+                        theme.highlight
+                    } else {
+                        theme.base
+                    },
+                ),
+                Span::styled(note, theme.muted),
+            ]))
+        })
+        .collect();
+
+    let mut state = ListState::default().with_selected(Some(selected));
+    f.render_stateful_widget(List::new(items).block(block), area, &mut state);
+}
+
+fn draw_harness_detail_panel(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let kind = app.harness_selected;
+    let config = &app.loaded.config;
+    let enabled = config.tools.is_enabled(kind);
+    let border_style = if app.details_focused {
+        theme.active_border
+    } else {
+        theme.border
+    };
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" HARNESS · {} ", kind.display_name()),
+            theme.header,
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .padding(Padding::new(PADDING_SM, PADDING_SM, PADDING_XS, PADDING_XS));
+
+    let (path, exists) = match app.paths.as_ref() {
+        Some(p) => {
+            let path = p.effective_harness_path(kind, config);
+            let exists = path.exists();
+            (path.display().to_string(), exists)
+        }
+        None => ("-".to_string(), false),
+    };
+    let overridden = config
+        .tools
+        .get(kind)
+        .config_path
+        .as_deref()
+        .is_some_and(|c| c.trim() != kind.default_config_path());
+
+    let (plugins_total, plugins_on) = app.loaded.harness_plugins.get(&kind).map_or((0, 0), |p| {
+        (p.len(), p.iter().filter(|x| x.enabled).count())
+    });
+    let skills = if app.skills_loaded {
+        let linked = app.skills.iter().filter(|s| s.enabled_for(kind)).count();
+        format!("{linked} of {} linked", app.skills.len())
+    } else {
+        "open Skills (5) to load".to_string()
+    };
+
+    let field = |label: &str, value: String, style: Style| {
+        Line::from(vec![
+            Span::styled(format!("{label:<10}"), theme.muted),
+            Span::styled(value, style),
+        ])
+    };
+    let (state_text, state_style) = if enabled {
+        ("enabled (synced)".to_string(), theme.success)
+    } else {
+        ("disabled (not synced)".to_string(), theme.warning)
+    };
+    let mut lines = vec![
+        field("State", state_text, state_style),
+        field(
+            "Config",
+            format!(
+                "{path}  [{}{}]",
+                if exists { "exists" } else { "missing" },
+                if overridden { ", local override" } else { "" }
+            ),
+            theme.base,
+        ),
+        field(
+            "Plugins",
+            format!("{plugins_on} enabled of {plugins_total}"),
+            theme.base,
+        ),
+        field("Skills", skills, theme.base),
+    ];
+
+    if let Some((name, on)) = app.harness_rows().into_iter().nth(app.harness_row) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Selected MCP:", theme.header)));
+        let how = match app
+            .outcome
+            .canonical
+            .get(&name)
+            .and_then(|c| c.harnesses.get(&kind))
+        {
+            Some(true) => "forced on for this harness",
+            Some(false) => "forced off for this harness",
+            None => "inherits the global enabled flag",
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {name}  "), theme.accent),
+            Span::styled(if on { "active" } else { "inactive" }, theme.base),
+            Span::styled(format!(" · {how}"), theme.muted),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("Actions:", theme.header)));
+    for (keys, text) in [
+        (
+            "  Space      ",
+            "Enable / disable the selected MCP for this harness",
+        ),
+        ("  e / Enter  ", "Open this harness's MCP config in $EDITOR"),
+        (
+            "  H          ",
+            "Enable / disable syncing with this harness",
+        ),
+        ("  r          ", "Reload from disk"),
     ] {
         lines.push(Line::from(vec![
             Span::styled(keys, theme.accent),

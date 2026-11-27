@@ -235,6 +235,7 @@ Register maga itself in any harness's MCP config. Read tools (`list_servers`, `p
 | Key | Action |
 | :--- | :--- |
 | <kbd>Tab</kbd> / <kbd>Shift+Tab</kbd> · <kbd>1</kbd>..<kbd>5</kbd> | Switch workspace section: **MCPs (`1`)**, **Plugins (`2`)**, **Guidelines (`3`)**, **Refs (`4`)**, **Skills (`5`)** |
+| <kbd>Tab</kbd> (terminals ≥ 120 cols) | Toggle focus between the **left sidebar** and the content. In the sidebar <kbd>j</kbd>/<kbd>k</kbd>/<kbd>g</kbd>/<kbd>G</kbd> switch section live; <kbd>Enter</kbd>/<kbd>Tab</kbd>/<kbd>l</kbd> return to the content. Narrower terminals keep the header tabs and the <kbd>Tab</kbd> section cycle |
 | <kbd>j</kbd> / <kbd>k</kbd> / <kbd>↑</kbd> / <kbd>↓</kbd> | Navigate active list (or scroll `DETAILS` tools when `t` focus is active) |
 | <kbd>PgUp</kbd> / <kbd>PgDn</kbd> / <kbd>Ctrl+u</kbd> / <kbd>Ctrl+d</kbd> | Jump 10 rows up / down |
 | <kbd>g</kbd> / <kbd>G</kbd> / <kbd>Home</kbd> / <kbd>End</kbd> | Jump to first / last row |

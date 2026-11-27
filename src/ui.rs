@@ -1,4 +1,4 @@
-use crate::app::{ActiveMode, App, SkillsInputPurpose, WorkspaceSection};
+use crate::app::{ActiveMode, App, SIDEBAR_WIDTH, SkillsInputPurpose, WorkspaceSection};
 use crate::domain::model::{HarnessKind, ProjectPolicy};
 use crate::domain::skills::SearchHit;
 use crate::mascot::{
@@ -91,7 +91,15 @@ pub fn draw(f: &mut Frame, app: &App, base_theme: &Theme) {
         fx_areas.status_bar.set(rows[2]);
 
         draw_header(f, rows[0], app, theme);
-        draw_workspace(f, rows[1], app, theme);
+        if app.sidebar_visible() {
+            let cols = Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)])
+                .split(rows[1]);
+            fx_areas.workspace.set(cols[1]);
+            draw_sidebar(f, cols[0], app, theme);
+            draw_workspace(f, cols[1], app, theme);
+        } else {
+            draw_workspace(f, rows[1], app, theme);
+        }
         draw_status_bar(f, rows[2], app, theme);
     }
 
@@ -198,6 +206,60 @@ pub fn draw(f: &mut Frame, app: &App, base_theme: &Theme) {
         theme,
         animations_enabled,
     );
+}
+
+/// Left navigation list (lazygit-style): one row per workspace section with its item count.
+fn draw_sidebar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let (_, total_plugins) = app.total_plugins_counts();
+    let count_of = |section: WorkspaceSection| -> String {
+        match section {
+            WorkspaceSection::Mcps => app.outcome.canonical.len().to_string(),
+            WorkspaceSection::Plugins => total_plugins.to_string(),
+            WorkspaceSection::Guidelines => app.guidelines_statuses.len().to_string(),
+            WorkspaceSection::Refs => app.loaded.refs.refs.len().to_string(),
+            WorkspaceSection::Skills if app.skills_loaded => app.skills.len().to_string(),
+            WorkspaceSection::Skills => "–".to_string(),
+        }
+    };
+
+    let border_style = if app.sidebar_focused && matches!(app.mode, ActiveMode::Normal) {
+        theme.active_border
+    } else {
+        theme.border
+    };
+    let block = Block::default()
+        .title(Span::styled(" Views ", theme.header))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .padding(Padding::new(PADDING_XS, PADDING_XS, PADDING_XS, PADDING_XS));
+    let inner_width = block.inner(area).width as usize;
+
+    let lines: Vec<Line> = WorkspaceSection::ALL
+        .iter()
+        .enumerate()
+        .map(|(idx, section)| {
+            let selected = *section == app.section;
+            let style = match (selected, app.sidebar_focused) {
+                (true, true) => theme.highlight,
+                (true, false) => theme.accent,
+                _ => theme.base,
+            };
+            let label = format!("{} {}", idx + 1, section.title());
+            let count = count_of(*section);
+            let pad = inner_width
+                .saturating_sub(2 + label.chars().count() + count.chars().count())
+                .max(1);
+            Line::from(vec![
+                Span::styled(if selected { "▸ " } else { "  " }, theme.accent),
+                Span::styled(label, style),
+                Span::styled(" ".repeat(pad), style),
+                Span::styled(count, theme.muted),
+            ])
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
@@ -343,19 +405,25 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let mut line1_spans = vec![
         Span::styled(format!(" {sp} maga "), theme.highlight),
         Span::styled(" · ", theme.header),
-        Span::styled(format!("[1: MCPs ({total})]"), mcp_tab_style),
-        Span::styled("  ", theme.base),
-        Span::styled(format!("[2: Plugins ({total_plugins})]"), plugin_tab_style),
     ];
-    if let Some(s) = tab3_span {
+    let show_tabs = !app.sidebar_visible();
+    if show_tabs {
+        line1_spans.push(Span::styled(format!("[1: MCPs ({total})]"), mcp_tab_style));
+        line1_spans.push(Span::styled("  ", theme.base));
+        line1_spans.push(Span::styled(
+            format!("[2: Plugins ({total_plugins})]"),
+            plugin_tab_style,
+        ));
+    }
+    if let Some(s) = tab3_span.filter(|_| show_tabs) {
         line1_spans.push(Span::styled("  ", theme.base));
         line1_spans.push(s);
     }
-    if let Some(s) = tab4_span {
+    if let Some(s) = tab4_span.filter(|_| show_tabs) {
         line1_spans.push(Span::styled("  ", theme.base));
         line1_spans.push(s);
     }
-    if let Some(s) = tab5_span {
+    if let Some(s) = tab5_span.filter(|_| show_tabs) {
         line1_spans.push(Span::styled("  ", theme.base));
         line1_spans.push(s);
     }
@@ -439,6 +507,16 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 " Tab/1-5: view  j/k: nav  h/l: harness  Space: enable/disable  f: search  a: install by name  r: reload  ?: help  q: quit"
             }
         },
+    };
+
+    let hints: String = if app.sidebar_visible() && matches!(app.mode, ActiveMode::Normal) {
+        if app.sidebar_focused {
+            " j/k: section  Enter/Tab/l: open  1-5: jump  o: options  ?: help  q: quit".to_string()
+        } else {
+            hints.replace("Tab/1-5: view", "Tab: sidebar  1-5: view")
+        }
+    } else {
+        hints.to_string()
     };
 
     let update_badge = app
@@ -1665,5 +1743,17 @@ mod tests {
         assert!(m_frame.contains("CLAUDE LOCAL PROJECTS"));
         assert!(m_frame.contains("/home/user/code/maga"));
         assert!(m_frame.contains("[Project: Enabled]"));
+    }
+
+    #[test]
+    fn sidebar_replaces_header_tabs_on_wide_terminals_only() {
+        let wide = render_to_string(130, 24, &build_test_app(130, 24), false);
+        assert!(wide.contains("Views"));
+        assert!(wide.contains("1 MCPs") && wide.contains("5 Skills"));
+        assert!(!wide.contains("[1: MCPs"));
+
+        let narrow = render_to_string(100, 24, &build_test_app(100, 24), false);
+        assert!(!narrow.contains("Views"));
+        assert!(narrow.contains("[1: MCPs"));
     }
 }

@@ -33,7 +33,31 @@ pub enum WorkspaceSection {
     Skills,
 }
 
+/// Minimum terminal width at which the left sidebar replaces the header tabs.
+pub const SIDEBAR_MIN_WIDTH: u16 = 120;
+/// Width of the left sidebar column.
+pub const SIDEBAR_WIDTH: u16 = 24;
+
 impl WorkspaceSection {
+    /// Sections in sidebar / `1`..`5` order.
+    pub const ALL: [Self; 5] = [
+        Self::Mcps,
+        Self::Plugins,
+        Self::Guidelines,
+        Self::Refs,
+        Self::Skills,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Mcps => "MCPs",
+            Self::Plugins => "Plugins",
+            Self::Guidelines => "Guidelines",
+            Self::Refs => "Refs",
+            Self::Skills => "Skills",
+        }
+    }
+
     pub fn toggle(self) -> Self {
         match self {
             Self::Mcps => Self::Plugins,
@@ -659,6 +683,8 @@ pub struct App {
     pub probe_tx: mpsc::Sender<ProbeEvent>,
     pub probe_rx: mpsc::Receiver<ProbeEvent>,
     pub details_focused: bool,
+    /// Keyboard focus is on the left sidebar (only when it is visible).
+    pub sidebar_focused: bool,
     pub details_scroll: usize,
     pub help_scroll: usize,
     pub available_update: Arc<Mutex<Option<String>>>,
@@ -783,6 +809,7 @@ impl App {
             probe_tx,
             probe_rx,
             details_focused: false,
+            sidebar_focused: false,
             details_scroll: 0,
             help_scroll: 0,
             available_update,
@@ -2058,7 +2085,63 @@ impl App {
         self.recompute_focus_gaze_target();
     }
 
+    /// The sidebar replaces the header tabs on wide terminals.
+    pub fn sidebar_visible(&self) -> bool {
+        self.width >= SIDEBAR_MIN_WIDTH && !self.loaded.config.ui.hide_ui
+    }
+
+    /// Moves the sidebar selection by `delta` (clamped) and switches the section live.
+    fn step_sidebar(&mut self, delta: isize) {
+        let current = WorkspaceSection::ALL
+            .iter()
+            .position(|s| *s == self.section)
+            .unwrap_or(0);
+        let last = WorkspaceSection::ALL.len() - 1;
+        let next = (current as isize)
+            .saturating_add(delta)
+            .clamp(0, last as isize) as usize;
+        let target = WorkspaceSection::ALL[next];
+        if target != self.section {
+            self.section = target;
+            self.details_scroll = 0;
+            self.ensure_skills_loaded();
+            self.emit_fx(FxTrigger::SelectionChanged);
+        }
+    }
+
     pub fn apply_workspace_action(&mut self, action: Action) {
+        if self.sidebar_visible() {
+            if self.sidebar_focused {
+                match action {
+                    Action::Down | Action::PageDown => return self.step_sidebar(1),
+                    Action::Up | Action::PageUp => return self.step_sidebar(-1),
+                    Action::First => return self.step_sidebar(isize::MIN / 2),
+                    Action::Last => return self.step_sidebar(isize::MAX / 2),
+                    Action::ToggleWorkspaceSection | Action::ConfirmOrFold | Action::FoldRight => {
+                        self.sidebar_focused = false;
+                        self.emit_fx(FxTrigger::SelectionChanged);
+                        return;
+                    }
+                    Action::Quit
+                    | Action::ToggleHelp
+                    | Action::OpenOptions
+                    | Action::ToggleHideUi
+                    | Action::ToggleHeroMascot
+                    | Action::RefreshFromDisk
+                    | Action::CancelModal
+                    | Action::SelectMcpsSection
+                    | Action::SelectPluginsSection
+                    | Action::SelectGuidelinesSection
+                    | Action::SelectRefsSection
+                    | Action::SelectSkillsSection => {}
+                    _ => return,
+                }
+            } else if action == Action::ToggleWorkspaceSection {
+                self.sidebar_focused = true;
+                self.emit_fx(FxTrigger::SelectionChanged);
+                return;
+            }
+        }
         let len = match self.section {
             WorkspaceSection::Mcps => self.visible_servers().len(),
             WorkspaceSection::Plugins => self.visible_plugin_rows().len(),
@@ -4542,5 +4625,43 @@ mod tests {
                 .as_ref()
                 .is_some_and(|(m, e)| *e && m.contains("zzz"))
         );
+    }
+
+    #[test]
+    fn sidebar_focus_moves_sections_live_and_hands_focus_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = StoragePaths::in_dir(dir.path());
+        let loaded = LoadedConfigs::load(&paths).expect("load");
+        let mut app = App::new(Some(paths), loaded, 130, 30);
+        let press = |app: &mut App, code| app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+
+        assert!(app.sidebar_visible() && !app.sidebar_focused);
+        press(&mut app, KeyCode::Tab);
+        assert!(app.sidebar_focused, "Tab focuses the sidebar");
+        assert_eq!(app.section, WorkspaceSection::Mcps, "Tab must not cycle");
+
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.section, WorkspaceSection::Plugins);
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.section, WorkspaceSection::Skills);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.section, WorkspaceSection::Skills, "clamped at the end");
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.section, WorkspaceSection::Mcps);
+
+        // Content-only keys are ignored while the sidebar has focus.
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.sidebar_focused);
+
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.sidebar_focused);
+        press(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.section, WorkspaceSection::Refs);
+
+        // Narrow terminals keep the legacy Tab cycle.
+        app.resize(100, 30);
+        assert!(!app.sidebar_visible());
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.section, WorkspaceSection::Skills);
     }
 }

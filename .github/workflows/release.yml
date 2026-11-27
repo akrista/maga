@@ -18,6 +18,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Linux builds use the oldest supported runner so the binary only needs glibc 2.35 (Debian 12+, Ubuntu 22.04+).
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -26,10 +27,10 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             archive: tar.gz
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             archive: tar.gz
             cross_gcc: gcc-aarch64-linux-gnu
             linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc

@@ -325,29 +325,42 @@ fn run_stdio_handshake(child: &mut Child, deadline: Instant) -> Result<ProbeOutc
     let (err_tx, err_rx) = mpsc::channel::<String>();
     if let Some(mut err_stream) = stderr {
         thread::spawn(move || {
+            // Keep the target's stderr pipe open and drained until EOF: dropping it early
+            // breaks targets that log diagnostics mid-handshake (e.g. maga probing itself).
             let mut buf = [0u8; 2048];
-            if let Ok(n) = err_stream.read(&mut buf)
-                && n > 0
-            {
-                let text = String::from_utf8_lossy(&buf[..n]).trim().to_string();
-                if !text.is_empty() {
-                    let _ = err_tx.send(text);
+            let mut sent = 0usize;
+            loop {
+                match err_stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        // Cap retained diagnostics at ~8 KiB; keep draining to EOF regardless.
+                        if sent < 8192 {
+                            sent += n;
+                            if err_tx
+                                .send(String::from_utf8_lossy(&buf[..n]).into_owned())
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => break,
                 }
             }
         });
     }
 
     // 1. Send `initialize` (id = 1)
-    let _ = send_stdio_json(&mut stdin, &build_initialize_request(1));
+    send_stdio_json(&mut stdin, &build_initialize_request(1))?;
     let init_msg = recv_stdio_jsonrpc(&line_rx, &err_rx, 1, deadline, "initialize")?;
     let init_result = extract_jsonrpc_result(&init_msg)?;
     let (server_info, protocol_version) = parse_initialize_result(init_result);
 
     // 2. Send `notifications/initialized`
-    let _ = send_stdio_json(&mut stdin, &build_initialized_notification());
+    send_stdio_json(&mut stdin, &build_initialized_notification())?;
 
     // 3. Send `tools/list` (id = 2)
-    let _ = send_stdio_json(&mut stdin, &build_tools_list_request(2));
+    send_stdio_json(&mut stdin, &build_tools_list_request(2))?;
     let tools_msg = recv_stdio_jsonrpc(&line_rx, &err_rx, 2, deadline, "tools/list")?;
     let tools_result = extract_jsonrpc_result(&tools_msg)?;
     let tools = parse_tools_list_result(tools_result);
@@ -400,10 +413,16 @@ fn recv_stdio_jsonrpc(
                 return Err(format!("Timed out waiting for `{step}` response"));
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                if let Ok(stderr_msg) = err_rx.recv_timeout(Duration::from_millis(80)) {
-                    let first_line = stderr_msg.lines().next().unwrap_or(&stderr_msg);
+                // The target is gone; drain any queued stderr diagnostics (bounded by the
+                // reader's ~8 KiB cap) to explain why it exited.
+                let mut captured = String::new();
+                while let Ok(chunk) = err_rx.recv_timeout(Duration::from_millis(80)) {
+                    captured.push_str(&chunk);
+                }
+                let captured = captured.trim();
+                if !captured.is_empty() {
                     return Err(format!(
-                        "Process exited before `{step}` response: {first_line}"
+                        "Process exited before `{step}` response: {captured}"
                     ));
                 }
                 return Err(format!(
@@ -660,6 +679,123 @@ sleep 30
                 assert!(start.elapsed() < Duration::from_secs(2));
             }
             other => panic!("Expected timeout Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stdio_probe_failure_includes_captured_stderr() {
+        // The target writes two stderr diagnostics then exits: the probe error must
+        // carry the captured stderr text (the old one-shot reader lost later lines).
+        #[cfg(windows)]
+        let fail_cfg = McpServerConfig::new_stdio(
+            "cmd",
+            vec![
+                "/C".to_string(),
+                "echo boom diagnostic one 1>&2 & echo second stderr line 1>&2 & exit /b 1"
+                    .to_string(),
+            ],
+        );
+        #[cfg(not(windows))]
+        let fail_cfg = McpServerConfig::new_stdio(
+            "sh",
+            vec![
+                "-c".to_string(),
+                "echo 'boom diagnostic one' >&2; echo 'second stderr line' >&2; exit 1".to_string(),
+            ],
+        );
+
+        match probe_server(&fail_cfg, Duration::from_secs(3)) {
+            ServerProbeState::Failed { error, .. } => {
+                assert!(
+                    error.contains("boom diagnostic one"),
+                    "unexpected error: {error}"
+                );
+                assert!(
+                    error.contains("second stderr line"),
+                    "unexpected error: {error}"
+                );
+            }
+            other => panic!("Expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stdio_probe_survives_target_stderr_logging_mid_handshake() {
+        // Mirrors maga probing itself: the target logs to stderr between the
+        // `initialize` and `tools/list` steps and must stay alive and answer.
+        #[cfg(windows)]
+        let (_dir, cfg) = {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cmd_path = dir.path().join("chatty-mcp.cmd");
+            let script = "@echo off\r\n\
+echo Starting chatty MCP server banner...\r\n\
+set /p line1=\r\n\
+echo mid-handshake stderr diagnostic 1>&2\r\n\
+echo {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"serverInfo\":{\"name\":\"chatty-stdio\",\"version\":\"1.0\"}}}\r\n\
+set /p line2=\r\n\
+echo second stderr diagnostic 1>&2\r\n\
+echo {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"read_file\",\"description\":\"Reads a file from disk\"}]}}\r\n\
+ping -n 30 127.0.0.1 >nul\r\n";
+            std::fs::write(&cmd_path, script).expect("write chatty-mcp.cmd");
+            (
+                dir,
+                McpServerConfig::new_stdio(cmd_path.to_string_lossy().to_string(), vec![]),
+            )
+        };
+
+        #[cfg(not(windows))]
+        let cfg = {
+            let script = r#"
+echo "Starting chatty MCP server banner..."
+read line1
+echo "mid-handshake stderr diagnostic" >&2
+echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"chatty-stdio","version":"1.0"}}}'
+read line2
+echo "second stderr diagnostic" >&2
+echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"read_file","description":"Reads a file from disk"}]}}'
+sleep 30
+"#
+            .to_string();
+            McpServerConfig::new_stdio("sh", vec!["-c".to_string(), script])
+        };
+
+        match probe_server(&cfg, Duration::from_secs(3)) {
+            ServerProbeState::Online(outcome) => {
+                assert_eq!(outcome.server_info.as_deref(), Some("chatty-stdio v1.0"));
+                assert_eq!(outcome.tools.len(), 1);
+                assert_eq!(outcome.tools[0].name, "read_file");
+            }
+            other => panic!("Expected Online, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stdio_probe_fails_fast_when_target_exits_immediately() {
+        // The target exits without reading stdin: the probe must fail fast with the
+        // write/EOF cause instead of stalling until the timeout.
+        #[cfg(windows)]
+        let fail_cfg =
+            McpServerConfig::new_stdio("cmd", vec!["/C".to_string(), "exit /b 1".to_string()]);
+        #[cfg(not(windows))]
+        let fail_cfg =
+            McpServerConfig::new_stdio("sh", vec!["-c".to_string(), "exit 1".to_string()]);
+
+        let start = Instant::now();
+        match probe_server(&fail_cfg, Duration::from_secs(5)) {
+            ServerProbeState::Failed { error, .. } => {
+                assert!(
+                    error.contains("child stdin")
+                        || error.contains("Process exited")
+                        || error.contains("closed stdout"),
+                    "unexpected error: {error}"
+                );
+                assert!(!error.contains("Timed out"), "unexpected error: {error}");
+                assert!(
+                    start.elapsed() < Duration::from_secs(3),
+                    "probe did not fail fast"
+                );
+            }
+            other => panic!("Expected Failed, got {other:?}"),
         }
     }
 

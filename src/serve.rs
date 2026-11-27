@@ -18,9 +18,15 @@ use crate::domain::storage::{HeadlessSyncError, LoadedConfigs, StoragePaths};
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// D1: diagnostics go to stderr, best-effort — a client may close or exhaust stderr at
+/// any time, and a broken stderr must never terminate the server (mcp-serve-resilience).
+fn log_diagnostic(message: String) {
+    let _ = writeln!(io::stderr(), "{message}");
+}
+
 /// Run the MCP server loop until stdin closes. Never touches stdout outside protocol frames.
 pub fn run(paths: StoragePaths, mutations_enabled: bool) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!(
+    log_diagnostic(format!(
         "maga MCP server v{} listening on stdio (mutations: {})",
         env!("CARGO_PKG_VERSION"),
         if mutations_enabled {
@@ -28,7 +34,7 @@ pub fn run(paths: StoragePaths, mutations_enabled: bool) -> Result<(), Box<dyn s
         } else {
             "read-only"
         }
-    );
+    ));
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -77,7 +83,7 @@ fn handle_frame(line: &str, mutations: bool, paths: &StoragePaths) -> Option<Val
     let id = match object.get("id") {
         // Notifications are logged to stderr and never answered.
         None => {
-            eprintln!("maga: notification {method}");
+            log_diagnostic(format!("maga: notification {method}"));
             return None;
         }
         Some(id) => id.clone(),

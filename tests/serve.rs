@@ -1,6 +1,6 @@
 //! Integration tests for `maga --serve`: spawns the real binary and drives a full MCP session.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
@@ -64,8 +64,30 @@ impl Drop for Server {
 
 fn spawn_server(mutations: bool) -> Server {
     let home = tempfile::TempDir::new().expect("tempdir");
+    // Override every storage path into the temp home: on Windows the process home is
+    // not redirected by HOME/XDG env vars, and a partial override would let sync and
+    // toggle touch the real harness configs.
+    let cfg_path = |rel: &str| home.path().join(rel).to_string_lossy().into_owned();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_maga"));
     cmd.arg("--serve")
+        .args([
+            "--config",
+            cfg_path("config/maga/config.toml").as_str(),
+            "--mcp-config",
+            cfg_path("config/maga/mcp.toml").as_str(),
+            "--plugins-config",
+            cfg_path("config/maga/plugins.toml").as_str(),
+            "--agy-config",
+            cfg_path("gemini/mcp_config.json").as_str(),
+            "--claude-config",
+            cfg_path("claude.json").as_str(),
+            "--copilot-config",
+            cfg_path("copilot/mcp-config.json").as_str(),
+            "--grok-config",
+            cfg_path("grok/config.toml").as_str(),
+            "--opencode-config",
+            cfg_path("opencode/opencode.json").as_str(),
+        ])
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", home.path().join("config"))
         .env_remove("MAGA_MCP_MUTATIONS")
@@ -205,6 +227,72 @@ fn full_session_with_mutations() {
     let synced: Value = serde_json::from_str(&text).expect("JSON payload");
     assert_eq!(synced["ok"], true);
     assert_eq!(synced["synced"], true);
+}
+
+#[test]
+fn survives_client_dropping_stderr() {
+    // Replicates the self-probe failure: a minimal client reads one stderr chunk,
+    // drops the server's stderr pipe, and keeps talking protocol on stdout. The
+    // server must tolerate the broken stderr instead of panicking (exit code 101).
+    let home = tempfile::TempDir::new().expect("tempdir");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_maga"));
+    cmd.arg("--serve")
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join("config"))
+        .env_remove("MAGA_MCP_MUTATIONS")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn maga --serve");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let stdout = child.stdout.take().expect("child stdout");
+    let mut stderr = child.stderr.take().expect("child stderr");
+
+    let mut banner = [0u8; 2048];
+    let n = stderr.read(&mut banner).expect("read stderr chunk");
+    assert!(n > 0, "expected startup banner on stderr");
+    drop(stderr);
+
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05","capabilities":{{}},"clientInfo":{{"name":"t","version":"0"}}}}}}"#
+    )
+    .expect("write initialize");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
+    )
+    .expect("write notification");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}}"#
+    )
+    .expect("write tools/list");
+
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("initialize response");
+    assert!(
+        line.contains("\"id\":1"),
+        "initialize response, got: {line}"
+    );
+
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .expect("tools/list response — child died after stderr was dropped");
+    assert!(
+        line.contains("\"id\":2"),
+        "tools/list response, got: {line}"
+    );
+    assert!(line.contains("list_servers"), "tools payload, got: {line}");
+
+    assert!(
+        child.try_wait().expect("child status").is_none(),
+        "server exited before stdin closed"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[test]

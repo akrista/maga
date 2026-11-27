@@ -105,28 +105,40 @@ Switch between the **MCP Servers (`1`)** and **Plugins (`2`)** workspace section
 
 ### Install & Run
 
-**Option 1 — Prebuilt Release Binary (Linux, macOS, Windows)**
+**Option 1 — Install Script (Linux, macOS, Windows) — Recommended**
 
-Download the archive for your platform (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, or `x86_64-pc-windows-msvc`) from [**GitHub Releases**](https://github.com/akrista/maga/releases), or install via [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall):
+One polyglot [`install.ps1`](install.ps1) (Bash + PowerShell) downloads the latest prebuilt release, verifies its SHA-256 against `SHA256SUMS`, installs it to `~/.local/bin` (Windows: `%LOCALAPPDATA%\maga\bin`, added to your user `PATH`), and warns about any other `maga` shadowing it on `PATH`. No Rust toolchain required.
 
 ```bash
-# Quick one-liner for Linux / macOS (adjust TARGET for your OS/arch)
-TARGET="x86_64-unknown-linux-gnu"
-curl -fsSL "https://github.com/akrista/maga/releases/latest/download/maga-v0.4.0-${TARGET}.tar.gz" \
-  | tar -xz -C ~/.local/bin maga
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/akrista/maga/master/install.ps1 | bash
+```
 
-# Or install prebuilt binary via cargo-binstall
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/akrista/maga/master/install.ps1 | iex
+```
+
+Pin a release with `MAGA_VERSION=v0.4.2` (or `--version v0.4.2`); override the destination with `MAGA_INSTALL_DIR`. If `maga` is already installed, re-running the script simply delegates to `maga --update`; add `--force` to reinstall.
+
+> **Upgrading:** use `maga --update`. It replaces the binary in place, even while an agent is running `maga serve` as an MCP server on Windows, where `cargo install` fails because the running `maga.exe` is locked. Running agents keep the old version until restarted.
+
+**Option 2 — Manual Archive or `cargo-binstall`**
+
+Download the archive for your platform (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, or `x86_64-pc-windows-msvc`) from [**GitHub Releases**](https://github.com/akrista/maga/releases), or:
+
+```bash
 cargo binstall --git https://github.com/akrista/maga maga
 ```
 
-**Option 2 — Install from GitHub via Cargo (Rust 1.88+)**
+**Option 3 — Install from GitHub via Cargo (Rust 1.88+)**
 
 ```bash
 cargo install --git https://github.com/akrista/maga
 maga
 ```
 
-**Option 3 — Build from a Local Clone**
+**Option 4 — Build from a Local Clone**
 
 ```bash
 git clone https://github.com/akrista/maga.git

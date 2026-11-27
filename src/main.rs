@@ -155,9 +155,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  Current version: v{}", info.current_version);
                 println!("  Latest version:  {}", info.latest_version);
                 if info.is_newer {
-                    println!(
-                        "\x1b[1;33m  Update available! Run `maga update` to upgrade.\x1b[0m"
-                    );
+                    println!("\x1b[1;33m  Update available! Run `maga update` to upgrade.\x1b[0m");
                     if let Some(notes) = &info.release_notes_url {
                         println!("  Release notes:   {notes}");
                     }

@@ -376,10 +376,16 @@ fn run_stdio_handshake(child: &mut Child, deadline: Instant) -> Result<ProbeOutc
 fn send_stdio_json(stdin: &mut impl Write, payload: &Value) -> Result<(), String> {
     let serialized =
         serde_json::to_string(payload).map_err(|e| format!("JSON serialize error: {e}"))?;
-    writeln!(stdin, "{serialized}").map_err(|e| format!("Failed to write to child stdin: {e}"))?;
-    stdin
-        .flush()
-        .map_err(|e| format!("Failed to flush child stdin: {e}"))
+    // BrokenPipe means the target already exited: ignore it so the following read
+    // reports the captured stderr that explains the exit, not the write error.
+    let ignore_broken_pipe = |r: std::io::Result<()>| match r {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(e),
+    };
+    ignore_broken_pipe(writeln!(stdin, "{serialized}"))
+        .map_err(|e| format!("Failed to write to child stdin: {e}"))?;
+    ignore_broken_pipe(stdin.flush()).map_err(|e| format!("Failed to flush child stdin: {e}"))
 }
 
 fn recv_stdio_jsonrpc(

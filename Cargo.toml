@@ -1,6 +1,6 @@
 [package]
 name = "maga"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Unified TUI manager for global MCP servers across Antigravity, Claude Code, GitHub Copilot, Grok CLI, and OpenCode"

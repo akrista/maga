@@ -3,7 +3,7 @@
   <p><strong>Unified Terminal UI &amp; Canonical Registry for Model Context Protocol (MCP) Servers &amp; Agentic Harness Plugins</strong></p>
 
   <p>
-    <a href="#quick-start"><img src="https://img.shields.io/badge/version-0.4.0-e8998d?style=flat-square" alt="Version 0.4.0" /></a>
+    <a href="https://github.com/akrista/maga/releases"><img src="https://img.shields.io/github/v/release/akrista/maga?style=flat-square&color=e8998d" alt="Latest release" /></a>
     <a href="Cargo.toml"><img src="https://img.shields.io/badge/rust-2024_edition-f4b942?style=flat-square&logo=rust" alt="Rust 2024 Edition" /></a>
     <a href="#supported-harnesses"><img src="https://img.shields.io/badge/harnesses-5_supported-7b68ee?style=flat-square" alt="5 Supported Harnesses" /></a>
     <a href="#live-mcp-health-probing--plugin-management"><img src="https://img.shields.io/badge/workspace-MCPs_%2B_Plugins-4ecdc4?style=flat-square" alt="MCPs + Plugins" /></a>
